@@ -34,8 +34,8 @@ for entry in st.session_state["chat_history"]:
         with st.chat_message("assistant"):
             if "interpretation" in entry:
                 st.write(entry["interpretation"])
-            if "df" in entry and entry["df"]:
-                df_disp = pd.DataFrame(entry["df"])
+            if "latest_df" in entry and entry["latest_df"]:
+                df_disp = pd.DataFrame(entry["latest_df"])
                 st.dataframe(df_disp)
             if "chart_result" in entry and entry["chart_result"]:
                 chart_img = base64.b64decode(entry["chart_result"])
@@ -65,8 +65,8 @@ if user_input:
     with ai_msg_placeholder.chat_message("assistant"):
         if "interpretation" in res:
             st.write(res["interpretation"])
-        if "df" in res and res["df"]:
-            st.dataframe(pd.DataFrame(res["df"]))
+        if "latest_df" in res and res["latest_df"]:
+            st.dataframe(pd.DataFrame(res["latest_df"]))
         if "chart_result" in res and res["chart_result"]:
             st.image(base64.b64decode(res["chart_result"]), caption="AI生成グラフ")
     # --- 8. 履歴に保存 ---

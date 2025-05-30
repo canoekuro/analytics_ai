@@ -9,6 +9,8 @@ import base64
 import re
 from typing import TypedDict, List, Optional, Any
 from langgraph.checkpoint.memory import MemorySaver
+import uuid
+from datetime import datetime
 import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -26,6 +28,9 @@ llm = ChatGoogleGenerativeAI(
     temperature=0,
     google_api_key=google_api_key
 ) # Or "gemini-1.5-flash", "gemini-1.5-pro" for higher capabilities
+
+CLEAR_DATA_KEYWORDS = ["clear data", "リセット"]
+DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
 
 #意図の判別
 
@@ -76,11 +81,6 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
 
 # SQL生成＋実行
 def sql_node(state):
-    #SQLが走るときには、前の解釈やグラフはNoneにする。
-    state["df"] = None
-    state["interpretation"] = None
-    state["chart_result"] = None
-    
     # 1. テーブル定義DBから検索
     retrieved_tables_docs = vectorstore_tables.similarity_search(state["input"], k=3)
     rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
@@ -120,12 +120,19 @@ def sql_node(state):
     sql_generated_clean = extract_sql(sql_generated)
     print(sql_generated_clean)
     result_df, sql_error = try_sql_execute(sql_generated_clean)
-    if sql_error:
+    current_error = sql_error # Initialize current_error with the result of the first try
+
+    if sql_error: # If first attempt had an error
         # LLMで修正を依頼
-        sql_generated_clean = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, state["input"])
-        print(sql_generated_clean)
+        fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, state["input"])
+        print(fixed_sql) # Print the fixed SQL
         # 再実行
-        result_df, sql_error2 = try_sql_execute(sql_generated_clean)
+        result_df, sql_error2 = try_sql_execute(fixed_sql)
+        current_error = sql_error2 # Update current_error with the result of the second try
+        
+        # Update sql_generated_clean to the fixed version if a fix was attempted
+        sql_generated_clean = fixed_sql 
+
         if sql_error2:
             print("再実行でもエラー:", sql_error2)
         else:
@@ -133,16 +140,43 @@ def sql_node(state):
             if result_df is not None:
                  print(result_df)
     
+    # current_error now holds the error from the last execution attempt (if any)
+    # sql_generated_clean holds the SQL that was last executed
+
     if result_df is not None:
         result_df_dict = result_df.to_dict(orient="records")
-    else:
-        result_df_dict = [] # Handle case where df is None
+        current_df_history = state.get("df_history", [])
+        new_history_entry = {
+            "id": uuid.uuid4().hex[:8],
+            "query": state.get("input", ""), # Ensure 'input' key exists
+            "timestamp": datetime.now().isoformat(),
+            "dataframe_dict": result_df_dict
+        }
+        current_df_history.append(new_history_entry)
 
-    return {**state, "df": result_df_dict, "SQL":sql_generated_clean, "condition": "SQL実行完了"}
+        return {
+            **state,
+            "latest_df": result_df_dict,
+            "df_history": current_df_history,
+            "SQL": sql_generated_clean,
+            "interpretation": None,
+            "chart_result": None,
+            "condition": "SQL実行完了",
+            "error": None
+        }
+    else:
+        # SQL execution failed or returned no data.
+        # Preserve existing latest_df, df_history, interpretation, and chart_result.
+        return {
+            **state,
+            "SQL": sql_generated_clean,
+            "condition": "SQL実行失敗",
+            "error": current_error
+        }
 
 # 解釈
 def interpret_node(state):
-    result_df_dict = state.get("df")
+    result_df_dict = state.get("latest_df")
     if result_df_dict is None or not result_df_dict: # Check if empty
         return {**state, "interpretation": "まだデータがありません。先にSQL質問をするか、メタデータ検索を試してください。", "condition": "解釈失敗"}
     
@@ -165,7 +199,7 @@ def interpret_node(state):
 
 
 def chart_node(state):
-    result_df_dict = state.get("df")
+    result_df_dict = state.get("latest_df")
     if result_df_dict is None or not result_df_dict: # Check if empty
         return {**state, "chart_result": None, "condition": "グラフ化失敗"}
 
@@ -210,6 +244,12 @@ def chart_node(state):
 
 def classify_intent_node(state):
     user_input = state["input"]
+    
+    # Initialize or append to query_history
+    current_history = state.get("query_history", [])
+    if not current_history or current_history[-1] != user_input: # Avoid duplicate entries if re-processed
+         current_history.append(user_input)
+
     # ここをAzure OpenAIで複数分類に拡張
     prompt = f"""
     ユーザーの質問の意図を判定してください。
@@ -233,12 +273,19 @@ def classify_intent_node(state):
     """
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
-    return {**state, "intent_list": steps, "condition": "分類完了"}
+
+    user_input_lower = state["input"].lower()
+    if any(keyword in user_input_lower for keyword in CLEAR_DATA_KEYWORDS):
+        steps = ["clear_data_intent"] # Prioritize clearing
+
+    return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
 # classifyノードの分岐（次に何へ進むか？）
 def classify_next(state):
     intents = state.get("intent_list", [])
-    if "メタデータ検索" in intents: # Prioritize metadata search if present
+    if "clear_data_intent" in intents: # Prioritize clear intent
+        return "clear_data"
+    elif "メタデータ検索" in intents: # Then metadata search
         return "metadata_retrieval" 
     elif "データ取得" in intents:
         return "sql"
@@ -298,16 +345,36 @@ def metadata_retrieval_node(state):
     
     return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
 
+def clear_data_node(state):
+    # Clear DataFrame, SQL, interpretation, chart, errors, and query history
+    # Keep 'input' and 'intent_list' as they are from the current query that triggered the clear.
+    # Also keep metadata_answer as per instructions.
+    return {
+        "input": state.get("input"), # Preserve current input
+        "intent_list": state.get("intent_list"), # Preserve current intent list
+        "latest_df": None, # Updated field name and cleared
+        "df_history": [],  # New field, cleared
+        "SQL": None,
+        "interpretation": DATA_CLEARED_MESSAGE, # Confirmation message
+        "chart_result": None,
+        "metadata_answer": state.get("metadata_answer"), # Keep this
+        "condition": "データクリア完了",
+        "error": None,
+        "query_history": [] # Reset query history
+    }
+
 class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
-    df: Optional[list]               # SQL実行後のpandas.DataFrameのdict
+    latest_df: Optional[list]        # 直近のSQL実行後のpandas.DataFrameのdict
+    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list}
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
     chart_result: Optional[str]      # グラフ画像（base64など）
     metadata_answer: Optional[str]   # メタデータ検索結果の回答
     condition: Optional[str]         # 各ノードの実行状態
     error: Optional[str]             # SQL等でエラーがあれば
+    query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
 
 def build_workflow():
     memory = MemorySaver()
@@ -317,12 +384,14 @@ def build_workflow():
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
     workflow.add_node("metadata_retrieval", metadata_retrieval_node) # 新しいノードを追加
+    workflow.add_node("clear_data", clear_data_node) # Add clear_data node
     
     workflow.add_conditional_edges("classify", classify_next)
     workflow.add_conditional_edges("sql", sql_next)
     workflow.add_conditional_edges("chart", chart_next)
     workflow.add_edge("interpret", END)
     workflow.add_edge("metadata_retrieval", END) # メタデータ検索後は終了
+    workflow.add_edge("clear_data", END) # Add edge for clear_data node
 
     workflow.set_entry_point("classify")
     return workflow.compile(checkpointer=memory)
