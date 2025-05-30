@@ -1,0 +1,38 @@
+[
+  {
+    "query_example": "各カテゴリごとの合計売上を出してください",
+    "sql_example": "SELECT category, SUM(sales) AS total_sales FROM sales_data GROUP BY category;"
+  },
+  {
+    "query_example": "2024年5月1日の商品ごとの売上を教えて",
+    "sql_example": "SELECT product_name, sales FROM sales_data WHERE date = '2024-05-01';"
+  },
+  {
+    "query_example": "パンの売上合計を出して",
+    "sql_example": "SELECT SUM(sales) FROM sales_data WHERE product_name = 'パン';"
+  },
+  {
+    "query_example": "全ユーザーの名前と都道府県を一覧表示してください",
+    "sql_example": "SELECT user_name, prefecture FROM users;"
+  },
+  {
+    "query_example": "30歳以上のユーザー名を抽出して",
+    "sql_example": "SELECT user_name FROM users WHERE age >= 30;"
+  },
+  {
+    "query_example": "商品の一覧を表示してください",
+    "sql_example": "SELECT * FROM products;"
+  },
+  {
+    "query_example": "飲料カテゴリの商品を抽出して",
+    "sql_example": "SELECT product_name FROM products WHERE category = '飲料';"
+  },
+  {
+    "query_example": "全商品の平均評価（rating）を計算して",
+    "sql_example": "SELECT product_id, AVG(rating) AS avg_rating FROM reviews GROUP BY product_id;"
+  },
+  {
+    "query_example": "評価が5のレビューのコメントを抽出して",
+    "sql_example": "SELECT comment FROM reviews WHERE rating = 5;"
+  }
+]

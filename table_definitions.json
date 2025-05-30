@@ -1,0 +1,111 @@
+[
+  {
+    "table_name": "sales_data",
+    "table_description": "売上データを格納するテーブル。商品カテゴリ、商品名、販売金額、日付を持つ。",
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "description": "レコードID（主キー）"
+      },
+      {
+        "name": "category",
+        "type": "TEXT",
+        "description": "商品カテゴリ名"
+      },
+      {
+        "name": "product_name",
+        "type": "TEXT",
+        "description": "商品名"
+      },
+      {
+        "name": "sales",
+        "type": "INTEGER",
+        "description": "販売金額"
+      },
+      {
+        "name": "date",
+        "type": "TEXT",
+        "description": "販売日（YYYY-MM-DD）"
+      }
+    ]
+  },
+  {
+    "table_name": "users",
+    "table_description": "ユーザー情報を格納するテーブル。ユーザー名、年齢、都道府県が格納される。",
+    "columns": [
+      {
+        "name": "user_id",
+        "type": "INTEGER",
+        "description": "ユーザーID（主キー）"
+      },
+      {
+        "name": "user_name",
+        "type": "TEXT",
+        "description": "ユーザー名"
+      },
+      {
+        "name": "age",
+        "type": "INTEGER",
+        "description": "年齢"
+      },
+      {
+        "name": "prefecture",
+        "type": "TEXT",
+        "description": "都道府県"
+      }
+    ]
+  },
+  {
+    "table_name": "products",
+    "table_description": "商品マスタテーブル。商品名、カテゴリ、価格が格納される。",
+    "columns": [
+      {
+        "name": "product_id",
+        "type": "INTEGER",
+        "description": "商品ID（主キー）"
+      },
+      {
+        "name": "product_name",
+        "type": "TEXT",
+        "description": "商品名"
+      },
+      {
+        "name": "category",
+        "type": "TEXT",
+        "description": "商品カテゴリ"
+      },
+      {
+        "name": "price",
+        "type": "INTEGER",
+        "description": "価格"
+      }
+    ]
+  },
+  {
+    "table_name": "reviews",
+    "table_description": "商品レビューを格納するテーブル。商品ID、評価（rating）、コメントが格納される。",
+    "columns": [
+      {
+        "name": "review_id",
+        "type": "INTEGER",
+        "description": "レビューID（主キー）"
+      },
+      {
+        "name": "product_id",
+        "type": "INTEGER",
+        "description": "商品ID"
+      },
+      {
+        "name": "rating",
+        "type": "INTEGER",
+        "description": "5段階評価（1-5）"
+      },
+      {
+        "name": "comment",
+        "type": "TEXT",
+        "description": "レビューコメント"
+      }
+    ]
+  }
+]
