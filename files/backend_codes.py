@@ -77,12 +77,12 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
 # SQL生成＋実行
 def sql_node(state):
     # 1. テーブル定義DBから検索
-    retrieved_tables = vectorstore_tables.similarity_search(state["input"], k=3)
-    rag_tables = "\n".join([doc.page_content for doc in retrieved_tables])
+    retrieved_tables_docs = vectorstore_tables.similarity_search(state["input"], k=3)
+    rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
 
     # 2. クエリ例DBから検索
-    retrieved_queries = vectorstore_queries.similarity_search(state["input"], k=3)
-    rag_queries = "\n".join([doc.page_content for doc in retrieved_queries])
+    retrieved_queries_docs = vectorstore_queries.similarity_search(state["input"], k=3)
+    rag_queries = "\n".join([doc.page_content for doc in retrieved_queries_docs])
 
      # 3. プロンプト組み立て
     user_prompt = f"""
@@ -125,16 +125,21 @@ def sql_node(state):
             print("再実行でもエラー:", sql_error2)
         else:
             print("=== 修正版SQLでの結果 ===")
-            print(result_df)
+            if result_df is not None:
+                 print(result_df)
+    
+    if result_df is not None:
+        result_df_dict = result_df.to_dict(orient="records")
+    else:
+        result_df_dict = [] # Handle case where df is None
 
-    result_df_dict = result_df.to_dict(orient="records")
     return {**state, "df": result_df_dict, "SQL":sql_generated_clean, "condition": "SQL実行完了"}
 
 # 解釈
 def interpret_node(state):
     result_df_dict = state.get("df")
-    if result_df_dict is None:
-        return {"interpretation": "まだデータがありません。先にSQL質問をしてください。"}
+    if result_df_dict is None or not result_df_dict: # Check if empty
+        return {**state, "interpretation": "まだデータがありません。先にSQL質問をするか、メタデータ検索を試してください。", "condition": "解釈失敗"}
     
     result_df = pd.DataFrame(result_df_dict)
     df_text = result_df.to_string(index=False)
@@ -156,7 +161,7 @@ def interpret_node(state):
 
 def chart_node(state):
     result_df_dict = state.get("df")
-    if result_df_dict is None:
+    if result_df_dict is None or not result_df_dict: # Check if empty
         return {**state, "chart_result": None, "condition": "グラフ化失敗"}
 
     result_df = pd.DataFrame(result_df_dict)
@@ -196,17 +201,18 @@ def chart_node(state):
         fig = base64.b64encode(open("output.png", "rb").read()).decode('utf-8')
         return {**state, "chart_result": fig, "condition": "グラフ化完了"}
     else:
-        return {**state, "condition": "グラフ化失敗"}
+        return {**state, "chart_result": None, "condition": "グラフ化失敗"} # ensure chart_result is None
 
 def classify_intent_node(state):
     user_input = state["input"]
     # ここをAzure OpenAIで複数分類に拡張
     prompt = f"""
     ユーザーの質問の意図を判定してください。
-    次の3つのうち、該当するものを「,」区切りで全て列挙してください：
+    次の4つのうち、該当するものを「,」区切りで全て列挙してください：
     - データ取得
     - グラフ作成
     - データ解釈
+    - メタデータ検索
 
     質問: 「{user_input}」
     例: 
@@ -214,9 +220,11 @@ def classify_intent_node(state):
     input:「＊＊＊のデータを出して」 output:「データ取得」
     input:「＊＊＊のデータを取得してグラフ化して」 output:「データ取得,グラフ作成」
     input:「＊＊＊のデータを取得して解釈して」 output:「データ取得,データ解釈」
-    input:「＊＊＊のデータのグラフ化と解釈して」 output:「データ取得,グラフ作成,データ解釈」 
+    input:「＊＊＊のデータのグラフ化と解釈して」 output:「データ取得,グラフ作成,データ解釈」
+    input:「sales_dataテーブルにはどんなカラムがありますか？」 output:「メタデータ検索」
+    input:「categoryカラムの情報を教えてください」 output:「メタデータ検索」
 
-    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈」）だけを必ず返すようにしてください。
+    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈,メタデータ検索」）だけを必ず返すようにしてください。
     """
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
@@ -225,10 +233,13 @@ def classify_intent_node(state):
 # classifyノードの分岐（次に何へ進むか？）
 def classify_next(state):
     intents = state.get("intent_list", [])
-    if "データ取得" in intents:
+    if "メタデータ検索" in intents: # Prioritize metadata search if present
+        return "metadata_retrieval" 
+    elif "データ取得" in intents:
         return "sql"
+    # These checks are likely redundant if metadata or data acquisition is primary
     elif "グラフ作成" in intents:
-        return "chart"
+        return "chart" 
     elif "データ解釈" in intents:
         return "interpret"
     else:
@@ -252,6 +263,36 @@ def chart_next(state):
     else:
         return END
 
+# 新しいメタデータ検索ノード
+def metadata_retrieval_node(state):
+    user_query = state["input"]
+    
+    # 1. テーブル定義DBから検索 (vectorstore_tablesを使用)
+    retrieved_docs = vectorstore_tables.similarity_search(user_query, k=3)
+    retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
+
+    # 2. プロンプト組み立て
+    prompt_template = """
+    以下のテーブル定義情報を参照して、ユーザーの質問に答えてください。
+    ユーザーが理解しやすいように、テーブルやカラムの役割、データ型、関連性などを説明してください。
+
+    【テーブル定義情報】
+    {retrieved_table_info}
+
+    【ユーザー質問】
+    {user_query}
+
+    【回答】
+    """
+    
+    llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, user_query=user_query)
+    
+    # 3. LLMに問い合わせ
+    response = llm.invoke(llm_prompt)
+    answer = response.content.strip()
+    
+    return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
+
 class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
@@ -259,6 +300,7 @@ class MyState(TypedDict, total=False):
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
     chart_result: Optional[str]      # グラフ画像（base64など）
+    metadata_answer: Optional[str]   # メタデータ検索結果の回答
     condition: Optional[str]         # 各ノードの実行状態
     error: Optional[str]             # SQL等でエラーがあれば
 
@@ -269,15 +311,23 @@ def build_workflow():
     workflow.add_node("sql", sql_node)
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
+    workflow.add_node("metadata_retrieval", metadata_retrieval_node) # 新しいノードを追加
+    
     workflow.add_conditional_edges("classify", classify_next)
     workflow.add_conditional_edges("sql", sql_next)
     workflow.add_conditional_edges("chart", chart_next)
     workflow.add_edge("interpret", END)
+    workflow.add_edge("metadata_retrieval", END) # メタデータ検索後は終了
+
     workflow.set_entry_point("classify")
     return workflow.compile(checkpointer=memory)
 
-user_query = "カテゴリの合計販売金額を出して"
+user_query = "カテゴリの合計販売金額を出して" # This will not trigger metadata_retrieval
+# To test metadata_retrieval, use a query like:
+# user_query = "sales_dataテーブルにはどんなカラムがありますか？" 
 workflow = build_workflow()
-config = {"configurable": {"thread_id": "1"}}
+config = {"configurable": {"thread_id": "1"}} # Changed thread_id for potentially fresh state
+# For testing the new node, you might want to invoke with a metadata question:
+# res = workflow.invoke({"input": "sales_dataテーブルにはどんなカラムがありますか？"}, config=config)
 res = workflow.invoke({"input": user_query}, config=config)
 print(res)
