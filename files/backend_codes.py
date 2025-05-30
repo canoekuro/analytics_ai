@@ -9,6 +9,8 @@ import base64
 import re
 from typing import TypedDict, List, Optional, Any
 from langgraph.checkpoint.memory import MemorySaver
+import uuid
+from datetime import datetime
 import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -142,11 +144,20 @@ def sql_node(state):
     # sql_generated_clean holds the SQL that was last executed
 
     if result_df is not None:
-        # New data successfully fetched
         result_df_dict = result_df.to_dict(orient="records")
+        current_df_history = state.get("df_history", [])
+        new_history_entry = {
+            "id": uuid.uuid4().hex[:8],
+            "query": state.get("input", ""), # Ensure 'input' key exists
+            "timestamp": datetime.now().isoformat(),
+            "dataframe_dict": result_df_dict
+        }
+        current_df_history.append(new_history_entry)
+
         return {
             **state,
-            "df": result_df_dict,
+            "latest_df": result_df_dict,
+            "df_history": current_df_history,
             "SQL": sql_generated_clean,
             "interpretation": None,
             "chart_result": None,
@@ -154,7 +165,8 @@ def sql_node(state):
             "error": None
         }
     else:
-        # SQL execution failed or returned no data
+        # SQL execution failed or returned no data.
+        # Preserve existing latest_df, df_history, interpretation, and chart_result.
         return {
             **state,
             "SQL": sql_generated_clean,
@@ -164,7 +176,7 @@ def sql_node(state):
 
 # 解釈
 def interpret_node(state):
-    result_df_dict = state.get("df")
+    result_df_dict = state.get("latest_df")
     if result_df_dict is None or not result_df_dict: # Check if empty
         return {**state, "interpretation": "まだデータがありません。先にSQL質問をするか、メタデータ検索を試してください。", "condition": "解釈失敗"}
     
@@ -187,7 +199,7 @@ def interpret_node(state):
 
 
 def chart_node(state):
-    result_df_dict = state.get("df")
+    result_df_dict = state.get("latest_df")
     if result_df_dict is None or not result_df_dict: # Check if empty
         return {**state, "chart_result": None, "condition": "グラフ化失敗"}
 
@@ -340,7 +352,8 @@ def clear_data_node(state):
     return {
         "input": state.get("input"), # Preserve current input
         "intent_list": state.get("intent_list"), # Preserve current intent list
-        "df": None,
+        "latest_df": None, # Updated field name and cleared
+        "df_history": [],  # New field, cleared
         "SQL": None,
         "interpretation": DATA_CLEARED_MESSAGE, # Confirmation message
         "chart_result": None,
@@ -353,7 +366,8 @@ def clear_data_node(state):
 class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
-    df: Optional[list]               # SQL実行後のpandas.DataFrameのdict
+    latest_df: Optional[list]        # 直近のSQL実行後のpandas.DataFrameのdict
+    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list}
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
     chart_result: Optional[str]      # グラフ画像（base64など）
