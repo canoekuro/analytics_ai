@@ -76,11 +76,6 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
 
 # SQL生成＋実行
 def sql_node(state):
-    #SQLが走るときには、前の解釈やグラフはNoneにする。
-    state["df"] = None
-    state["interpretation"] = None
-    state["chart_result"] = None
-    
     # 1. テーブル定義DBから検索
     retrieved_tables_docs = vectorstore_tables.similarity_search(state["input"], k=3)
     rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
@@ -133,12 +128,37 @@ def sql_node(state):
             if result_df is not None:
                  print(result_df)
     
-    if result_df is not None:
-        result_df_dict = result_df.to_dict(orient="records")
-    else:
-        result_df_dict = [] # Handle case where df is None
+    # Ensure `sql_generated_clean`, `result_df`, and `current_error` are defined by this point.
+    # Note: The original code used `sql_error` and `sql_error2`. We'll use `current_error`
+    # to represent the final error state after attempting SQL execution and potential fixes.
+    # We need to ensure `current_error` is properly set based on `sql_error` and `sql_error2`.
 
-    return {**state, "df": result_df_dict, "SQL":sql_generated_clean, "condition": "SQL実行完了"}
+    current_error = None
+    if 'sql_error2' in locals() and sql_error2 is not None: # Error after fix attempt
+        current_error = sql_error2
+    elif 'sql_error' in locals() and sql_error is not None and result_df is None: # Error on first attempt, and no df from fix
+        current_error = sql_error
+
+    if result_df is not None:
+        # New data successfully fetched
+        result_df_dict = result_df.to_dict(orient="records")
+        return {
+            **state,
+            "df": result_df_dict,
+            "SQL": sql_generated_clean,
+            "interpretation": None,
+            "chart_result": None,
+            "condition": "SQL実行完了",
+            "error": None
+        }
+    else:
+        # SQL execution failed or returned no data
+        return {
+            **state,
+            "SQL": sql_generated_clean,
+            "condition": "SQL実行失敗",
+            "error": current_error
+        }
 
 # 解釈
 def interpret_node(state):
@@ -210,6 +230,12 @@ def chart_node(state):
 
 def classify_intent_node(state):
     user_input = state["input"]
+    
+    # Initialize or append to query_history
+    current_history = state.get("query_history", [])
+    if not current_history or current_history[-1] != user_input: # Avoid duplicate entries if re-processed
+         current_history.append(user_input)
+
     # ここをAzure OpenAIで複数分類に拡張
     prompt = f"""
     ユーザーの質問の意図を判定してください。
@@ -233,12 +259,19 @@ def classify_intent_node(state):
     """
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
-    return {**state, "intent_list": steps, "condition": "分類完了"}
+
+    user_input_lower = state["input"].lower()
+    if "clear data" in user_input_lower or "リセット" in user_input_lower:
+        steps = ["clear_data_intent"] # Prioritize clearing
+
+    return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
 # classifyノードの分岐（次に何へ進むか？）
 def classify_next(state):
     intents = state.get("intent_list", [])
-    if "メタデータ検索" in intents: # Prioritize metadata search if present
+    if "clear_data_intent" in intents: # Prioritize clear intent
+        return "clear_data"
+    elif "メタデータ検索" in intents: # Then metadata search
         return "metadata_retrieval" 
     elif "データ取得" in intents:
         return "sql"
@@ -298,6 +331,23 @@ def metadata_retrieval_node(state):
     
     return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
 
+def clear_data_node(state):
+    # Clear DataFrame, SQL, interpretation, chart, errors, and query history
+    # Keep 'input' and 'intent_list' as they are from the current query that triggered the clear.
+    # Also keep metadata_answer as per instructions.
+    return {
+        "input": state.get("input"), # Preserve current input
+        "intent_list": state.get("intent_list"), # Preserve current intent list
+        "df": None,
+        "SQL": None,
+        "interpretation": "データが正常にクリアされました。", # Confirmation message
+        "chart_result": None,
+        "metadata_answer": state.get("metadata_answer"), # Keep this
+        "condition": "データクリア完了",
+        "error": None,
+        "query_history": [] # Reset query history
+    }
+
 class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
@@ -308,6 +358,7 @@ class MyState(TypedDict, total=False):
     metadata_answer: Optional[str]   # メタデータ検索結果の回答
     condition: Optional[str]         # 各ノードの実行状態
     error: Optional[str]             # SQL等でエラーがあれば
+    query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
 
 def build_workflow():
     memory = MemorySaver()
@@ -317,12 +368,14 @@ def build_workflow():
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
     workflow.add_node("metadata_retrieval", metadata_retrieval_node) # 新しいノードを追加
+    workflow.add_node("clear_data", clear_data_node) # Add clear_data node
     
     workflow.add_conditional_edges("classify", classify_next)
     workflow.add_conditional_edges("sql", sql_next)
     workflow.add_conditional_edges("chart", chart_next)
     workflow.add_edge("interpret", END)
     workflow.add_edge("metadata_retrieval", END) # メタデータ検索後は終了
+    workflow.add_edge("clear_data", END) # Add edge for clear_data node
 
     workflow.set_entry_point("classify")
     return workflow.compile(checkpointer=memory)
