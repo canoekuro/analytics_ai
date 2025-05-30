@@ -27,6 +27,9 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=google_api_key
 ) # Or "gemini-1.5-flash", "gemini-1.5-pro" for higher capabilities
 
+CLEAR_DATA_KEYWORDS = ["clear data", "リセット"]
+DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
+
 #意図の判別
 
 def extract_sql(sql_text):
@@ -115,12 +118,19 @@ def sql_node(state):
     sql_generated_clean = extract_sql(sql_generated)
     print(sql_generated_clean)
     result_df, sql_error = try_sql_execute(sql_generated_clean)
-    if sql_error:
+    current_error = sql_error # Initialize current_error with the result of the first try
+
+    if sql_error: # If first attempt had an error
         # LLMで修正を依頼
-        sql_generated_clean = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, state["input"])
-        print(sql_generated_clean)
+        fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, state["input"])
+        print(fixed_sql) # Print the fixed SQL
         # 再実行
-        result_df, sql_error2 = try_sql_execute(sql_generated_clean)
+        result_df, sql_error2 = try_sql_execute(fixed_sql)
+        current_error = sql_error2 # Update current_error with the result of the second try
+        
+        # Update sql_generated_clean to the fixed version if a fix was attempted
+        sql_generated_clean = fixed_sql 
+
         if sql_error2:
             print("再実行でもエラー:", sql_error2)
         else:
@@ -128,16 +138,8 @@ def sql_node(state):
             if result_df is not None:
                  print(result_df)
     
-    # Ensure `sql_generated_clean`, `result_df`, and `current_error` are defined by this point.
-    # Note: The original code used `sql_error` and `sql_error2`. We'll use `current_error`
-    # to represent the final error state after attempting SQL execution and potential fixes.
-    # We need to ensure `current_error` is properly set based on `sql_error` and `sql_error2`.
-
-    current_error = None
-    if 'sql_error2' in locals() and sql_error2 is not None: # Error after fix attempt
-        current_error = sql_error2
-    elif 'sql_error' in locals() and sql_error is not None and result_df is None: # Error on first attempt, and no df from fix
-        current_error = sql_error
+    # current_error now holds the error from the last execution attempt (if any)
+    # sql_generated_clean holds the SQL that was last executed
 
     if result_df is not None:
         # New data successfully fetched
@@ -261,7 +263,7 @@ def classify_intent_node(state):
     steps = [x.strip() for x in result.split(",") if x.strip()]
 
     user_input_lower = state["input"].lower()
-    if "clear data" in user_input_lower or "リセット" in user_input_lower:
+    if any(keyword in user_input_lower for keyword in CLEAR_DATA_KEYWORDS):
         steps = ["clear_data_intent"] # Prioritize clearing
 
     return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
@@ -340,7 +342,7 @@ def clear_data_node(state):
         "intent_list": state.get("intent_list"), # Preserve current intent list
         "df": None,
         "SQL": None,
-        "interpretation": "データが正常にクリアされました。", # Confirmation message
+        "interpretation": DATA_CLEARED_MESSAGE, # Confirmation message
         "chart_result": None,
         "metadata_answer": state.get("metadata_answer"), # Keep this
         "condition": "データクリア完了",
