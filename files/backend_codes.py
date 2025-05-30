@@ -76,6 +76,9 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
 
 # SQL生成＋実行
 def sql_node(state):
+    state["df"] = None
+    state["interpretation"] = None
+    state["chart_result"] = None
     # 1. テーブル定義DBから検索
     retrieved_tables = vectorstore_tables.similarity_search(state["input"], k=3)
     rag_tables = "\n".join([doc.page_content for doc in retrieved_tables])
