@@ -1,4 +1,5 @@
 from langchain_community.vectorstores import FAISS
+import difflib # Make sure this import is added at the top of the file
 import sqlite3
 import pandas as pd
 from langgraph.graph import StateGraph, END
@@ -17,6 +18,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 
 google_api_key = os.getenv("GOOGLE_API_KEY")
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # Or other suitable Gemini embedding model
+SIMILARITY_THRESHOLD = 0.8
 
 # ベクトルストア
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
@@ -78,6 +80,39 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
     response = llm.invoke(prompt)
     fixed_sql = extract_sql(response.content)
     return fixed_sql
+
+def find_similar_query_node(state):
+    user_query = state["input"]
+    df_history = state.get("df_history", [])
+
+    print(f"User query: {user_query}") # For debugging
+    print(f"History length: {len(df_history)}") # For debugging
+
+    for entry in df_history:
+        if "query" not in entry: # Skip entries without a query
+            continue
+
+        similarity = difflib.SequenceMatcher(None, user_query, entry["query"]).ratio()
+        print(f"Comparing with '{entry['query']}': Similarity: {similarity:.2f}") # For debugging
+
+        if similarity >= SIMILARITY_THRESHOLD:
+            print(f"Similar query found with ID {entry.get('id', 'N/A')}. Reusing results.")
+            # Ensure all necessary fields from a normal sql_node success are present
+            return {
+                **state,
+                "latest_df": entry["dataframe_dict"],
+                "SQL": entry.get("SQL"),
+                "interpretation": None,
+                "chart_result": None,
+                "condition": "similar_query_found",
+                "error": None
+            }
+
+    print("No sufficiently similar query found in history.")
+    return {
+        **state,
+        "condition": "no_similar_query"
+    }
 
 # SQL生成＋実行
 def sql_node(state):
@@ -150,7 +185,8 @@ def sql_node(state):
             "id": uuid.uuid4().hex[:8],
             "query": state.get("input", ""), # Ensure 'input' key exists
             "timestamp": datetime.now().isoformat(),
-            "dataframe_dict": result_df_dict
+            "dataframe_dict": result_df_dict,
+            "SQL": sql_generated_clean # Add this line
         }
         current_df_history.append(new_history_entry)
 
@@ -288,7 +324,7 @@ def classify_next(state):
     elif "メタデータ検索" in intents: # Then metadata search
         return "metadata_retrieval" 
     elif "データ取得" in intents:
-        return "sql"
+        return "find_similar_query" # Changed from "sql"
     # These checks are likely redundant if metadata or data acquisition is primary
     elif "グラフ作成" in intents:
         return "chart" 
@@ -296,6 +332,19 @@ def classify_next(state):
         return "interpret"
     else:
         return END
+
+def find_similar_next(state):
+    if state.get("condition") == "similar_query_found":
+        # If a similar query is found, mimic sql_next logic
+        intents = state.get("intent_list", [])
+        if "グラフ作成" in intents:
+            return "chart"
+        elif "データ解釈" in intents:
+            return "interpret"
+        else:
+            return END
+    else: # "no_similar_query" or any other condition
+        return "sql"
 
 # sqlノード後の遷移
 def sql_next(state):
@@ -367,7 +416,7 @@ class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
     latest_df: Optional[list]        # 直近のSQL実行後のpandas.DataFrameのdict
-    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list}
+    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
     chart_result: Optional[str]      # グラフ画像（base64など）
@@ -380,6 +429,7 @@ def build_workflow():
     memory = MemorySaver()
     workflow = StateGraph(state_schema=MyState)
     workflow.add_node("classify", classify_intent_node)
+    workflow.add_node("find_similar_query", find_similar_query_node)
     workflow.add_node("sql", sql_node)
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
@@ -387,6 +437,7 @@ def build_workflow():
     workflow.add_node("clear_data", clear_data_node) # Add clear_data node
     
     workflow.add_conditional_edges("classify", classify_next)
+    workflow.add_conditional_edges("find_similar_query", find_similar_next)
     workflow.add_conditional_edges("sql", sql_next)
     workflow.add_conditional_edges("chart", chart_next)
     workflow.add_edge("interpret", END)
