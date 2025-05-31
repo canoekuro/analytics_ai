@@ -64,11 +64,14 @@ def try_sql_execute(sql_text):
 def transform_sql_error(sql_error: str) -> str:
     """Transforms raw SQL error messages into user-friendly messages."""
     if "no such table" in sql_error.lower():
-        return "The query could not be executed because a specified table was not found. Please check the table names."
+        return f"指定されたテーブルが見つからなかったため、クエリを実行できませんでした。テーブル名を確認してください。(詳細: {sql_error})"
     elif "no such column" in sql_error.lower():
-        return "The query could not be executed because a specified column was not found. Please check the column names."
+        return f"指定された列が見つからなかったため、クエリを実行できませんでした。列名を確認してください。(詳細: {sql_error})"
+    elif "syntax error" in sql_error.lower():
+        return f"SQL構文にエラーがあります。クエリを確認してください。(詳細: {sql_error})"
+    # Add more specific common SQL error translations if possible
     else:
-        return f"An error occurred while processing the SQL query. Technical details: {sql_error}"
+        return f"SQLクエリの処理中に予期せぬエラーが発生しました。管理者に連絡してください。(詳細: {sql_error})"
 
 def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_query):
     """エラー内容からSQL修正をAIに依頼"""

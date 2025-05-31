@@ -5,6 +5,7 @@ from PIL import Image
 from io import BytesIO
 import time
 from files.backend_codes import build_workflow
+import uuid # Add this import
 
 compiled_workflow = build_workflow()
 
@@ -30,14 +31,19 @@ if st.button("Clear Chat History"):
     st.session_state.chat_history = []
     st.session_state.memory_state = {} # Clear local frontend state
 
-    # Send a command to the backend to clear its state as well
-    config = {'configurable': {'thread_id': '1'}} # Use the appropriate thread_id
+    # Ensure a thread_id exists for the current session for clearing history
+    if "session_thread_id" not in st.session_state:
+        st.session_state["session_thread_id"] = str(uuid.uuid4())
+
+    # Use the session-specific thread_id for clearing
+    session_specific_thread_id = st.session_state["session_thread_id"]
+    config = {'configurable': {'thread_id': session_specific_thread_id}}
     try:
         # Directly invoke the backend with the special clear command
         compiled_workflow.invoke({"input": "SYSTEM_CLEAR_HISTORY"}, config=config)
-        st.success("Chat history and associated backend state have been cleared.")
+        st.success(f"Chat history and associated backend state for your session have been cleared.")
     except Exception as e:
-        st.error(f"Error clearing backend state: {e}")
+        st.error(f"Error clearing backend state for session {session_specific_thread_id}: {e}")
     st.rerun() # Rerun to refresh the UI cleanly after clearing
 
 # --- 3. チャットUI ---
@@ -53,7 +59,7 @@ with history_container:
         else:
             # assistant応答は「interpretation/普通テキスト」「df（データフレーム）」「chart_result（画像）」の3パターン
             with st.chat_message("assistant"):
-                if "error" in entry and entry["error"] and entry["error"] is not None:
+                if "error" in entry and entry["error"]: # Simplified check
                     st.error(entry['error']) # Display user-friendly error directly
 
                 if "interpretation" in entry:
@@ -126,7 +132,7 @@ if user_input:
 
     # --- 7. AIバブル差し替え ---
     with ai_msg_placeholder.chat_message("assistant"): # ai_msg_placeholder should still be valid
-        if "error" in res and res["error"] and res["error"] is not None:
+        if "error" in res and res["error"]: # Simplified check
             st.error(res['error']) # Display user-friendly error directly
 
         if "interpretation" in res and res["interpretation"]: # Ensure not None or empty
