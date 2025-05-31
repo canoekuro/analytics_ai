@@ -95,16 +95,14 @@ def find_similar_query_node(state: MyState) -> MyState:
     if not data_requirements:
         # No data requirements specified, so nothing to find.
         # This might happen if "データ取得" was not an intent but the node is still reached.
-        print("No data requirements to process in find_similar_query_node.")
         return {
             **state,
-            "latest_df": {}, # Ensure latest_df is an empty dict
+            "latest_df": collections.OrderedDict(), # Consistent initialization
             "missing_data_requirements": [],
             "condition": "no_requirements_specified" # New condition
         }
 
-    print(f"Processing data_requirements: {data_requirements}")
-    print(f"History length: {len(df_history)}")
+    found_data_map = collections.OrderedDict() # Initialize as OrderedDict
 
     for req in data_requirements:
         found_for_req = False
@@ -118,29 +116,29 @@ def find_similar_query_node(state: MyState) -> MyState:
             # Compare the current data requirement (req) with the query that generated the history entry.
             # This is an approximation. Ideally, history entries would be tagged with the requirements they satisfy.
             similarity = difflib.SequenceMatcher(None, req, entry.get("query", "")).ratio()
-            print(f"Comparing requirement '{req}' with history query '{entry.get('query', '')}': Similarity: {similarity:.2f}")
+            # print(f"Comparing requirement '{req}' with history query '{entry.get('query', '')}': Similarity: {similarity:.2f}") # DEBUG
 
             if similarity >= SIMILARITY_THRESHOLD and similarity > best_similarity_for_req:
                 best_similarity_for_req = similarity
                 best_match_entry = entry
 
         if best_match_entry:
-            print(f"Found similar data for requirement '{req}' in history (ID: {best_match_entry.get('id', 'N/A')}, Similarity: {best_similarity_for_req:.2f}).")
+            # print(f"Found similar data for requirement '{req}' in history (ID: {best_match_entry.get('id', 'N/A')}, Similarity: {best_similarity_for_req:.2f}).") # DEBUG
             found_data_map[req] = best_match_entry["dataframe_dict"]
             used_history_ids.add(best_match_entry.get("id"))
             found_for_req = True
 
         if not found_for_req:
-            print(f"No similar data found in history for requirement: '{req}'")
+            # print(f"No similar data found in history for requirement: '{req}'") # DEBUG
             missing_requirements.append(req)
 
     final_condition = ""
     if not missing_requirements:
         final_condition = "all_data_found"
-        print("All data requirements found in history.")
+        # print("All data requirements found in history.") # DEBUG
     else:
         final_condition = "missing_data"
-        print(f"Missing data requirements: {missing_requirements}")
+        # print(f"Missing data requirements: {missing_requirements}") # DEBUG
 
     return {
         **state,
@@ -175,9 +173,9 @@ def sql_node(state: MyState) -> MyState:
     """
 
     if missing_requirements:
-        print(f"Processing missing data requirements: {missing_requirements}")
+        # print(f"Processing missing data requirements: {missing_requirements}") # DEBUG
         for req_string in missing_requirements:
-            print(f"Attempting to fetch data for requirement: '{req_string}'")
+            # print(f"Attempting to fetch data for requirement: '{req_string}'") # DEBUG
 
             # 1. RAG specific to the requirement
             retrieved_tables_docs = vectorstore_tables.similarity_search(req_string, k=3)
@@ -208,24 +206,24 @@ def sql_node(state: MyState) -> MyState:
             ])
 
             sql_generated_clean = extract_sql(response.content.strip())
-            print(f"SQL generated for '{req_string}': {sql_generated_clean}")
+            # print(f"SQL generated for '{req_string}': {sql_generated_clean}") # DEBUG
             last_sql_generated = sql_generated_clean
             result_df, sql_error = try_sql_execute(sql_generated_clean)
 
             if sql_error:
-                print(f"Error executing SQL for '{req_string}': {sql_error}. Attempting to fix...")
+                # print(f"Error executing SQL for '{req_string}': {sql_error}. Attempting to fix...") # DEBUG
                 # Pass req_string as user_query context to fix_sql_with_llm
                 fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, req_string)
-                print(f"Fixed SQL for '{req_string}': {fixed_sql}")
+                # print(f"Fixed SQL for '{req_string}': {fixed_sql}") # DEBUG
                 last_sql_generated = fixed_sql
                 result_df, sql_error = try_sql_execute(fixed_sql)
 
             if sql_error:
-                print(f"Error persisted for requirement '{req_string}' after fix attempt: {sql_error}")
+                # print(f"Error persisted for requirement '{req_string}' after fix attempt: {sql_error}") # DEBUG
                 any_error_occurred = True
                 accumulated_errors.append(f"Failed to get data for '{req_string}': {sql_error}")
             elif result_df is not None:
-                print(f"Successfully fetched data for requirement: '{req_string}'")
+                # print(f"Successfully fetched data for requirement: '{req_string}'") # DEBUG
                 result_df_dict = result_df.to_dict(orient="records")
                 current_latest_df[req_string] = result_df_dict
 
@@ -238,7 +236,7 @@ def sql_node(state: MyState) -> MyState:
                 }
                 current_df_history.append(new_history_entry)
             else: # No error, but no data (e.g. SELECT query that returns 0 rows)
-                print(f"No data returned for requirement '{req_string}', but no SQL error.")
+                # print(f"No data returned for requirement '{req_string}', but no SQL error.") # DEBUG
                 # Storing empty list to signify the query ran but had no results for this req.
                 current_latest_df[req_string] = []
 
@@ -262,7 +260,6 @@ def sql_node(state: MyState) -> MyState:
 
     else:
         # Fallback to existing behavior: process state["input"] as a single query
-        print("No specific missing requirements. Processing state.input as a general query.")
         # This part largely mirrors the original single-query logic but adapts state update.
         retrieved_tables_docs = vectorstore_tables.similarity_search(overall_user_input, k=3)
         rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
@@ -284,13 +281,13 @@ def sql_node(state: MyState) -> MyState:
         ])
 
         sql_generated_clean = extract_sql(response.content.strip())
-        print(f"SQL generated for full input '{overall_user_input}': {sql_generated_clean}")
+        # print(f"SQL generated for full input '{overall_user_input}': {sql_generated_clean}") # DEBUG
         result_df, sql_error = try_sql_execute(sql_generated_clean)
         current_error_message = sql_error # For this path
 
         if sql_error:
             fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, overall_user_input)
-            print(f"Fixed SQL for full input: {fixed_sql}")
+            # print(f"Fixed SQL for full input: {fixed_sql}") # DEBUG
             sql_generated_clean = fixed_sql # Update to the fixed SQL
             result_df, sql_error = try_sql_execute(fixed_sql)
             current_error_message = sql_error
@@ -390,9 +387,9 @@ def chart_node(state: MyState) -> MyState:
         if first_df_data_list:
             df_to_plot = pd.DataFrame(first_df_data_list)
             chart_context_message = f"以下のデータ（「{first_req_string}」に関するもの）とユーザーからの依頼に答える"
-            print(f"Chart node: Using data for requirement '{first_req_string}' for charting.")
+            # print(f"Chart node: Using data for requirement '{first_req_string}' for charting.") # DEBUG
         else:
-            print(f"Chart node: Data for the first requirement '{first_req_string}' is empty.")
+            # print(f"Chart node: Data for the first requirement '{first_req_string}' is empty.") # DEBUG
             return {**state, "chart_result": None, "condition": "グラフ化失敗"}
 
     elif isinstance(latest_df_data, list): # Fallback for old format
@@ -402,7 +399,7 @@ def chart_node(state: MyState) -> MyState:
         chart_context_message = "以下のdf（pandas DataFrame）とユーザーからの依頼に答える"
 
     if df_to_plot is None or df_to_plot.empty:
-        print("Chart node: No valid DataFrame to plot.")
+        # print("Chart node: No valid DataFrame to plot.") # DEBUG
         return {**state, "chart_result": None, "condition": "グラフ化失敗"}
 
     python_tool = PythonAstREPLTool(
@@ -505,7 +502,7 @@ def extract_data_requirements_node(state):
     else:
         extracted_requirements = [req.strip() for req in extracted_requirements_str.split(",") if req.strip()]
 
-    print(f"Extracted data requirements: {extracted_requirements}") # For debugging
+    # print(f"Extracted data requirements: {extracted_requirements}") # DEBUG
 
     return {
         **state,
@@ -539,7 +536,7 @@ def find_similar_next(state: MyState):
     intents = state.get("intent_list", [])
 
     if condition == "all_data_found":
-        print("Transitioning from find_similar_query: All data found.")
+        # print("Transitioning from find_similar_query: All data found.") # DEBUG
         # All data requirements are met from history. Proceed to next steps based on intent.
         if "グラフ作成" in intents:
             return "chart"
@@ -548,7 +545,7 @@ def find_similar_next(state: MyState):
         else:
             return END # All data found, but no further processing requested.
     elif condition == "missing_data":
-        print("Transitioning from find_similar_query: Missing data. Proceeding to SQL node.")
+        # print("Transitioning from find_similar_query: Missing data. Proceeding to SQL node.") # DEBUG
         # Some data is missing, so go to sql_node to fetch it.
         # sql_node will (eventually) need to know what's in "missing_data_requirements".
         return "sql"
@@ -556,7 +553,7 @@ def find_similar_next(state: MyState):
         # This case implies "データ取得" was not an intent, or requirements extraction failed.
         # If there are other intents like chart/interpret, they might operate on whatever is in latest_df.
         # Or, it could be an end state if no other actions are specified.
-        print("Transitioning from find_similar_query: No data requirements were specified.")
+        # print("Transitioning from find_similar_query: No data requirements were specified.") # DEBUG
         if "グラフ作成" in intents:
             return "chart"
         elif "データ解釈" in intents:
@@ -564,7 +561,7 @@ def find_similar_next(state: MyState):
         else:
             return END # No specific data needed, and no further actions.
     else: # Default fallback, should ideally not be reached if conditions are comprehensive
-        print(f"Transitioning from find_similar_query: Unknown condition ('{condition}'). Defaulting to SQL node.")
+        # print(f"Transitioning from find_similar_query: Unknown condition ('{condition}'). Defaulting to SQL node.") # DEBUG
         return "sql"
 
 
@@ -623,7 +620,7 @@ def clear_data_node(state):
     return {
         "input": state.get("input"), # Preserve current input
         "intent_list": state.get("intent_list"), # Preserve current intent list
-        "latest_df": None, # Updated field name and cleared
+        "latest_df": collections.OrderedDict(), # Consistent initialization
         "df_history": [],  # New field, cleared
         "SQL": None,
         "interpretation": DATA_CLEARED_MESSAGE, # Confirmation message
@@ -689,7 +686,7 @@ config = {"configurable": {"thread_id": "2"}} # Changed thread_id for potentiall
 # user_query = "A商品の売上データをグラフにして"
 
 res = workflow.invoke({"input": user_query}, config=config) # Use the original user_query for now
-print(res)
+# print(res) # DEBUG - Main workflow output
 
 # Example of how to populate df_history for testing
 # You'd need to run this separately or ensure your DB has these from previous runs.

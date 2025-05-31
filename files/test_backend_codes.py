@@ -92,7 +92,7 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "all_data_found")
-        self.assertIsInstance(result_state["latest_df"], dict) # Should be a dict, or OrderedDict
+        self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
         self.assertEqual(len(result_state["latest_df"]), 2)
         self.assertEqual(result_state["latest_df"]["A商品の売上集計"], [{"product": "A", "sales": 100}])
         self.assertEqual(result_state["latest_df"]["顧客属性データ"], [{"user_id": 1, "age": 30}])
@@ -116,7 +116,7 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "missing_data")
-        self.assertIsInstance(result_state["latest_df"], dict)
+        self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
         self.assertEqual(len(result_state["latest_df"]), 1)
         self.assertTrue("A商品の売上" in result_state["latest_df"])
         self.assertEqual(result_state["latest_df"]["A商品の売上"], [{"product": "A", "sales": 100}])
@@ -137,7 +137,7 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "missing_data")
-        self.assertIsInstance(result_state["latest_df"], dict)
+        self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
         self.assertEqual(len(result_state["latest_df"]), 0)
         self.assertEqual(len(result_state["missing_data_requirements"]), 2)
         self.assertIn("A商品の売上", result_state["missing_data_requirements"])
@@ -154,8 +154,8 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "no_requirements_specified")
-        self.assertIsInstance(result_state["latest_df"], dict)
-        self.assertEqual(len(result_state["latest_df"]), 0)
+        self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
+        self.assertEqual(result_state["latest_df"], collections.OrderedDict()) # Check for empty OrderedDict
         self.assertEqual(result_state["missing_data_requirements"], [])
 
     def test_history_entry_used_once(self):
@@ -175,7 +175,7 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "missing_data")
-        self.assertIsInstance(result_state["latest_df"], dict)
+        self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
         self.assertEqual(len(result_state["latest_df"]), 1) # Only one should be found
 
         # Verify which one was found and which is missing
@@ -366,6 +366,40 @@ class TestSqlNode(unittest.TestCase):
         self.assertEqual(mock_try_sql.call_count, 3)
 
         self.assertEqual(result_state.get("missing_data_requirements"), ["Error Req"])
+
+
+# Import clear_data_node for testing
+from files.backend_codes import clear_data_node, DATA_CLEARED_MESSAGE
+
+class TestClearDataNode(unittest.TestCase):
+    def test_clear_data_node_resets_state_correctly(self):
+        initial_state = MyState(
+            input="リセットして",
+            intent_list=["clear_data_intent"],
+            latest_df=collections.OrderedDict({"some_data": [{"col": "val"}]}),
+            df_history=[{"id": "old_id", "query": "old_query", "dataframe_dict": [], "SQL": "OLD SQL"}],
+            SQL="SELECT * FROM old_table",
+            interpretation="Old interpretation",
+            chart_result="old_chart_base64",
+            metadata_answer="Old metadata", # This should be preserved as per current clear_data_node
+            condition="some_condition",
+            error="some_error",
+            query_history=["q1", "q2"]
+        )
+
+        cleared_state = clear_data_node(initial_state)
+
+        self.assertEqual(cleared_state["input"], "リセットして") # Preserved
+        self.assertEqual(cleared_state["intent_list"], ["clear_data_intent"]) # Preserved
+        self.assertEqual(cleared_state["latest_df"], collections.OrderedDict()) # Reset to empty OrderedDict
+        self.assertEqual(cleared_state["df_history"], []) # Cleared
+        self.assertIsNone(cleared_state["SQL"]) # Cleared
+        self.assertEqual(cleared_state["interpretation"], DATA_CLEARED_MESSAGE) # Set to cleared message
+        self.assertIsNone(cleared_state["chart_result"]) # Cleared
+        self.assertEqual(cleared_state["metadata_answer"], "Old metadata") # Preserved
+        self.assertEqual(cleared_state["condition"], "データクリア完了")
+        self.assertIsNone(cleared_state["error"]) # Cleared
+        self.assertEqual(cleared_state["query_history"], []) # Cleared
 
 
 class TestWorkflow(unittest.TestCase):
