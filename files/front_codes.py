@@ -34,9 +34,36 @@ for entry in st.session_state["chat_history"]:
         with st.chat_message("assistant"):
             if "interpretation" in entry:
                 st.write(entry["interpretation"])
-            if "latest_df" in entry and entry["latest_df"]:
-                df_disp = pd.DataFrame(entry["latest_df"])
-                st.dataframe(df_disp)
+
+            # --- Displaying latest_df (potentially multiple DataFrames) ---
+            if "latest_df" in entry and entry["latest_df"] is not None:
+                latest_df_data = entry["latest_df"]
+                if isinstance(latest_df_data, dict): # New OrderedDict format
+                    if not latest_df_data: # Empty dict
+                        st.write("取得されたデータはありません。")
+                    for req_string, df_data_list in latest_df_data.items():
+                        st.write(f"データ: 「{req_string}」")
+                        if df_data_list:
+                            try:
+                                df_disp = pd.DataFrame(df_data_list)
+                                st.dataframe(df_disp)
+                            except Exception as e:
+                                st.error(f"DataFrame表示エラー ({req_string}): {e}")
+                                st.write(df_data_list) # Display raw data if error
+                        else:
+                            st.write("(この要件に対するデータはありません)")
+                elif isinstance(latest_df_data, list): # Fallback for old list format
+                    if latest_df_data:
+                        try:
+                            df_disp = pd.DataFrame(latest_df_data)
+                            st.dataframe(df_disp)
+                        except Exception as e:
+                            st.error(f"DataFrame表示エラー (旧形式): {e}")
+                            st.write(latest_df_data)
+                    else:
+                        st.write("取得されたデータはありません。 (旧形式)")
+                # else: could be other types if state is corrupted, ignore for now
+
             if "chart_result" in entry and entry["chart_result"]:
                 chart_img = base64.b64decode(entry["chart_result"])
                 st.image(chart_img, caption="AI生成グラフ")
@@ -63,10 +90,38 @@ if user_input:
 
     # --- 7. AIバブル差し替え ---
     with ai_msg_placeholder.chat_message("assistant"):
-        if "interpretation" in res:
+        if "interpretation" in res and res["interpretation"]: # Ensure not None or empty
             st.write(res["interpretation"])
-        if "latest_df" in res and res["latest_df"]:
-            st.dataframe(pd.DataFrame(res["latest_df"]))
+
+        # --- Displaying latest_df from live response ---
+        if "latest_df" in res and res["latest_df"] is not None:
+            latest_df_data = res["latest_df"]
+            if isinstance(latest_df_data, dict): # New OrderedDict format
+                if not latest_df_data:
+                     st.write("取得されたデータはありません。")
+                for req_string, df_data_list in latest_df_data.items():
+                    st.write(f"データ: 「{req_string}」")
+                    if df_data_list:
+                        try:
+                            df_disp = pd.DataFrame(df_data_list)
+                            st.dataframe(df_disp)
+                        except Exception as e:
+                            st.error(f"DataFrame表示エラー ({req_string}): {e}")
+                            st.write(df_data_list)
+                    else:
+                        st.write("(この要件に対するデータはありません)")
+            elif isinstance(latest_df_data, list): # Fallback for old list format
+                if latest_df_data:
+                    try:
+                        df_disp = pd.DataFrame(latest_df_data)
+                        st.dataframe(df_disp)
+                    except Exception as e:
+                        st.error(f"DataFrame表示エラー (旧形式): {e}")
+                        st.write(latest_df_data)
+                else:
+                    st.write("取得されたデータはありません。 (旧形式)")
+            # else: could be other types if state is corrupted, ignore for now
+
         if "chart_result" in res and res["chart_result"]:
             st.image(base64.b64decode(res["chart_result"]), caption="AI生成グラフ")
     # --- 8. 履歴に保存 ---
