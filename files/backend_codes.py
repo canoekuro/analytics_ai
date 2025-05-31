@@ -2,6 +2,7 @@ from langchain_community.vectorstores import FAISS
 import difflib # Make sure this import is added at the top of the file
 import sqlite3
 import pandas as pd
+import logging
 from langgraph.graph import StateGraph, END
 from langchain.agents import Tool, initialize_agent
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
@@ -16,6 +17,9 @@ import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
+# Configure basic logging
+logging.basicConfig(level=logging.INFO)
+
 google_api_key = os.getenv("GOOGLE_API_KEY")
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # Or other suitable Gemini embedding model
 SIMILARITY_THRESHOLD = 0.8
@@ -24,14 +28,15 @@ SIMILARITY_THRESHOLD = 0.8
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
 
+# Get LLM model name from environment variable, with a default
+llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-2.0-flash-lite")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash-lite", 
+    model=llm_model_name,
     temperature=0,
     google_api_key=google_api_key
 ) # Or "gemini-1.5-flash", "gemini-1.5-pro" for higher capabilities
 
-CLEAR_DATA_KEYWORDS = ["clear data", "リセット"]
 DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
 
 #意図の判別
@@ -53,8 +58,21 @@ def try_sql_execute(sql_text):
         df = pd.read_sql(sql_text, conn)
         return df, None
     except Exception as e:
+        logging.error(f"SQL execution failed. Error: {e}\nSQL: {sql_text}", exc_info=True)
         return None, str(e)
     
+def transform_sql_error(sql_error: str) -> str:
+    """Transforms raw SQL error messages into user-friendly messages."""
+    if "no such table" in sql_error.lower():
+        return f"指定されたテーブルが見つからなかったため、クエリを実行できませんでした。テーブル名を確認してください。(詳細: {sql_error})"
+    elif "no such column" in sql_error.lower():
+        return f"指定された列が見つからなかったため、クエリを実行できませんでした。列名を確認してください。(詳細: {sql_error})"
+    elif "syntax error" in sql_error.lower():
+        return f"SQL構文にエラーがあります。クエリを確認してください。(詳細: {sql_error})"
+    # Add more specific common SQL error translations if possible
+    else:
+        return f"SQLクエリの処理中に予期せぬエラーが発生しました。管理者に連絡してください。(詳細: {sql_error})"
+
 def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_query):
     """エラー内容からSQL修正をAIに依頼"""
     prompt = f"""
@@ -207,21 +225,34 @@ def sql_node(state: MyState) -> MyState:
 
             sql_generated_clean = extract_sql(response.content.strip())
             # print(f"SQL generated for '{req_string}': {sql_generated_clean}") # DEBUG
+            original_sql_for_logging = sql_generated_clean # Store for logging if fix fails
             last_sql_generated = sql_generated_clean
             result_df, sql_error = try_sql_execute(sql_generated_clean)
 
             if sql_error:
-                # print(f"Error executing SQL for '{req_string}': {sql_error}. Attempting to fix...") # DEBUG
+                logging.warning(
+                    f"Initial SQL execution failed for requirement. "
+                    f"User requirement: '{req_string}', "
+                    f"Generated SQL: '{sql_generated_clean}', "
+                    f"Error: {sql_error}. Attempting to fix..."
+                )
                 # Pass req_string as user_query context to fix_sql_with_llm
                 fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, req_string)
                 # print(f"Fixed SQL for '{req_string}': {fixed_sql}") # DEBUG
                 last_sql_generated = fixed_sql
                 result_df, sql_error = try_sql_execute(fixed_sql)
 
-            if sql_error:
-                # print(f"Error persisted for requirement '{req_string}' after fix attempt: {sql_error}") # DEBUG
-                any_error_occurred = True
-                accumulated_errors.append(f"Failed to get data for '{req_string}': {sql_error}")
+                if sql_error: # Error persisted after fix attempt
+                    logging.error(
+                        f"SQL execution failed definitively for requirement. "
+                        f"User requirement: '{req_string}', "
+                        f"Original SQL: '{original_sql_for_logging}', "
+                        f"Fixed SQL: '{fixed_sql}', "
+                        f"Error: {sql_error}"
+                    )
+                    any_error_occurred = True
+                    user_friendly_error = transform_sql_error(sql_error)
+                    accumulated_errors.append(f"For '{req_string}': {user_friendly_error}")
             elif result_df is not None:
                 # print(f"Successfully fetched data for requirement: '{req_string}'") # DEBUG
                 result_df_dict = result_df.to_dict(orient="records")
@@ -282,15 +313,43 @@ def sql_node(state: MyState) -> MyState:
 
         sql_generated_clean = extract_sql(response.content.strip())
         # print(f"SQL generated for full input '{overall_user_input}': {sql_generated_clean}") # DEBUG
+        original_sql_for_logging = sql_generated_clean # Store for logging if fix fails
         result_df, sql_error = try_sql_execute(sql_generated_clean)
-        current_error_message = sql_error # For this path
+        current_error_message = None # Initialize
 
         if sql_error:
+            logging.warning(
+                f"Initial SQL execution failed for full input. "
+                f"User input: '{overall_user_input}', "
+                f"Generated SQL: '{sql_generated_clean}', "
+                f"Error: {sql_error}. Attempting to fix..."
+            )
             fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, overall_user_input)
             # print(f"Fixed SQL for full input: {fixed_sql}") # DEBUG
-            sql_generated_clean = fixed_sql # Update to the fixed SQL
-            result_df, sql_error = try_sql_execute(fixed_sql)
-            current_error_message = sql_error
+            # sql_generated_clean should store the fixed_sql if a fix was attempted, for logging purposes.
+            # However, if the fixed_sql also fails, sql_generated_clean (which becomes original_sql_for_logging in the next error log)
+            # should be the original one, and fixed_sql is the one that failed.
+            # Let's adjust: use a different variable for the SQL that is currently being executed.
+            current_executed_sql = fixed_sql
+            result_df, sql_error = try_sql_execute(current_executed_sql)
+
+            if sql_error: # Error persisted after fix attempt
+                logging.error(
+                    f"SQL execution failed definitively for full input. "
+                    f"User input: '{overall_user_input}', "
+                    f"Original SQL: '{original_sql_for_logging}', "
+                    f"Fixed SQL: '{current_executed_sql}', "
+                    f"Error: {sql_error}"
+                )
+                current_error_message = transform_sql_error(sql_error)
+                # sql_generated_clean for the state should reflect the last SQL that was tried and failed.
+                sql_generated_clean = current_executed_sql
+            else: # Fix was successful
+                current_error_message = None # Clear error if fix was successful
+                sql_generated_clean = current_executed_sql # Update to the successfully fixed SQL
+        else: # No initial error
+             current_error_message = None
+             # sql_generated_clean is already the initially generated SQL, which was successful.
 
         if result_df is not None:
             result_df_dict = result_df.to_dict(orient="records")
@@ -321,7 +380,7 @@ def sql_node(state: MyState) -> MyState:
                 "latest_df": current_latest_df, # Potentially empty if it was before
                 "SQL": sql_generated_clean,
                 "condition": "SQL実行失敗",
-                "error": current_error_message
+                "error": current_error_message # This will be the user-friendly message or None
             }
 
 # 解釈
@@ -438,10 +497,20 @@ def chart_node(state: MyState) -> MyState:
 
 def classify_intent_node(state):
     user_input = state["input"]
-    
-    # Initialize or append to query_history
+    if user_input == "SYSTEM_CLEAR_HISTORY":
+        # Preserve existing query_history if any, or initialize
+        current_history = state.get("query_history", [])
+        return {
+            **state,
+            "intent_list": ["clear_data_intent"],
+            "condition": "分類完了", # Match standard condition output
+            "query_history": current_history # Preserve history up to this point if needed by clear_data_node
+        }
+
+    # Initialize or append to query_history (moved down)
     current_history = state.get("query_history", [])
-    if not current_history or current_history[-1] != user_input: # Avoid duplicate entries if re-processed
+    # Avoid duplicating system messages or if history already has this exact user input as last item
+    if not current_history or current_history[-1] != user_input:
          current_history.append(user_input)
 
     # ここをAzure OpenAIで複数分類に拡張
@@ -467,10 +536,6 @@ def classify_intent_node(state):
     """
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
-
-    user_input_lower = state["input"].lower()
-    if any(keyword in user_input_lower for keyword in CLEAR_DATA_KEYWORDS):
-        steps = ["clear_data_intent"] # Prioritize clearing
 
     return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
