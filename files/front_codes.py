@@ -13,27 +13,51 @@ if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
 if "memory_state" not in st.session_state:
     st.session_state["memory_state"] = {}
+if "disabled" not in st.session_state: # Initialization for chat input disable state
+    st.session_state["disabled"] = False
 
 # --- 2. ワークフローのセットアップ（必要ならキャッシュ） ---
+MAX_HISTORY_DISPLAY = 20 # Max number of chat messages to display
+
 @st.cache_resource
 def get_workflow():
     return build_workflow()
 
 compiled_workflow = get_workflow()
 
+# --- Clear History Button ---
+if st.button("Clear Chat History"):
+    st.session_state.chat_history = []
+    st.session_state.memory_state = {} # Clear local frontend state
+
+    # Send a command to the backend to clear its state as well
+    config = {'configurable': {'thread_id': '1'}} # Use the appropriate thread_id
+    try:
+        # Directly invoke the backend with the special clear command
+        compiled_workflow.invoke({"input": "SYSTEM_CLEAR_HISTORY"}, config=config)
+        st.success("Chat history and associated backend state have been cleared.")
+    except Exception as e:
+        st.error(f"Error clearing backend state: {e}")
+    st.rerun() # Rerun to refresh the UI cleanly after clearing
+
 # --- 3. チャットUI ---
 st.title("SQL生成&データ解釈チャットAI")
 
-# 3.1 履歴の表示（直近10件まで、または全件）
-for entry in st.session_state["chat_history"]:
-    role = entry["role"]
-    if role == "user":
-        st.chat_message("user").write(entry["content"])
-    else:
-        # assistant応答は「interpretation/普通テキスト」「df（データフレーム）」「chart_result（画像）」の3パターン
-        with st.chat_message("assistant"):
-            if "interpretation" in entry:
-                st.write(entry["interpretation"])
+# 3.1 履歴の表示（直近MAX_HISTORY_DISPLAY件まで）
+history_container = st.container(height=500)
+with history_container:
+    for entry in st.session_state["chat_history"][-MAX_HISTORY_DISPLAY:]:
+        role = entry["role"]
+        if role == "user":
+            st.chat_message("user").write(entry["content"])
+        else:
+            # assistant応答は「interpretation/普通テキスト」「df（データフレーム）」「chart_result（画像）」の3パターン
+            with st.chat_message("assistant"):
+                if "error" in entry and entry["error"] and entry["error"] is not None:
+                    st.error(entry['error']) # Display user-friendly error directly
+
+                if "interpretation" in entry:
+                    st.write(entry["interpretation"])
 
             # --- Displaying latest_df (potentially multiple DataFrames) ---
             if "latest_df" in entry and entry["latest_df"] is not None:
@@ -69,27 +93,42 @@ for entry in st.session_state["chat_history"]:
                 st.image(chart_img, caption="AI生成グラフ")
 
 # 3.2 ユーザー入力受付
-user_input = st.chat_input("質問を入力してください（例: 'カテゴリごとの合計販売金額を出して'）")
+user_input = st.chat_input(
+    "質問を入力してください（例: 'カテゴリごとの合計販売金額を出して'）",
+    disabled=st.session_state.get("disabled", False)
+)
 if user_input:
-    # --- 4. ユーザー入力バブルを即時表示 ---
+    # --- 4. ユーザー入力バブルを即時表示 & 入力フィールドを無効化 ---
     st.chat_message("user").write(user_input)
     st.session_state["chat_history"].append({"role": "user", "content": user_input})
 
+    st.session_state.disabled = True
+    st.rerun() # Immediately disable input and refresh to show user message before "thinking"
+
     # --- 5. AIバブル(typing演出) ---
+    # This part will run after the rerun caused by disabling the input
     ai_msg_placeholder = st.empty()
-    for i in range(8):  # 約4秒間タイピング演出
-        dots = "." * ((i % 4) + 1)
-        ai_msg_placeholder.chat_message("assistant").write(f"AI is thinking{dots} _typing_ :speech_balloon:")
-        time.sleep(0.5)
+    # Only show typing if it's actually processing (i.e., input was just submitted)
+    # This check helps prevent re-showing typing animation on subsequent reruns if state changes elsewhere
+    if st.session_state.get("disabled", False): # Check if we are in "processing" mode
+        for i in range(8):  # 約4秒間タイピング演出
+            dots = "." * ((i % 4) + 1)
+            ai_msg_placeholder.chat_message("assistant").write(f"AI is thinking{dots} _typing_ :speech_balloon:")
+            time.sleep(0.5)
 
     # --- 6. LangGraphバックエンド呼び出し ---
     config = {'configurable': {'thread_id': '1'}}
+    # Retrieve the latest user_input from chat_history as user_input variable might be from previous run post rerun
+    current_user_input = st.session_state["chat_history"][-1]["content"]
     input_state = dict(st.session_state.get("memory_state", {}))
-    input_state["input"] = user_input
+    input_state["input"] = current_user_input # Use the most recent input
     res = compiled_workflow.invoke(input_state, config)
 
     # --- 7. AIバブル差し替え ---
-    with ai_msg_placeholder.chat_message("assistant"):
+    with ai_msg_placeholder.chat_message("assistant"): # ai_msg_placeholder should still be valid
+        if "error" in res and res["error"] and res["error"] is not None:
+            st.error(res['error']) # Display user-friendly error directly
+
         if "interpretation" in res and res["interpretation"]: # Ensure not None or empty
             st.write(res["interpretation"])
 
@@ -124,6 +163,10 @@ if user_input:
 
         if "chart_result" in res and res["chart_result"]:
             st.image(base64.b64decode(res["chart_result"]), caption="AI生成グラフ")
-    # --- 8. 履歴に保存 ---
+
+    # --- 8. 履歴に保存 & 入力フィールドを再度有効化 ---
     st.session_state["chat_history"].append({"role": "assistant", **res})
-    st.session_state["memory_state"] = res
+    st.session_state["memory_state"] = res # Save the full state for potential resume
+
+    st.session_state.disabled = False
+    st.rerun() # Re-enable input and refresh UI

@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch, MagicMock, call
 import pandas as pd
+import difflib # Added for mocking SequenceMatcher
+import sqlite3 # For testing try_sql_execute with in-memory DB
 import collections
 import uuid
 from datetime import datetime
@@ -12,6 +14,7 @@ from files.backend_codes import (
     find_similar_query_node,
     sql_node,
     build_workflow,
+    try_sql_execute, # Import for direct testing
     # For mocking, we might need to patch where they are *used* if not careful with direct imports
     # However, for llm, vectorstores, these are global in backend_codes, so patching them there is fine.
 )
@@ -98,14 +101,25 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         self.assertEqual(result_state["latest_df"]["顧客属性データ"], [{"user_id": 1, "age": 30}])
         self.assertEqual(result_state["missing_data_requirements"], [])
 
-    def test_some_requirements_missing(self):
+    @patch('files.backend_codes.SIMILARITY_THRESHOLD', 0.8) # Fix threshold for this test
+    @patch('files.backend_codes.difflib.SequenceMatcher')
+    def test_some_requirements_missing(self, MockSequenceMatcher, mock_threshold):
+        # Configure the mock instance that will be created inside find_similar_query_node
+        mock_matcher_instance = MockSequenceMatcher.return_value
+
+        # This list will provide return values for successive calls to ratio().
+        # Order:
+        # 1. Req "A商品の売上" vs Hist "A商品の売上集計" -> Found
+        # 2. Req "B商品の在庫" vs Hist "A商品の売上集計" -> Not Found
+        mock_matcher_instance.ratio.side_effect = [
+            0.9, # Above 0.8 threshold
+            0.5  # Below 0.8 threshold
+        ]
+
         sample_history_entry_1 = {
-            "id": "hist_001", "query": "A商品の売上集計", "timestamp": "ts1", # Matches "A商品の売上" well
+            "id": "hist_001", "query": "A商品の売上集計", "timestamp": "ts1",
             "dataframe_dict": [{"product": "A", "sales": 100}], "SQL": "SQL1"
         }
-        # This setup assumes SIMILARITY_THRESHOLD in backend_codes.py is around 0.6-0.8 for this to work.
-        # "A商品の売上" vs "A商品の売上集計" should be high.
-        # "B商品の在庫" vs "A商品の売上集計" should be low.
         state = MyState(
             input="A商品の売上とB商品の在庫データが欲しい",
             data_requirements=["A商品の売上", "B商品の在庫"],
@@ -158,35 +172,57 @@ class TestFindSimilarQueryNode(unittest.TestCase):
         self.assertEqual(result_state["latest_df"], collections.OrderedDict()) # Check for empty OrderedDict
         self.assertEqual(result_state["missing_data_requirements"], [])
 
-    def test_history_entry_used_once(self):
+    @patch('files.backend_codes.SIMILARITY_THRESHOLD', 0.8) # Fix threshold for this test
+    @patch('files.backend_codes.difflib.SequenceMatcher')
+    def test_history_entry_used_once(self, MockSequenceMatcher, mock_threshold):
+        mock_matcher_instance = MockSequenceMatcher.return_value
+
+        # Scenario:
+        # Req 1: "A商品の詳細"
+        # Req 2: "A商品の情報"
+        # History 1: "A商品の詳細データ"
+        #
+        # Comparisons made by find_similar_query_node (order matters):
+        # Loop 1 (req "A商品の詳細"):
+        #   - "A商品の詳細" vs "A商品の詳細データ" -> ratio() call 1
+        # Loop 2 (req "A商品の情報"):
+        #   - "A商品の情報" vs "A商品の詳細データ" -> ratio() call 2 (if history not used yet)
+        #
+        # We want "A商品の詳細" to match "A商品の詳細データ" strongly.
+        # We want "A商品の情報" to match "A商品の詳細データ" less strongly (or below threshold),
+        # or ensure that if it does match, the history entry is already used.
+        # Let's make "A商品の詳細" the clear winner and ensure it uses the history.
+        # Then "A商品の情報" will find the history entry already used.
+
+        mock_matcher_instance.ratio.side_effect = [
+            0.95, # "A商品の詳細" vs "A商品の詳細データ" (high, above threshold)
+            0.85  # "A商品の情報" vs "A商品の詳細データ" (also above, but history will be used)
+                  # This value doesn't strictly matter if the history is correctly marked as used.
+                  # If it were below threshold, that would also work for this test's logic.
+        ]
+
         sample_history_entry_1 = {
             "id": "hist_001", "query": "A商品の詳細データ", "timestamp": "ts1",
             "dataframe_dict": [{"product": "A", "detail": "very detailed"}], "SQL": "SQL_A_detail"
         }
         state = MyState(
-            input="A商品の詳細とA商品の情報", # Two requirements
-            data_requirements=["A商品の詳細", "A商品の情報"],
-            df_history=[sample_history_entry_1], # Only one relevant history entry
+            input="A商品の詳細とA商品の情報",
+            data_requirements=["A商品の詳細", "A商品の情報"], # Order of requirements processing
+            df_history=[sample_history_entry_1],
             intent_list=["データ取得"]
         )
-        # backend_codes.SIMILARITY_THRESHOLD will determine if "A商品の情報" matches "A商品の詳細データ"
-        # Assuming "A商品の詳細" is a better or earlier match.
 
         result_state = find_similar_query_node(state)
 
         self.assertEqual(result_state["condition"], "missing_data")
         self.assertIsInstance(result_state["latest_df"], collections.OrderedDict)
-        self.assertEqual(len(result_state["latest_df"]), 1) # Only one should be found
+        self.assertEqual(len(result_state["latest_df"]), 1)
 
-        # Verify which one was found and which is missing
-        if "A商品の詳細" in result_state["latest_df"]:
-            self.assertEqual(result_state["latest_df"]["A商品の詳細"], [{"product": "A", "detail": "very detailed"}])
-            self.assertIn("A商品の情報", result_state["missing_data_requirements"])
-        elif "A商品の情報" in result_state["latest_df"]: # This case depends on similarity scoring
-            self.assertEqual(result_state["latest_df"]["A商品の情報"], [{"product": "A", "detail": "very detailed"}])
-            self.assertIn("A商品の詳細", result_state["missing_data_requirements"])
-        else:
-            self.fail("The found data in latest_df does not match any of the expected requirements.")
+        # "A商品の詳細" should be found because it's processed first and has a high similarity
+        self.assertIn("A商品の詳細", result_state["latest_df"])
+        self.assertEqual(result_state["latest_df"]["A商品の詳細"], [{"product": "A", "detail": "very detailed"}])
+        self.assertIn("A商品の情報", result_state["missing_data_requirements"])
+        self.assertNotIn("A商品の情報", result_state["latest_df"])
 
 
 class TestSqlNode(unittest.TestCase):
@@ -199,6 +235,8 @@ class TestSqlNode(unittest.TestCase):
     def test_sql_node_with_missing_requirements(
         self, mock_uuid, mock_try_sql, mock_llm, mock_vs_queries, mock_vs_tables
     ):
+        # This test does not directly depend on SIMILARITY_THRESHOLD, so no changes needed for that.
+        # Keeping it here just to show its position relative to the modified tests.
         mock_uuid.return_value = MagicMock(hex=MagicMock(return_value="test_uuid_".ljust(8, '0'))) # Ensure 8 chars for [:8] slice
 
         # --- Mocking RAG results ---
@@ -368,8 +406,366 @@ class TestSqlNode(unittest.TestCase):
         self.assertEqual(result_state.get("missing_data_requirements"), ["Error Req"])
 
 
+class TestSqlNodeCorrection(unittest.TestCase):
+
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.vectorstore_queries.similarity_search')
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.uuid.uuid4')
+    def test_sql_correction_successful(
+        self, mock_uuid, mock_try_sql, mock_llm, mock_vs_queries, mock_vs_tables
+    ):
+        mock_uuid.return_value = MagicMock(hex=MagicMock(return_value="corr_ok_".ljust(8, '0')))
+        req_string = "Sales for Product X"
+        initial_sql = "SELECT sale FROM productX_sales;" # Intentionally problematic
+        fixed_sql = "SELECT sales FROM product_X_sales;" # Corrected SQL
+        expected_df_data = [{"sales": 100}]
+        expected_df = pd.DataFrame(expected_df_data)
+
+        # RAG mocks (called for initial SQL gen and for fix_sql_with_llm)
+        mock_vs_tables.return_value = [MagicMock(page_content="Table: product_X_sales (sales, product_id)")]
+        mock_vs_queries.return_value = [MagicMock(page_content="SELECT sales FROM product_X_sales WHERE product_id = 'X'")]
+
+        # LLM sequence:
+        # 1. Initial SQL generation
+        # 2. fix_sql_with_llm (receives error, generates fixed_sql)
+        mock_llm.invoke.side_effect = [
+            MagicMock(content=initial_sql), # Initial SQL generation
+            MagicMock(content=fixed_sql)    # SQL generated by fix_sql_with_llm
+        ]
+
+        # DB execution sequence:
+        # 1. Initial SQL fails
+        # 2. Fixed SQL succeeds
+        mock_try_sql.side_effect = [
+            (None, "no such column: sale"), # Error for initial_sql
+            (expected_df, None)             # Success for fixed_sql
+        ]
+
+        initial_state = MyState(
+            input=f"Get {req_string}",
+            missing_data_requirements=[req_string],
+            latest_df=collections.OrderedDict(),
+            df_history=[]
+        )
+
+        result_state = sql_node(initial_state)
+
+        self.assertEqual(result_state["condition"], "SQL実行完了")
+        self.assertIsNone(result_state["error"])
+        self.assertIn(req_string, result_state["latest_df"])
+        self.assertEqual(result_state["latest_df"][req_string], expected_df_data)
+        self.assertEqual(result_state["SQL"], fixed_sql) # Should store the successfully executed SQL
+
+        self.assertEqual(mock_llm.invoke.call_count, 2)
+        # Call 1: Initial SQL generation
+        self.assertIn(req_string, str(mock_llm.invoke.call_args_list[0].args[0]))
+        # Call 2: fix_sql_with_llm
+        fixer_prompt_args = mock_llm.invoke.call_args_list[1].args[0]
+        self.assertIn(initial_sql, str(fixer_prompt_args))
+        self.assertIn("no such column: sale", str(fixer_prompt_args))
+        self.assertIn(req_string, str(fixer_prompt_args)) # User query context
+
+        self.assertEqual(mock_try_sql.call_count, 2)
+        mock_try_sql.assert_any_call(initial_sql)
+        mock_try_sql.assert_any_call(fixed_sql)
+
+        self.assertEqual(len(result_state.get("missing_data_requirements", [])), 0)
+
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.vectorstore_queries.similarity_search')
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.uuid.uuid4') # Not strictly needed here but good practice if history was added
+    @patch('files.backend_codes.transform_sql_error') # Mock the error transformation
+    def test_sql_correction_fails_again(
+        self, mock_transform_sql_error, mock_uuid, mock_try_sql, mock_llm, mock_vs_queries, mock_vs_tables
+    ):
+        mock_uuid.return_value = MagicMock(hex=MagicMock(return_value="corr_fail".ljust(8, '0')))
+        req_string = "Inventory for Product Y"
+        initial_sql = "SELECT inventry FROM productY_inventory;"
+        fixed_sql_attempt = "SELECT inventory FROM product_Y_inventory_typo;" # Still wrong
+
+        # Mock RAG
+        mock_vs_tables.return_value = [MagicMock(page_content="Table: product_Y_inventory (inventory, product_id)")]
+        mock_vs_queries.return_value = [MagicMock(page_content="SELECT inventory FROM product_Y_inventory")]
+
+        # LLM sequence:
+        mock_llm.invoke.side_effect = [
+            MagicMock(content=initial_sql),
+            MagicMock(content=fixed_sql_attempt)
+        ]
+
+        # DB execution sequence: both fail
+        mock_try_sql.side_effect = [
+            (None, "no such column: inventry"),
+            (None, "no such table: product_Y_inventory_typo")
+        ]
+
+        # Mock the error transformation to check it's called with the final error
+        mock_transform_sql_error.return_value = "User-friendly: Table not found"
+
+
+        initial_state = MyState(
+            input=f"Get {req_string}",
+            missing_data_requirements=[req_string],
+            latest_df=collections.OrderedDict(),
+            df_history=[]
+        )
+
+        result_state = sql_node(initial_state)
+
+        self.assertEqual(result_state["condition"], "SQL部分的失敗") # Or "SQL実行失敗" if only one req
+        self.assertIsNotNone(result_state["error"])
+        # Check that the user-friendly message is in the error string
+        self.assertIn("User-friendly: Table not found", result_state["error"])
+        self.assertNotIn(req_string, result_state["latest_df"]) # No data should be added
+        self.assertEqual(result_state["SQL"], fixed_sql_attempt) # Stores the last attempted SQL
+
+        self.assertEqual(mock_llm.invoke.call_count, 2)
+        self.assertEqual(mock_try_sql.call_count, 2)
+        mock_transform_sql_error.assert_called_once_with("no such table: product_Y_inventory_typo")
+        self.assertEqual(result_state.get("missing_data_requirements"), [req_string])
+
+
+class TestTrySqlExecute(unittest.TestCase):
+
+    @patch('files.backend_codes.sqlite3.connect')
+    def test_try_sql_execute_success_in_memory(self, mock_sqlite_connect):
+        # Setup in-memory database
+        in_memory_conn = sqlite3.connect(':memory:')
+        mock_sqlite_connect.return_value = in_memory_conn
+
+        cursor = in_memory_conn.cursor()
+        cursor.execute("CREATE TABLE test_table (id INTEGER, name TEXT)")
+        cursor.execute("INSERT INTO test_table VALUES (1, 'Test User One')")
+        cursor.execute("INSERT INTO test_table VALUES (2, 'Test User Two')")
+        in_memory_conn.commit()
+
+        df, error = try_sql_execute("SELECT id, name FROM test_table ORDER BY id ASC")
+
+        self.assertIsNotNone(df)
+        self.assertIsNone(error)
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df.iloc[0]['name'], 'Test User One')
+        self.assertEqual(df.iloc[1]['id'], 2)
+
+        # try_sql_execute internally calls connect("my_data.db")
+        mock_sqlite_connect.assert_called_once_with("my_data.db")
+        in_memory_conn.close()
+
+    @patch('files.backend_codes.sqlite3.connect')
+    def test_try_sql_execute_error_in_memory(self, mock_sqlite_connect):
+        # Setup in-memory database
+        in_memory_conn = sqlite3.connect(':memory:')
+        mock_sqlite_connect.return_value = in_memory_conn
+
+        # No table created, so SELECT will fail
+
+        df, error = try_sql_execute("SELECT * FROM non_existent_table")
+
+        self.assertIsNone(df)
+        self.assertIsNotNone(error)
+        self.assertIn("no such table: non_existent_table", error.lower())
+
+        mock_sqlite_connect.assert_called_once_with("my_data.db")
+        in_memory_conn.close()
+
+    @patch('files.backend_codes.sqlite3.connect')
+    def test_try_sql_execute_connection_failure(self, mock_sqlite_connect):
+        # Simulate sqlite3.connect itself raising an error
+        mock_sqlite_connect.side_effect = sqlite3.OperationalError("unable to open database file")
+
+        df, error = try_sql_execute("SELECT * FROM any_table")
+
+        self.assertIsNone(df)
+        self.assertIsNotNone(error)
+        self.assertIn("unable to open database file", error.lower())
+        mock_sqlite_connect.assert_called_once_with("my_data.db")
+
+
 # Import clear_data_node for testing
-from files.backend_codes import clear_data_node, DATA_CLEARED_MESSAGE
+from files.backend_codes import clear_data_node, DATA_CLEARED_MESSAGE, interpret_node, chart_node, metadata_retrieval_node
+
+class TestInterpretNode(unittest.TestCase):
+
+    @patch('files.backend_codes.llm')
+    def test_interpret_node_valid_data(self, mock_llm):
+        mock_llm.invoke.return_value = MagicMock(content="This is a great interpretation of the data.")
+        sample_data = collections.OrderedDict({
+            "Sales Data": [{"item": "A", "revenue": 100}, {"item": "B", "revenue": 150}],
+            "Inventory Data": [{"item": "A", "stock": 20}, {"item": "B", "stock": 30}]
+        })
+        state = MyState(latest_df=sample_data)
+
+        result_state = interpret_node(state)
+
+        mock_llm.invoke.assert_called_once()
+        prompt_arg = mock_llm.invoke.call_args[0][0] # Gets the list of messages/string passed to invoke
+
+        # Check that stringified data for each part of OrderedDict is in the prompt
+        self.assertIn("Sales Data", str(prompt_arg))
+        self.assertIn("item", str(prompt_arg)) # column name
+        self.assertIn("100", str(prompt_arg))  # value
+        self.assertIn("Inventory Data", str(prompt_arg))
+        self.assertIn("stock", str(prompt_arg))
+        self.assertIn("30", str(prompt_arg))
+
+        self.assertEqual(result_state["interpretation"], "This is a great interpretation of the data.")
+        self.assertEqual(result_state["condition"], "解釈完了")
+
+    @patch('files.backend_codes.llm')
+    def test_interpret_node_empty_data_dict(self, mock_llm):
+        state = MyState(latest_df=collections.OrderedDict())
+        result_state = interpret_node(state)
+        self.assertEqual(result_state["interpretation"], "データが取得されましたが、内容は空です。") # Updated expected message
+        self.assertEqual(result_state["condition"], "解釈失敗")
+        mock_llm.invoke.assert_not_called()
+
+    @patch('files.backend_codes.llm')
+    def test_interpret_node_empty_data_list_in_dict(self, mock_llm):
+        state = MyState(latest_df=collections.OrderedDict({"Empty Sales": []}))
+        result_state = interpret_node(state)
+        # The prompt will contain "(この要件に対するデータはありません)"
+        # LLM will be called, it should summarize this.
+        mock_llm.invoke.return_value = MagicMock(content="No data was available for Empty Sales.")
+
+        result_state = interpret_node(state)
+
+        mock_llm.invoke.assert_called_once()
+        prompt_arg = mock_llm.invoke.call_args[0][0]
+        self.assertIn("Empty Sales", str(prompt_arg))
+        self.assertIn("(この要件に対するデータはありません)", str(prompt_arg))
+        self.assertEqual(result_state["interpretation"], "No data was available for Empty Sales.")
+        self.assertEqual(result_state["condition"], "解釈完了")
+
+
+    @patch('files.backend_codes.llm')
+    def test_interpret_node_none_data(self, mock_llm):
+        state = MyState(latest_df=None)
+        result_state = interpret_node(state)
+        self.assertEqual(result_state["interpretation"], "まだデータがありません。先にSQL質問をするか、メタデータ検索を試してください。")
+        self.assertEqual(result_state["condition"], "解釈失敗")
+        mock_llm.invoke.assert_not_called()
+
+class TestChartNode(unittest.TestCase):
+
+    @patch('builtins.open', new_callable=unittest.mock.mock_open, read_data=b'chart_bytes')
+    @patch('files.backend_codes.base64.b64encode')
+    @patch('files.backend_codes.os.path.exists')
+    @patch('files.backend_codes.PythonAstREPLTool') # Mock the tool itself
+    @patch('files.backend_codes.initialize_agent') # Mock agent initialization
+    def test_chart_node_successful_generation(
+        self, mock_initialize_agent, mock_python_tool, mock_os_path_exists, mock_b64encode, mock_open_file
+    ):
+        # Setup Mocks
+        mock_agent_instance = MagicMock()
+        mock_initialize_agent.return_value = mock_agent_instance
+        mock_agent_instance.invoke.return_value = {"output": "Agent created output.png"} # Simulate agent execution
+
+        mock_python_tool_instance = MagicMock()
+        mock_python_tool.return_value = mock_python_tool_instance
+
+        mock_os_path_exists.return_value = True # Simulate output.png exists
+        mock_b64encode.return_value = "encoded_chart_data"
+
+        sample_data = collections.OrderedDict({"Sales": [{"category": "A", "amount": 100}]})
+        state = MyState(latest_df=sample_data, input="Plot sales data")
+
+        result_state = chart_node(state)
+
+        mock_initialize_agent.assert_called_once() # Check agent was initialized
+        # Check that PythonAstREPLTool was instantiated with df
+        tool_args = mock_python_tool.call_args
+        self.assertIn('df', tool_args.kwargs['locals'])
+        self.assertIsInstance(tool_args.kwargs['locals']['df'], pd.DataFrame)
+
+        mock_agent_instance.invoke.assert_called_once()
+        agent_prompt = mock_agent_instance.invoke.call_args[0][0]
+        self.assertIn("最適なグラフをsns(seaborn)で作成して", agent_prompt)
+        self.assertIn("Plot sales data", agent_prompt) # User input
+        self.assertIn("Sales", agent_prompt) # Requirement name
+        self.assertIn("category", agent_prompt) # Column from data
+        self.assertIn("100", agent_prompt) # Value from data
+
+        mock_os_path_exists.assert_called_once_with("output.png")
+        mock_b64encode.assert_called_once_with(b"chart_bytes")
+        mock_open_file.assert_called_once_with("output.png", "rb")
+
+        self.assertEqual(result_state["chart_result"], "encoded_chart_data")
+        self.assertEqual(result_state["condition"], "グラフ化完了")
+
+    @patch('files.backend_codes.initialize_agent')
+    def test_chart_node_empty_latest_df(self, mock_initialize_agent):
+        state = MyState(latest_df=collections.OrderedDict(), input="Plot this")
+        result_state = chart_node(state)
+        self.assertIsNone(result_state["chart_result"])
+        self.assertEqual(result_state["condition"], "グラフ化失敗")
+        mock_initialize_agent.assert_not_called()
+
+    @patch('files.backend_codes.initialize_agent')
+    def test_chart_node_none_latest_df(self, mock_initialize_agent):
+        state = MyState(latest_df=None, input="Plot this")
+        result_state = chart_node(state)
+        self.assertIsNone(result_state["chart_result"])
+        self.assertEqual(result_state["condition"], "グラフ化失敗")
+        mock_initialize_agent.assert_not_called()
+
+    @patch('files.backend_codes.os.path.exists')
+    @patch('files.backend_codes.initialize_agent') # To ensure it's called
+    @patch('files.backend_codes.PythonAstREPLTool')
+    def test_chart_node_output_file_not_created(
+        self, mock_python_tool, mock_initialize_agent, mock_os_path_exists
+    ):
+        mock_agent_instance = MagicMock()
+        mock_initialize_agent.return_value = mock_agent_instance
+        mock_agent_instance.invoke.return_value = {"output": "Agent ran but did not create file"}
+
+        mock_os_path_exists.return_value = False # output.png does not exist
+
+        sample_data = collections.OrderedDict({"Sales": [{"category": "A", "amount": 100}]})
+        state = MyState(latest_df=sample_data, input="Plot sales data")
+
+        result_state = chart_node(state)
+
+        mock_initialize_agent.assert_called_once()
+        mock_agent_instance.invoke.assert_called_once()
+        mock_os_path_exists.assert_called_once_with("output.png")
+
+        self.assertIsNone(result_state["chart_result"])
+        self.assertEqual(result_state["condition"], "グラフ化失敗")
+
+
+class TestMetadataRetrievalNode(unittest.TestCase):
+
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.llm')
+    def test_metadata_retrieval_successful(self, mock_llm, mock_vs_tables_search):
+        user_query = "What are the columns in sales_table?"
+        mock_rag_docs = [
+            MagicMock(page_content="Table: sales_table Columns: id, date, amount"),
+            MagicMock(page_content="Table: product_table Columns: id, name, price")
+        ]
+        mock_vs_tables_search.return_value = mock_rag_docs
+
+        expected_llm_answer = "The sales_table has columns: id, date, and amount."
+        mock_llm.invoke.return_value = MagicMock(content=expected_llm_answer)
+
+        state = MyState(input=user_query)
+        result_state = metadata_retrieval_node(state)
+
+        mock_vs_tables_search.assert_called_once_with(user_query, k=3)
+
+        mock_llm.invoke.assert_called_once()
+        llm_prompt_arg = mock_llm.invoke.call_args[0][0]
+        self.assertIn(user_query, llm_prompt_arg)
+        self.assertIn("Table: sales_table Columns: id, date, amount", llm_prompt_arg) # RAG content
+        self.assertIn("Table: product_table Columns: id, name, price", llm_prompt_arg) # RAG content
+
+        self.assertEqual(result_state["metadata_answer"], expected_llm_answer)
+        self.assertEqual(result_state["condition"], "メタデータ検索完了")
+
 
 class TestClearDataNode(unittest.TestCase):
     def test_clear_data_node_resets_state_correctly(self):
@@ -490,6 +886,18 @@ class TestWorkflow(unittest.TestCase):
         # Call 3 (interpret): "Interpreted results..."
         self.assertEqual(mock_llm.invoke.call_count, 3)
 
+        llm_calls = mock_llm.invoke.call_args_list
+        # Call 1: Classify intent
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0])) # Prompt for classify_intent
+        self.assertIn(user_input, str(llm_calls[0].args[0]))
+        # Call 2: Extract data requirements
+        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0])) # Prompt for extract_data_requirements
+        self.assertIn(user_input, str(llm_calls[1].args[0]))
+        # Call 3: Interpret node
+        self.assertIn("以下のSQLクエリ実行結果群について", str(llm_calls[2].args[0])) # Prompt for interpret_node
+        self.assertIn("A商品の売上", str(llm_calls[2].args[0])) # Check if data is in prompt
+        self.assertIn("顧客属性", str(llm_calls[2].args[0]))
+
         # Ensure mocks for nodes not reached (sql_node, chart_node) were not called
         mock_vs_tables.assert_not_called()
         mock_vs_queries.assert_not_called()
@@ -499,7 +907,70 @@ class TestWorkflow(unittest.TestCase):
     @patch('files.backend_codes.llm')
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
-    @patch('files.backend_codes.try_sql_execute')
+    # Removed try_sql_execute from direct patches here as it's used by sql_node, which is implicitly tested.
+    # Same for PythonAstREPLTool, uuid.
+    def test_workflow_metadata_retrieval_path(
+        self, mock_vs_queries, mock_vs_tables, mock_llm # Mocks are applied from bottom up
+    ):
+        user_input = "sales_dataテーブルにはどんなカラムがありますか？"
+        config = {"configurable": {"thread_id": "test_thread_metadata"}}
+
+        # --- Mocking sequence for LLM calls ---
+        # 1. classify_intent_node: returns "メタデータ検索"
+        # 2. metadata_retrieval_node: returns the metadata answer
+        mock_llm.invoke.side_effect = [
+            MagicMock(content="メタデータ検索"),
+            MagicMock(content="sales_dataテーブルには、'date', 'product_id', 'sales_amount' カラムがあります。")
+        ]
+
+        # Mock vectorstore_tables used by metadata_retrieval_node
+        mock_vs_tables.return_value = [
+            MagicMock(page_content="Table: sales_data Columns: date, product_id, sales_amount"),
+            MagicMock(page_content="Table: customers Columns: customer_id, name, segment")
+        ]
+
+        # Mocks that should NOT be called for this path
+        # These are good candidates to move into specific test setups if they are not shared,
+        # or ensure they are reset if tests share them.
+        # For this test, we are primarily checking the LLM and vectorstore calls.
+        # Other nodes like extract_data_requirements, find_similar_query, sql, chart, interpret
+        # should not be triggered. We can verify this by checking the LLM call count and specific prompts.
+
+        # Invoke the workflow
+        final_state = self.workflow.invoke({"input": user_input}, config=config)
+
+        # --- Assertions ---
+        # Path: classify -> metadata_retrieval -> END
+        self.assertEqual(final_state["condition"], "メタデータ検索完了")
+        self.assertEqual(final_state["metadata_answer"], "sales_dataテーブルには、'date', 'product_id', 'sales_amount' カラムがあります。")
+
+        # Check LLM calls
+        self.assertEqual(mock_llm.invoke.call_count, 2)
+        llm_calls = mock_llm.invoke.call_args_list
+
+        # Call 1: Classify intent
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
+        self.assertIn(user_input, str(llm_calls[0].args[0]))
+
+        # Call 2: Metadata retrieval node
+        self.assertIn("以下のテーブル定義情報を参照して、ユーザーの質問に答えてください。", str(llm_calls[1].args[0]))
+        self.assertIn(user_input, str(llm_calls[1].args[0]))
+        self.assertIn("Table: sales_data Columns: date, product_id, sales_amount", str(llm_calls[1].args[0])) # Check RAG content in prompt
+
+        # Check vectorstore_tables call
+        mock_vs_tables.assert_called_once_with(user_input, k=3)
+
+        # Ensure other vectorstore (for queries in sql_node) was not called
+        mock_vs_queries.assert_not_called()
+
+        # By checking the LLM call count (2) and the specific prompts, we implicitly assert
+        # that nodes like extract_data_requirements, sql_node (SQL generation part), interpret_node, chart_node
+        # were not called as they would have made additional LLM calls with different prompts.
+
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.vectorstore_queries.similarity_search')
+    @patch('files.backend_codes.try_sql_execute') # Keep for sql_node
     @patch('files.backend_codes.PythonAstREPLTool') # For chart_node
     @patch('files.backend_codes.uuid.uuid4') # For sql_node history
     def test_workflow_missing_data_then_sql_then_chart(
@@ -513,12 +984,12 @@ class TestWorkflow(unittest.TestCase):
         # 1. classify_intent_node: "データ取得,グラフ作成"
         # 2. extract_data_requirements_node: "A商品の売上,B商品の在庫"
         # 3. sql_node (for B商品の在庫): generates SQL "SELECT * FROM B_inventory;"
-        # 4. chart_node: Python code for charting (not checking exact code, just that it's called)
+        # 4. chart_node: Python code for charting
         mock_llm.invoke.side_effect = [
-            MagicMock(content="データ取得,グラフ作成"),
-            MagicMock(content="A商品の売上,B商品の在庫"),
-            MagicMock(content="SELECT * FROM B_inventory;"), # SQL for B商品の在庫 in sql_node
-            MagicMock(content="print('Chart generated')") # Python code from chart agent
+            MagicMock(content="データ取得,グラフ作成"),           # Call 1: classify_intent
+            MagicMock(content="A商品の売上,B商品の在庫"),       # Call 2: extract_data_requirements
+            MagicMock(content="SELECT * FROM B_inventory;"), # Call 3: sql_node (SQL gen for B商品の在庫)
+            MagicMock(content="print('Chart generated')")    # Call 4: chart_node (agent prompt)
         ]
 
         # --- Data for find_similar_query_node ---
@@ -581,6 +1052,20 @@ class TestWorkflow(unittest.TestCase):
 
         # LLM Calls: classify, extract_req, sql_gen_B, chart_agent_prompt
         self.assertEqual(mock_llm.invoke.call_count, 4)
+        llm_calls = mock_llm.invoke.call_args_list
+        # Call 1: Classify intent
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
+        self.assertIn(user_input, str(llm_calls[0].args[0]))
+        # Call 2: Extract data requirements
+        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0]))
+        self.assertIn(user_input, str(llm_calls[1].args[0]))
+        # Call 3: SQL node (for B商品の在庫)
+        self.assertIn("【現在の具体的なデータ取得要件】", str(llm_calls[2].args[0])) # Prompt for sql_node
+        self.assertIn("B商品の在庫", str(llm_calls[2].args[0]))
+        # Call 4: Chart node
+        self.assertIn("最適なグラフをsns(seaborn)で作成して", str(llm_calls[3].args[0])) # Prompt for chart_node
+        self.assertIn(user_input, str(llm_calls[3].args[0])) # Original user input in chart prompt
+        self.assertIn("A商品の売上", str(llm_calls[3].args[0])) # Data context (df_to_plot) in chart prompt
 
         # RAG calls for B商品の在庫 in sql_node
         mock_vs_tables.assert_called_once_with("B商品の在庫", k=3)
