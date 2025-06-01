@@ -1,0 +1,36 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ main ] # Assuming 'main' is the default branch
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12' # Based on pyvenv.cfg content
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        else
+          echo "requirements.txt not found, skipping pip install -r requirements.txt"
+        fi
+
+    - name: Run tests
+      env:
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        LLM_MODEL_NAME: "gemini-1.5-flash-latest"
+      run: |
+        python -m unittest discover -s ./files -p "test_*.py"

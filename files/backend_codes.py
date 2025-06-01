@@ -39,6 +39,24 @@ llm = ChatGoogleGenerativeAI(
 
 DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
 
+
+import collections
+class MyState(TypedDict, total=False):
+    input: str                       # ユーザーの問い合わせ
+    intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
+    latest_df: Optional[collections.OrderedDict[str, list]] # Changed: Dict mapping requirement to its dataframe (list of records)
+    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
+    SQL: Optional[str]               # 生成されたSQL
+    interpretation: Optional[str]    # データ解釈（分析コメント）
+    chart_result: Optional[str]      # グラフ画像（base64など）
+    metadata_answer: Optional[str]   # メタデータ検索結果の回答
+    condition: Optional[str]         # 各ノードの実行状態
+    error: Optional[str]             # SQL等でエラーがあれば
+    query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
+    data_requirements: List[str]     # データ要件
+    missing_data_requirements: Optional[List[str]] # New: List of data requirements not found in history
+
+
 #意図の判別
 
 def extract_sql(sql_text):
@@ -696,22 +714,6 @@ def clear_data_node(state):
         "query_history": [] # Reset query history
     }
 
-import collections
-
-class MyState(TypedDict, total=False):
-    input: str                       # ユーザーの問い合わせ
-    intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
-    latest_df: Optional[collections.OrderedDict[str, list]] # Changed: Dict mapping requirement to its dataframe (list of records)
-    df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
-    SQL: Optional[str]               # 生成されたSQL
-    interpretation: Optional[str]    # データ解釈（分析コメント）
-    chart_result: Optional[str]      # グラフ画像（base64など）
-    metadata_answer: Optional[str]   # メタデータ検索結果の回答
-    condition: Optional[str]         # 各ノードの実行状態
-    error: Optional[str]             # SQL等でエラーがあれば
-    query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
-    data_requirements: List[str]     # データ要件
-    missing_data_requirements: Optional[List[str]] # New: List of data requirements not found in history
 
 def build_workflow():
     memory = MemorySaver()
