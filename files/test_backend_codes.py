@@ -920,8 +920,9 @@ class TestInterpretNode(unittest.TestCase):
         self.assertEqual(result_state["condition"], "解釈完了") # Still considered a successful interpretation
 
     @patch('files.backend_codes.llm')
-    def test_interpret_node_llm_none_content_response(self, mock_llm):
+    def test_interpret_node_llm_none_content_response_raises_attributeerror(self, mock_llm):
         # Simulate LLM response where content attribute is None
+        # This test verifies behavior BEFORE the fix for None content.
         mock_response = MagicMock()
         mock_response.content = None
         mock_llm.invoke.return_value = mock_response
@@ -936,8 +937,26 @@ class TestInterpretNode(unittest.TestCase):
             interpret_node(state)
 
         mock_llm.invoke.assert_called_once()
-        # Depending on exact behavior, condition might not be set or might be an error state.
-        # Since the function errors out before setting these, we don't check them here.
+        # Condition/interpretation are not set due to the error.
+
+    @patch('files.backend_codes.llm')
+    def test_interpret_node_llm_none_content_response_handled(self, mock_llm):
+        # Simulate LLM response where content attribute is None
+        # This test verifies behavior AFTER the fix for None content.
+        mock_response = MagicMock()
+        mock_response.content = None
+        mock_llm.invoke.return_value = mock_response
+
+        sample_data = collections.OrderedDict({
+            "Sample Data": [{"col": "value"}]
+        })
+        state = MyState(latest_df=sample_data)
+
+        result_state = interpret_node(state)
+
+        mock_llm.invoke.assert_called_once()
+        self.assertEqual(result_state["interpretation"], "")
+        self.assertEqual(result_state["condition"], "解釈完了")
 
 class TestChartNode(unittest.TestCase):
 
