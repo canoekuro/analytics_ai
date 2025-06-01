@@ -6,6 +6,7 @@ from io import BytesIO
 import time
 from files.backend_codes import build_workflow
 import uuid # Add this import
+import collections # Add this import
 
 compiled_workflow = build_workflow()
 
@@ -13,9 +14,17 @@ compiled_workflow = build_workflow()
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
 if "memory_state" not in st.session_state:
-    st.session_state["memory_state"] = {}
-if "disabled" not in st.session_state: # Initialization for chat input disable state
+    st.session_state["memory_state"] = {} # This will store the full state from the backend
+if "disabled" not in st.session_state:
     st.session_state["disabled"] = False
+if "session_thread_id" not in st.session_state: # Ensure session_thread_id is initialized
+    st.session_state["session_thread_id"] = str(uuid.uuid4())
+if "awaiting_clarification_input" not in st.session_state:
+    st.session_state.awaiting_clarification_input = False
+if "clarification_question_text" not in st.session_state:
+    st.session_state.clarification_question_text = None
+if "user_input_type" not in st.session_state: # Added for multi-stage plan interaction
+    st.session_state["user_input_type"] = None
 
 # --- 2. ワークフローのセットアップ（必要ならキャッシュ） ---
 MAX_HISTORY_DISPLAY = 20 # Max number of chat messages to display
@@ -30,12 +39,15 @@ compiled_workflow = get_workflow()
 if st.button("Clear Chat History"):
     st.session_state.chat_history = []
     st.session_state.memory_state = {} # Clear local frontend state
+    st.session_state.awaiting_clarification_input = False # Reset clarification state
+    st.session_state.clarification_question_text = None # Reset clarification state
+    if "user_selected_option" in st.session_state: # Though not used in current flow, good practice if added
+        del st.session_state.user_selected_option
+    if "analysis_options" in st.session_state.get("memory_state", {}): # Clear from memory_state
+        del st.session_state.memory_state["analysis_options"]
 
-    # Ensure a thread_id exists for the current session for clearing history
-    if "session_thread_id" not in st.session_state:
-        st.session_state["session_thread_id"] = str(uuid.uuid4())
 
-    # Use the session-specific thread_id for clearing
+    # Use the session-specific thread_id for clearing (already initialized)
     session_specific_thread_id = st.session_state["session_thread_id"]
     config = {'configurable': {'thread_id': session_specific_thread_id}}
     try:
@@ -59,6 +71,17 @@ with history_container:
         else:
             # assistant応答は「interpretation/普通テキスト」「df（データフレーム）」「chart_result（画像）」の3パターン
             with st.chat_message("assistant"):
+                # Display multi-stage analysis progress if applicable
+                if "analysis_plan" in entry and entry["analysis_plan"] and entry.get("current_plan_step_index") is not None:
+                    plan = entry["analysis_plan"]
+                    current_idx = entry["current_plan_step_index"]
+                    total_steps = len(plan)
+                    if 0 <= current_idx < total_steps: # Ensure index is valid
+                        current_step_info = plan[current_idx]
+                        action = current_step_info.get('action', 'N/A')
+                        details = current_step_info.get('details', 'N/A')
+                        st.info(f"Multi-step Analysis: Step {current_idx + 1} of {total_steps} (Action: {action}, Details: {details})")
+
                 if "error" in entry and entry["error"]: # Simplified check
                     st.error(entry['error']) # Display user-friendly error directly
 
@@ -98,47 +121,174 @@ with history_container:
                 chart_img = base64.b64decode(entry["chart_result"])
                 st.image(chart_img, caption="AI生成グラフ")
 
-# 3.2 ユーザー入力受付
+# 3.2 ユーザー入力受付 & Clarification Handling
+if st.session_state.awaiting_clarification_input and st.session_state.clarification_question_text:
+    # --- Display Clarification Question and Get Answer ---
+    st.info(st.session_state.clarification_question_text) # Display the question
+
+    with st.form(key="clarification_form"):
+        clarification_answer = st.text_input("Please provide the requested information:")
+        submit_clarification_button = st.form_submit_button(label="Submit Clarification")
+
+    if submit_clarification_button and clarification_answer:
+        st.session_state["chat_history"].append({"role": "user", "content": clarification_answer, "type": "clarification_answer"})
+
+        current_memory_state = dict(st.session_state.get("memory_state", {}))
+        current_memory_state["user_clarification"] = clarification_answer
+        # 'input' and 'clarification_question' should still be in current_memory_state from the backend's last response.
+
+        st.session_state.disabled = True # Disable main input during processing
+        st.session_state.awaiting_clarification_input = False
+        st.session_state.clarification_question_text = None
+        st.rerun() # Rerun to show user's clarification and start AI "thinking"
+
+# Main chat input - disabled if awaiting clarification OR if processing normal input OR if awaiting step confirmation
+chat_input_disabled = st.session_state.disabled or \
+                      st.session_state.awaiting_clarification_input or \
+                      st.session_state.get("memory_state", {}).get("awaiting_step_confirmation", False)
+
 user_input = st.chat_input(
     "質問を入力してください（例: 'カテゴリごとの合計販売金額を出して'）",
-    disabled=st.session_state.get("disabled", False)
+    disabled=chat_input_disabled
 )
-if user_input:
+
+# --- Multi-stage Analysis Controls (Proceed/Cancel) ---
+if st.session_state.get("memory_state", {}).get("awaiting_step_confirmation"):
+    # Display intermediate results (already handled by chat history loop)
+    st.markdown("---") # Separator
+    st.write("The analysis is paused. Choose an action:")
+    button_cols = st.columns([1, 1, 2]) # Adjust column ratios as needed
+
+    if button_cols[0].button("Proceed to Next Step", key="proceed_step_button"):
+        st.session_state["user_input_type"] = "proceed_analysis_step"
+        # The memory_state (which includes the plan) is already set from the last backend response.
+        # We just need to signal the intent to proceed.
+        st.session_state.disabled = True # Trigger backend processing
+        st.rerun()
+
+    if button_cols[1].button("Cancel Analysis Plan", key="cancel_plan_button"):
+        st.session_state["user_input_type"] = "cancel_analysis_plan"
+        st.session_state.disabled = True # Trigger backend processing
+        st.rerun()
+
+if user_input and not st.session_state.awaiting_clarification_input and not st.session_state.get("memory_state", {}).get("awaiting_step_confirmation", False): # Normal user input processing
     # --- 4. ユーザー入力バブルを即時表示 & 入力フィールドを無効化 ---
     st.chat_message("user").write(user_input)
     st.session_state["chat_history"].append({"role": "user", "content": user_input})
-
     st.session_state.disabled = True
-    st.rerun() # Immediately disable input and refresh to show user message before "thinking"
+    st.rerun() # Immediately disable input and refresh to show user message
 
+# This block handles processing after either a new message or a clarification is submitted
+# It relies on st.session_state.disabled being True if processing is needed.
+if st.session_state.disabled: # This will be true after user submits new input OR clarification (due to rerun)
     # --- 5. AIバブル(typing演出) ---
-    # This part will run after the rerun caused by disabling the input
     ai_msg_placeholder = st.empty()
-    # Only show typing if it's actually processing (i.e., input was just submitted)
-    # This check helps prevent re-showing typing animation on subsequent reruns if state changes elsewhere
-    if st.session_state.get("disabled", False): # Check if we are in "processing" mode
-        for i in range(8):  # 約4秒間タイピング演出
-            dots = "." * ((i % 4) + 1)
-            ai_msg_placeholder.chat_message("assistant").write(f"AI is thinking{dots} _typing_ :speech_balloon:")
-            time.sleep(0.5)
+    for i in range(8):  # 約4秒間タイピング演出
+        dots = "." * ((i % 4) + 1)
+        ai_msg_placeholder.chat_message("assistant").write(f"AI is thinking{dots} _typing_ :speech_balloon:")
+        time.sleep(0.5)
 
     # --- 6. LangGraphバックエンド呼び出し ---
-    config = {'configurable': {'thread_id': '1'}}
+    # Use the session-specific thread_id
+    config = {'configurable': {'thread_id': st.session_state["session_thread_id"]}}
     # Retrieve the latest user_input from chat_history as user_input variable might be from previous run post rerun
     current_user_input = st.session_state["chat_history"][-1]["content"]
-    input_state = dict(st.session_state.get("memory_state", {}))
-    input_state["input"] = current_user_input # Use the most recent input
-    res = compiled_workflow.invoke(input_state, config)
 
-    # --- 7. AIバブル差し替え ---
-    with ai_msg_placeholder.chat_message("assistant"): # ai_msg_placeholder should still be valid
-        if "error" in res and res["error"]: # Simplified check
-            st.error(res['error']) # Display user-friendly error directly
+    config = {'configurable': {'thread_id': st.session_state["session_thread_id"]}}
 
-        if "interpretation" in res and res["interpretation"]: # Ensure not None or empty
-            st.write(res["interpretation"])
+    user_action_type = st.session_state.get("user_input_type")
+    current_memory = dict(st.session_state.get("memory_state", {}))
+    invoke_payload = {}
 
-        # --- Displaying latest_df from live response ---
+    if user_action_type == "proceed_analysis_step":
+        # Backend needs the current memory state to know about the plan, index etc.
+        # And user_action to be routed correctly.
+        invoke_payload = {**current_memory, "user_action": "proceed_analysis_step", "awaiting_step_confirmation": False}
+        st.session_state["chat_history"].append({"role": "user", "content": "User chose to proceed to the next step.", "type": "system_action"})
+    elif user_action_type == "cancel_analysis_plan":
+        invoke_payload = {**current_memory, "user_action": "cancel_analysis_plan", "awaiting_step_confirmation": False}
+        st.session_state["chat_history"].append({"role": "user", "content": "User chose to cancel the analysis plan.", "type": "system_action"})
+    else:
+        # This is the existing logic for handling normal user input, clarifications, or analysis option selections.
+        last_user_message_entry = next((msg for msg in reversed(st.session_state.chat_history) if msg["role"] == "user"), None)
+        if last_user_message_entry:
+            last_user_interaction_type = last_user_message_entry.get("type")
+            current_user_input_content = last_user_message_entry["content"]
+
+            if last_user_interaction_type == "clarification_answer":
+                invoke_payload = {**current_memory, "user_clarification": current_user_input_content}
+            elif last_user_interaction_type == "analysis_selection":
+                # This logic was for when analysis options were selected.
+                # It constructed a new_input_context. We should ensure it's compatible.
+                # The key is that 'input' becomes the selected option, and history is preserved.
+                chat_history_for_query_context = st.session_state.get("chat_history", [])
+                query_history_list = [msg["content"] for msg in chat_history_for_query_context[:-1] if msg["role"] == "user"]
+                invoke_payload = {
+                    "input": current_user_input_content, # Selected option
+                    "df_history": current_memory.get("df_history", []),
+                    "query_history": query_history_list,
+                    "latest_df": collections.OrderedDict(),
+                    "SQL": None, "interpretation": None, "chart_result": None,
+                    "clarification_question": None, "user_clarification": None,
+                    "analysis_options": None, "error": None, "intent_list": [],
+                    "data_requirements": [], "missing_data_requirements": None,
+                    # Carry over plan variables if any, though analysis_selection might imply starting fresh
+                    # or modifying an existing plan - for now, this assumes it's a new primary query.
+                    "analysis_plan": current_memory.get("analysis_plan"),
+                    "current_plan_step_index": current_memory.get("current_plan_step_index"),
+                    "awaiting_step_confirmation": current_memory.get("awaiting_step_confirmation"),
+                    "complex_analysis_original_query": current_memory.get("complex_analysis_original_query"),
+                }
+            else: # Standard new query from the main chat_input
+                previous_df_history = current_memory.get("df_history", [])
+                full_chat_history_for_query_context = st.session_state.get("chat_history", [])
+                query_history_context = [msg["content"] for msg in full_chat_history_for_query_context[:-1] if msg["role"] == "user"]
+                invoke_payload = {
+                    "input": current_user_input_content,
+                    "df_history": previous_df_history,
+                    "query_history": query_history_context,
+                    "latest_df": collections.OrderedDict(), "SQL": None, "interpretation": None, "chart_result": None,
+                    "clarification_question": None, "user_clarification": None, "analysis_options": None,
+                    "error": None, "intent_list": [], "data_requirements": [], "missing_data_requirements": None,
+                    # Ensure plan variables are reset/None for a brand new query if not part of a plan context
+                    "analysis_plan": None, "current_plan_step_index": None,
+                    "awaiting_step_confirmation": False, "complex_analysis_original_query": None,
+                }
+        else: # Should not happen if st.session_state.disabled is True due to user input
+            st.session_state.disabled = False
+            st.rerun()
+            return
+
+    # Clear the user_input_type after processing
+    st.session_state["user_input_type"] = None
+
+    if not invoke_payload:
+        st.warning("Something went wrong, no action to take. Please try again.")
+        st.session_state.disabled = False
+        st.rerun()
+        return
+
+    res = compiled_workflow.invoke(invoke_payload, config=config)
+
+    # --- 7. AIバブル差し替え & Clarification Check ---
+    if "clarification_question" in res and res["clarification_question"]:
+            st.session_state.awaiting_clarification_input = True
+            st.session_state.clarification_question_text = res["clarification_question"]
+            st.session_state["chat_history"].append({"role": "assistant", "content": res["clarification_question"], "type": "clarification_request"})
+            st.session_state["memory_state"] = res
+            ai_msg_placeholder.empty()
+            st.session_state.disabled = False
+            st.rerun()
+        else:
+            # Normal response processing
+            with ai_msg_placeholder.chat_message("assistant"):
+                if "error" in res and res["error"]:
+                    st.error(res['error'])
+
+                if "interpretation" in res and res["interpretation"]:
+                    st.write(res["interpretation"])
+
+                # --- Displaying latest_df from live response ---
         if "latest_df" in res and res["latest_df"] is not None:
             latest_df_data = res["latest_df"]
             if isinstance(latest_df_data, dict): # New OrderedDict format
@@ -170,9 +320,58 @@ if user_input:
         if "chart_result" in res and res["chart_result"]:
             st.image(base64.b64decode(res["chart_result"]), caption="AI生成グラフ")
 
-    # --- 8. 履歴に保存 & 入力フィールドを再度有効化 ---
-    st.session_state["chat_history"].append({"role": "assistant", **res})
-    st.session_state["memory_state"] = res # Save the full state for potential resume
+        # --- Display Analysis Options (if any) ---
+        if "analysis_options" in res and res["analysis_options"] and isinstance(res["analysis_options"], list) and len(res["analysis_options"]) > 0:
+            st.markdown("---") # Separator
+            st.write("Suggested next steps:")
+            for i, option_text in enumerate(res["analysis_options"]):
+                if not isinstance(option_text, str): # Ensure option_text is a string
+                    continue # Skip if not a string
+                button_key = f"analysis_option_btn_{uuid.uuid4().hex}_{i}" # Unique key
+                if st.button(option_text, key=button_key):
+                    # User clicked an analysis option
+                    st.chat_message("user").write(option_text)
+                    st.session_state["chat_history"].append({"role": "user", "content": option_text, "type": "analysis_selection"})
 
-    st.session_state.disabled = False
-    st.rerun() # Re-enable input and refresh UI
+                    current_memory_state = st.session_state.get("memory_state", {})
+                    # Prepare a clean state for the new turn, but carry over history
+
+                    # query_history for backend should be a list of user query strings
+                    # up to, but not including, the current selected option.
+                    # The current selected option becomes the new "input".
+                    chat_history_for_query_context = st.session_state.get("chat_history", [])
+                    # The last item in chat_history_for_query_context is the selected option itself (just added),
+                    # so we take up to [:-1] for the history that *led* to this option.
+                    query_history_list = [msg["content"] for msg in chat_history_for_query_context[:-1] if msg["role"] == "user"]
+
+                    new_input_context = {
+                        "input": option_text,
+                        "df_history": current_memory_state.get("df_history", []),
+                        "query_history": query_history_list,
+                        # Reset other fields for a fresh analysis based on the selected option
+                        "latest_df": collections.OrderedDict(),
+                        "SQL": None,
+                        "interpretation": None,
+                        "chart_result": None,
+                        "clarification_question": None,
+                        "user_clarification": None,
+                        "analysis_options": None, # Clear options for the new turn
+                        "error": None,
+                        "intent_list": [], # Will be re-classified
+                        "data_requirements": [], # Will be re-extracted
+                        "missing_data_requirements": None,
+                    }
+                    st.session_state.memory_state = new_input_context
+                    st.session_state.disabled = True # Trigger backend processing
+                    # No need to call ai_msg_placeholder.empty() here as it's outside this with block
+                    st.rerun()
+                    break # Exit loop once a button is clicked and rerun is triggered
+
+    # --- 8. 履歴に保存 & 入力フィールドを再度有効化 ---
+    # Ensure this runs only if we haven't already rerun due to button click
+    if not (st.session_state.disabled and any(entry.get("type") == "analysis_selection" for entry in st.session_state.chat_history[-1:])):
+        st.session_state["chat_history"].append({"role": "assistant", **res})
+        st.session_state["memory_state"] = res # Save the full state
+
+        st.session_state.disabled = False
+        st.rerun() # Re-enable input and refresh UI

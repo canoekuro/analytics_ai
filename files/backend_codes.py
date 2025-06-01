@@ -10,6 +10,7 @@ import os
 import base64
 import re
 from typing import TypedDict, List, Optional, Any
+import ast # For literal_eval
 from langgraph.checkpoint.memory import MemorySaver
 import uuid
 from datetime import datetime
@@ -55,7 +56,186 @@ class MyState(TypedDict, total=False):
     query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
     data_requirements: List[str]     # データ要件
     missing_data_requirements: Optional[List[str]] # New: List of data requirements not found in history
+    clarification_question: Optional[str] = None
+    analysis_options: Optional[List[str]] = None
+    user_clarification: Optional[str] = None
+    # For multi-stage analysis planning
+    analysis_plan: Optional[List[dict]] = None # Stores the list of steps, e.g., [{"node": "sql", "params": {...}}, {"node": "interpret"}]
+    current_plan_step_index: Optional[int] = None # Index of the current step in analysis_plan
+    awaiting_step_confirmation: Optional[bool] = None # True if waiting for user to proceed to next step
+    complex_analysis_original_query: Optional[str] = None # Stores the original multi-step query
+    user_action: Optional[str] = None # New field for frontend actions like "proceed_analysis_step" or "cancel_analysis_plan"
 
+# Analysis Planning Node
+def analysis_planning_node(state: MyState) -> MyState:
+    user_query = state.get("input", "")
+
+    # LLM Prompt to identify multi-step queries and generate a plan
+    # For this subtask, the actual LLM call is mocked below.
+    # prompt_for_plan = f"""
+    # Analyze the user's query: "{user_query}"
+    # Is this a multi-step analysis request?
+    # If YES, decompose it into a series of logical steps. Each step should map to an action: "sql", "interpret", "chart".
+    # For each step, specify the action and "details" (e.g., for "sql", what data to fetch based on the query portion for that step).
+    # Output the plan as a JSON string: '[{{"action": "action_type", "details": "description_for_step"}}, ...]'
+    # Example: User query "Show monthly sales, interpret it, then chart the sales trend."
+    # Output: '[{{"action": "sql", "details": "monthly sales"}}, {{"action": "interpret", "details": "interpret monthly sales"}}, {{"action": "chart", "details": "chart sales trend"}}]'
+    # If NO (it's a single-step request or not an analysis task), output the exact phrase: "NOT_MULTI_STEP"
+    # """
+    # llm_response_str = llm.invoke(prompt_for_plan).content.strip()
+
+    # Mocked response for subtask:
+    if "plan" in user_query.lower() or "まず" in user_query or "次に" in user_query or "then" in user_query.lower(): # Simple keyword check
+        # Example: "まず月次売上を表示し、次にそれを解釈し、最後に売上トレンドをグラフ化してplan"
+        # This mock plan assumes the LLM can break this down.
+        # A real LLM would need to extract "月次売上" for the first sql, etc.
+        plan_parts = []
+        if "月次売上" in user_query or "monthly sales" in user_query:
+            plan_parts.append({"action": "sql", "details": "Overall monthly sales"})
+            if "解釈" in user_query or "interpret" in user_query:
+                plan_parts.append({"action": "interpret", "details": "Interpret monthly sales"})
+            if "グラフ" in user_query or "chart" in user_query or "トレンド" in user_query or "trend" in user_query:
+                 plan_parts.append({"action": "chart", "details": "Sales trend chart"})
+
+        if not plan_parts: # Fallback mock plan if keywords aren't specific enough for the above
+            plan_parts = [{"action": "sql", "details": "General data related to query"}, {"action": "interpret", "details": "Interpret general data"}]
+
+        plan_json_str = json.dumps(plan_parts) # Convert list of dicts to JSON string
+    else:
+        plan_json_str = "NOT_MULTI_STEP"
+
+    if plan_json_str == "NOT_MULTI_STEP":
+        return {
+            **state,
+            "analysis_plan": None,
+            "condition": "single_step_request"
+        }
+    else:
+        try:
+            parsed_plan = json.loads(plan_json_str)
+            if not isinstance(parsed_plan, list) or not all(isinstance(step, dict) and "action" in step and "details" in step for step in parsed_plan):
+                raise ValueError("Plan is not a list of dicts with action and details")
+
+            # Set input for the first step.
+            # Subsequent steps will have their input set by execute_planned_step_node or plan_step_transition_node
+            first_step_input = parsed_plan[0].get("details", "") if parsed_plan else ""
+
+            return {
+                **state,
+                "complex_analysis_original_query": user_query, # Store original multi-step query
+                "analysis_plan": parsed_plan,
+                "current_plan_step_index": 0,
+                "awaiting_step_confirmation": False, # Initially false, set to true after a step completes
+                "input": first_step_input, # Modify input to be for the first step
+                "data_requirements": [first_step_input] if parsed_plan[0].get("action") == "sql" else [], # Pre-populate data_requirements for first SQL step
+                "condition": "plan_generated"
+            }
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.error(f"Failed to parse analysis plan: {e}. Plan string: '{plan_json_str}'")
+            return {
+                **state,
+                "analysis_plan": None,
+                "condition": "single_step_request", # Treat as single step if plan parsing fails
+                "error": f"Error parsing analysis plan: {e}"
+            }
+
+# Execute Planned Step Node
+def execute_planned_step_node(state: MyState) -> MyState:
+    plan = state.get("analysis_plan")
+    current_index = state.get("current_plan_step_index")
+
+    if not plan or current_index is None or not (0 <= current_index < len(plan)):
+        logging.error("Invalid plan or step index in execute_planned_step_node.")
+        return {**state, "error": "Invalid plan state.", "condition": "plan_error"}
+
+    current_step = plan[current_index]
+    action = current_step.get("action")
+    details = current_step.get("details", "") # Details for the current step
+
+    # Prepare state for the target node
+    # Set 'input' to current step's details.
+    # If action is 'sql', also populate 'data_requirements'.
+    # Clear other potentially interfering state fields from previous steps if necessary.
+
+    # Reset specific fields that should be populated by the upcoming node
+    # Preserve latest_df if current action is interpret or chart, otherwise clear it (e.g., for SQL action)
+    new_latest_df = state.get("latest_df")
+    if action == "sql": # If the current planned step is SQL, then latest_df should be cleared to receive new data.
+        new_latest_df = collections.OrderedDict()
+    # For 'interpret' or 'chart', new_latest_df will retain the existing state.latest_df,
+    # which should contain the output of the previous SQL step.
+
+    current_state_for_step = {
+        **state,
+        "input": details, # Target node will use this as its primary input for the step
+        "data_requirements": [details] if action == "sql" and details else [],
+        "SQL": None,
+        "interpretation": None,
+        "chart_result": None,
+        "error": None,
+        "latest_df": new_latest_df, # Use the adjusted new_latest_df
+        "missing_data_requirements": [],
+        "clarification_question": None,
+        "user_clarification": None,
+        "user_action": None, # Clear user_action as it has been processed by routing to this node
+        "awaiting_step_confirmation": False, # Ensure this is false as we are executing a step
+        "condition": f"executing_plan_step_{action}"
+    }
+
+    return current_state_for_step
+
+# Plan Step Transition Node
+def plan_step_transition_node(state: MyState) -> MyState:
+    current_index = state.get("current_plan_step_index")
+    plan_length = len(state.get("analysis_plan", []))
+
+    if current_index is None:
+        logging.error("current_plan_step_index is None in plan_step_transition_node")
+        return {**state, "error": "Plan execution error: step index missing.", "condition": "plan_error_no_index"}
+
+    next_index = current_index + 1
+
+    if next_index < plan_length:
+        # Prepare for the next step
+        next_step_details = state["analysis_plan"][next_index].get("details", "")
+        next_step_action = state["analysis_plan"][next_index].get("action")
+
+        return {
+            **state,
+            "current_plan_step_index": next_index,
+            "awaiting_step_confirmation": True, # Pause for frontend confirmation
+            "input": next_step_details, # Set input for the upcoming step (will be used by execute_planned_step_node)
+            "data_requirements": [next_step_details] if next_step_action == "sql" and next_step_details else [],
+            "condition": "awaiting_next_step_confirmation"
+        }
+    else:
+        # Plan complete
+        original_query = state.get("complex_analysis_original_query", "")
+        return {
+            **state,
+            "analysis_plan": None,
+            "current_plan_step_index": None,
+            "awaiting_step_confirmation": None,
+            "complex_analysis_original_query": None,
+            "input": original_query, # Restore original query or set to a summary
+            "data_requirements": [], # Clear for post-plan phase
+            "condition": "plan_completed"
+        }
+
+# Node to handle cancellation of an analysis plan
+def cancel_analysis_plan_node(state: MyState) -> MyState:
+    original_query = state.get("complex_analysis_original_query", "The analysis plan was cancelled.")
+    return {
+        **state,
+        "analysis_plan": None,
+        "current_plan_step_index": None,
+        "awaiting_step_confirmation": False, # Ensure this is false
+        "complex_analysis_original_query": None,
+        "input": original_query, # Restore original query or use a cancellation message
+        "interpretation": "The multi-step analysis plan has been cancelled by the user.",
+        "condition": "plan_cancelled",
+        "user_action": None # Clear the action
+    }
 
 #意図の判別
 
@@ -68,6 +248,49 @@ def extract_sql(sql_text):
     if match:
         return match.group(1).strip()
     return sql_text.strip()
+
+def parse_llm_list_output(llm_output_str: str) -> List[str]:
+    try:
+        # Handle common LLM list-like outputs, e.g. newlines, hyphens
+        # Remove potential markdown list characters like '-' or '*'
+        cleaned_str = re.sub(r'^\s*[-*]\s*', '', llm_output_str, flags=re.MULTILINE)
+
+        # If it's not already in list format, try to make it so,
+        # especially if it's a simple newline-separated list of suggestions
+        if not cleaned_str.strip().startswith('['):
+            lines = [line.strip().replace("'", "\\'") for line in cleaned_str.split('\n') if line.strip()]
+            # Ensure each item is quoted if it's a simple list of strings
+            # This helps ast.literal_eval to parse it correctly.
+            if all(not (line.startswith("'") and line.endswith("'")) and \
+                   not (line.startswith('"') and line.endswith('"')) for line in lines):
+                 cleaned_str = "[" + ", ".join([f"'{line}'" for line in lines]) + "]"
+            else: # It might already be a list of quoted strings, just needs brackets
+                 cleaned_str = "[" + ", ".join(lines) + "]"
+
+
+        parsed_list = ast.literal_eval(cleaned_str)
+        if isinstance(parsed_list, list) and all(isinstance(item, str) for item in parsed_list):
+            return parsed_list
+        return [] # Return empty if not a list of strings
+    except (ValueError, SyntaxError) as e:
+        logging.warning(f"Failed to parse LLM list output with ast.literal_eval: {e}. Original string: '{llm_output_str}'. Falling back to newline split.")
+        # Fallback: Try to extract lines if it looks like a multi-line string output
+        # that ast.literal_eval couldn't handle (e.g. no quotes, just items on new lines)
+        # Remove any surrounding brackets or list-like artifacts before splitting
+        str_for_split = llm_output_str.strip()
+        if str_for_split.startswith('[') and str_for_split.endswith(']'):
+            str_for_split = str_for_split[1:-1]
+
+        # Split by newline, strip quotes/commas from each item, filter empty
+        suggestions = []
+        for line in str_for_split.split('\n'):
+            # Remove list item markers like '-' or '*' and surrounding whitespace/quotes
+            item = re.sub(r'^\s*[-*]\s*', '', line).strip()
+            item = item.strip('\'",') # Remove surrounding quotes
+            if item:
+                 suggestions.append(item)
+        return suggestions
+
 
 def try_sql_execute(sql_text):
     """SQLを実行し、エラーがあれば内容を返す"""
@@ -596,25 +819,186 @@ def extract_data_requirements_node(state):
         "condition": "データ要件抽出完了"
     }
 
-# classifyノードの分岐（次に何へ進むか？）
-def classify_next(state):
-    intents = state.get("intent_list", [])
-    if "clear_data_intent" in intents: # Prioritize clear intent
-        return "clear_data"
-    elif "メタデータ検索" in intents: # Then metadata search
-        return "metadata_retrieval"
-    elif "データ取得" in intents:
-        return "extract_data_requirements" # Changed from "find_similar_query"
-    # These checks are likely redundant if metadata or data acquisition is primary
-    elif "グラフ作成" in intents: # This case might be hit if "データ取得" is not in intents
-        # If only chart is requested, and no data acquisition, where does the data come from?
-        # This path might need to go to find_similar_query to see if *any* relevant data exists,
-        # or it implies the user expects to use previously loaded data.
-        # For now, if "データ取得" is not an intent, chart/interpret might rely on existing latest_df.
-        return "chart"
-    elif "データ解釈" in intents:
-        return "interpret"
+# Information Gathering Node
+def information_gathering_node(state: MyState) -> MyState:
+    user_input = state.get("input", "")
+    data_requirements = state.get("data_requirements", [])
+    df_history = state.get("df_history", [])
+    user_clarification = state.get("user_clarification")
+
+    # 1. If user_clarification is present, incorporate it
+    if user_clarification:
+        # Simple incorporation: append to original input.
+        # More sophisticated logic might be needed to update data_requirements directly.
+        updated_input = f"{user_input} [User Clarification: {user_clarification}]"
+        # Potentially re-run data requirements extraction or directly use it.
+        # For now, we assume this clarification is enough to proceed.
+        return {
+            **state,
+            "input": updated_input, # Augment input
+            "user_clarification": None, # Clear after processing
+            "clarification_question": None, # Clear previous question
+            "condition": "clarification_not_needed"
+        }
+
+    # 2. If no user_clarification, proceed to check if clarification is needed
+    # Create a summary of df_history (e.g., list of queries)
+    df_history_summary_list = []
+    if df_history:
+        for entry in df_history:
+            query = entry.get("query", "N/A")
+            # Truncate long queries if necessary
+            summary = query if len(query) < 50 else query[:47] + "..."
+            df_history_summary_list.append(summary)
+    df_history_summary = ", ".join(df_history_summary_list) if df_history_summary_list else "No relevant data history."
+
+    prompt_for_clarification = f"""
+You are an intelligent assistant helping to clarify a user's data analysis request.
+Your goal is to identify if essential information for data retrieval or analysis is missing.
+If crucial information is missing, formulate a single, clear question to the user to obtain it.
+If no clarification is needed, respond with the exact phrase: NO_CLARIFICATION_NEEDED
+
+Here is the current context:
+User's overall request: "{user_input}"
+Identified data requirements by a previous step: {data_requirements if data_requirements else "None yet."}
+Summary of previously retrieved data relevant to this conversation: {df_history_summary}
+
+Examples of missing information and good clarification questions:
+- If the user asks for "sales data" without a period: "For what period would you like to see the sales data (e.g., last month, specific year, specific dates)?"
+- If the user asks to "analyze performance" without specifying metrics or subjects: "What specific aspects or metrics of performance are you interested in analyzing, and for which subjects (e.g., products, employees)?"
+- If data requirements mention "customer segments" but no segmentation criteria are clear: "How would you like to segment the customers? (e.g., by demographics, purchase history, location)"
+- If the user asks for a comparison but one of the items to compare is unclear: "You mentioned comparing X with Y, but Y is unclear. What is Y?"
+
+Based on the user's request and identified data requirements, is there any missing information?
+If yes, what question should be asked to the user?
+If no, reply with NO_CLARIFICATION_NEEDED.
+"""
+    # response = llm.invoke(prompt_for_clarification) # This would be the actual LLM call
+    # llm_response_text = response.content.strip()
+
+    # For now, retain the mock logic but with the new prompt structure in mind for future integration.
+    # The mock logic below should be replaced by a real LLM call using the prompt above.
+    llm_response_text = "" # Placeholder for actual LLM response
+    if not data_requirements and ("show me data" in user_input.lower() or "データを見せて" in user_input.lower()):
+        llm_response_text = "To proceed, I need a bit more information: What specific data would you like to see and for what purpose?"
+    elif "analyze" in user_input.lower() and not any("specific" in req.lower() for req in data_requirements):
+        llm_response_text = "To proceed, I need a bit more information: What specific aspects are you interested in analyzing?"
+    elif ("sales data" in user_input.lower() or "売上データ" in user_input.lower()) and not any(period_keyword in req.lower() for period_keyword in ["month", "year", "period", "date", "月", "年", "期間", "日付"] for req in data_requirements):
+        # Check if user_clarification already provided this
+        if not (user_clarification and any(pk in user_clarification.lower() for pk in ["month", "year", "period", "date"])):
+             llm_response_text = "For what period would you like to see the sales data (e.g., last month, specific dates)?"
+        else:
+             llm_response_text = "NO_CLARIFICATION_NEEDED" # Assume clarification fixed it
     else:
+        llm_response_text = "NO_CLARIFICATION_NEEDED"
+
+    if llm_response_text != "NO_CLARIFICATION_NEEDED":
+        return {{
+            **state,
+            "clarification_question": llm_response_text,
+            "condition": "awaiting_user_clarification"
+        }}
+    else:
+        return {{
+            **state,
+            "clarification_question": None,
+            "condition": "clarification_not_needed"
+        }}
+
+# classifyノードの分岐（次に何へ進むか？）
+def classify_next(state: MyState):
+    user_action = state.get("user_action")
+    intents = state.get("intent_list", []) # Populated by classify_intent_node
+
+    # Priority 1: User actions from frontend buttons
+    if user_action == "proceed_analysis_step":
+        # Frontend payload for "proceed_analysis_step" includes "awaiting_step_confirmation": False.
+        # user_action will be cleared in execute_planned_step_node.
+        return "execute_planned_step"
+    elif user_action == "cancel_analysis_plan":
+        # user_action will be cleared in cancel_analysis_plan_node.
+        return "cancel_analysis_plan"
+
+    # Priority 2: System intents (like clear history)
+    if "clear_data_intent" in intents:
+        return "clear_data"
+
+    # Priority 3: Metadata search intent
+    elif "メタデータ検索" in intents: # "metadata_search"
+        return "metadata_retrieval"
+
+    # Priority 4: Default to analysis planning for any other user query/intent
+    else:
+        # This path is for new user queries or existing queries where no specific user_action was triggered.
+        # classify_intent_node would have run, populating intents. If intents are e.g. ["データ取得"],
+        # it still goes to analysis_planning_node which will then decide if it's single_step_request
+        # or if a plan needs to be generated.
+        return "analysis_planning"
+
+# Conditional logic for information_gathering_node
+def information_gathering_next(state: MyState):
+    condition = state.get("condition")
+    # This node is part of the single-step execution path.
+    # It should not be aware of multi-step plans.
+    if condition == "awaiting_user_clarification":
+        return END # Go to END, frontend will handle clarification
+    elif condition == "clarification_not_needed":
+        return "find_similar_query" # Original single-step flow continues
+    else: # Should not happen
+        logging.warning(f"Unexpected condition in information_gathering_next: {condition}")
+        return END
+
+# Conditional logic for analysis_planning_node
+def analysis_planning_next(state: MyState):
+    condition = state.get("condition")
+    if condition == "plan_generated":
+        # If a plan is generated, and user was confirming, this confirmation is for the *first* step.
+        # If awaiting_step_confirmation is true here, it means user clicked "Proceed" on the overall plan.
+        if state.get("awaiting_step_confirmation") is True:
+             return "execute_planned_step" # Directly execute first step
+        else:
+            # This is the first time plan is generated, ask for confirmation to start.
+            # Or, could proceed directly if no initial overall confirmation is desired.
+            # For now, let's assume we always ask for confirmation for the first step too.
+            # The frontend would show the plan and a "Start Plan" button.
+            # To simplify for backend, we might assume first step confirmation is implicit or handled by frontend sending a specific input.
+            # Let's proceed to execute_planned_step directly for now.
+            # Frontend can control this by sending a specific "user_confirms_plan_start" input if needed.
+            return "execute_planned_step"
+    elif condition == "single_step_request":
+        return "extract_data_requirements" # Fallback to original single-step flow
+    else: # plan_error or other
+        return END
+
+# Conditional logic for execute_planned_step_node
+def execute_planned_step_next(state: MyState):
+    # This node prepares the state for the actual action node (sql, interpret, chart)
+    # The condition was set to "executing_plan_step_{action}"
+    condition = state.get("condition", "")
+    if "executing_plan_step_sql" in condition:
+        return "sql"
+    elif "executing_plan_step_interpret" in condition:
+        return "interpret"
+    elif "executing_plan_step_chart" in condition:
+        return "chart"
+    else: # plan_error etc.
+        logging.error(f"Unknown condition after execute_planned_step: {condition}")
+        return END
+
+# Conditional logic for plan_step_transition_node
+def plan_step_transition_next(state: MyState):
+    condition = state.get("condition")
+    if condition == "awaiting_next_step_confirmation":
+        # State now has awaiting_step_confirmation = True.
+        # Frontend should get this, display results, and offer "Proceed".
+        # When user clicks "Proceed", workflow is invoked again.
+        # classify_next will see awaiting_step_confirmation = True and route to execute_planned_step.
+        return END
+    elif condition == "plan_completed":
+        return "suggest_analysis_paths" # Or END, depending on desired final action
+    elif condition == "plan_error_no_index": # Error case from plan_step_transition
+        return END
+    else: # Should not happen
         return END
 
 def find_similar_next(state: MyState):
@@ -652,22 +1036,51 @@ def find_similar_next(state: MyState):
 
 
 # sqlノード後の遷移
-def sql_next(state):
-    intents = state.get("intent_list", [])
+def sql_next(state: MyState):
+    # If part of a plan, after SQL execution, go to plan transition.
+    if state.get("analysis_plan") and state.get("current_plan_step_index") is not None:
+        return "plan_step_transition"
+
+    # Original single-step logic
+    intents = state.get("intent_list", []) # intent_list might be empty/irrelevant in planned mode
+    if not intents and state.get("complex_analysis_original_query"): # Try to infer from original query if in single_step_request mode after planning failed
+        # This part is tricky, ideally single_step_request would re-run intent classification or have its own logic
+        pass # For now, rely on explicit intents or direct plan execution
+
     if "グラフ作成" in intents:
         return "chart"
     elif "データ解釈" in intents:
         return "interpret"
     else:
-        return END
+        return END # Or suggest_analysis_paths if appropriate for single SQL query
 
 # chartノード後の遷移
-def chart_next(state):
+def chart_next(state: MyState):
+    # If part of a plan, after chart execution, go to plan transition.
+    if state.get("analysis_plan") and state.get("current_plan_step_index") is not None:
+        return "plan_step_transition"
+
+    # Original single-step logic
     intents = state.get("intent_list", [])
     if "データ解釈" in intents:
         return "interpret"
     else:
-        return END
+        return "suggest_analysis_paths"
+
+# interpretノード後の遷移 (New, as interpret_node was a terminal before routing to suggest_analysis_paths)
+def interpret_next(state: MyState):
+    # If part of a plan, after interpretation, go to plan transition.
+    if state.get("analysis_plan") and state.get("current_plan_step_index") is not None:
+        return "plan_step_transition"
+
+    # Original single-step logic: after interpretation, suggest next paths
+    return "suggest_analysis_paths"
+
+
+# Conditional logic for suggest_analysis_paths_node
+def suggest_analysis_paths_next(state: MyState):
+    # Currently, always ends after suggesting paths, frontend handles selection.
+    return END
 
 # 新しいメタデータ検索ノード
 def metadata_retrieval_node(state):
@@ -717,29 +1130,133 @@ def clear_data_node(state):
         "query_history": [] # Reset query history
     }
 
+# Suggest Analysis Paths Node
+# Ensure DATA_CLEARED_MESSAGE is defined globally or passed appropriately if used in this node.
+# For the subtask, we'll assume it's accessible.
+
+def suggest_analysis_paths_node(state: MyState) -> MyState:
+    original_user_input = state.get("input", "")
+    latest_df_ordered_dict = state.get("latest_df")
+    current_interpretation = state.get("interpretation", "")
+    query_history = state.get("query_history", [])
+    # DATA_CLEARED_MESSAGE should be accessible here if used in conditions
+
+    no_data_messages = [
+        "まだデータがありません。",
+        "データが取得されましたが、内容は空です。",
+        "データが取得されましたが、内容は空でした。",
+        DATA_CLEARED_MESSAGE # Make sure this constant is available
+    ]
+
+    # Initial check for meaningful data or interpretation
+    if not latest_df_ordered_dict and (not current_interpretation or any(msg in current_interpretation for msg in no_data_messages)):
+        return {**state, "analysis_options": [], "condition": "no_paths_suggested"}
+
+    data_summary_parts = []
+    if latest_df_ordered_dict:
+        for req, data_list in latest_df_ordered_dict.items():
+            if data_list:
+                try:
+                    df = pd.DataFrame(data_list)
+                    if not df.empty:
+                        data_summary_parts.append(f"Data for '{req}': {df.shape[0]} rows, {df.shape[1]} columns (Columns: {', '.join(df.columns)})")
+                    else:
+                        data_summary_parts.append(f"Data for '{req}': Empty")
+                except Exception:
+                    data_summary_parts.append(f"Data for '{req}': Could not load as DataFrame")
+            else:
+                data_summary_parts.append(f"Data for '{req}': Empty or not available")
+
+    data_summary = "\n".join(data_summary_parts) if data_summary_parts else "No data retrieved or all data was empty."
+    recent_query_history_summary = "\n".join(query_history[-3:]) if query_history else "No query history."
+
+    prompt_for_suggestions = f"""
+You are an intelligent data analysis assistant. Based on the user's recent activity and the data obtained, suggest 2-3 relevant follow-up questions or analysis actions the user might be interested in.
+Format your response as a Python-style list of strings. For example: ["Show sales by region", "Analyze customer churn"]
+If no specific suggestions come to mind or if the data is insufficient for further meaningful analysis, return an empty list: [].
+
+User's original request: "{original_user_input}"
+Summary of current data:
+{data_summary}
+Current interpretation/summary of findings: "{current_interpretation if current_interpretation else 'Not yet available.'}"
+Recent query history:
+{recent_query_history_summary}
+
+Based on this, what are some logical next steps or questions?
+Response (as a Python list of strings):
+"""
+    # In a real scenario, an LLM call would be made here:
+    # response = llm.invoke(prompt_for_suggestions)
+    # llm_response_str = response.content.strip()
+
+    # Mock LLM response for now, using logic similar to the original but ensuring it's integrated with the new prompt structure
+    llm_response_str = "[]" # Default to no suggestions
+    if data_summary_parts:
+        if "sales" in original_user_input.lower() or "売上" in original_user_input:
+            llm_response_str = '["月別の売上トレンドを表示しますか？", "最も売上が高い商品カテゴリは何ですか？", "前期と比較した売上はどうですか？"]'
+        elif "customer" in original_user_input.lower() or "顧客" in original_user_input:
+            llm_response_str = '["顧客をデモグラフィック情報でセグメント分けしますか？", "新規顧客獲得数のトレンドを表示しますか？", "顧客の購入頻度を分析しますか？"]'
+        else:
+            llm_response_str = '["このデータを異なる種類のグラフで表示しますか？", "主要な発見を要約してください。", "業界ベンチマークと比較してどうですか？"]'
+    elif current_interpretation and len(current_interpretation) > 50 and not any(msg in current_interpretation for msg in no_data_messages):
+        llm_response_str = '["この分析の限界は何ですか？", "これをさらに詳細に分析できますか？"]'
+
+    parsed_options = parse_llm_list_output(llm_response_str)
+
+    if not parsed_options:
+        return {**state, "analysis_options": [], "condition": "no_paths_suggested"}
+    else:
+        return {**state, "analysis_options": parsed_options[:3], "condition": "paths_suggested"}
 
 def build_workflow():
     memory = MemorySaver()
     workflow = StateGraph(state_schema=MyState)
+
+    # Add all nodes
     workflow.add_node("classify", classify_intent_node)
-    workflow.add_node("extract_data_requirements", extract_data_requirements_node) # New node
+    workflow.add_node("analysis_planning", analysis_planning_node) # New
+    workflow.add_node("execute_planned_step", execute_planned_step_node) # New
+    workflow.add_node("plan_step_transition", plan_step_transition_node) # New
+    workflow.add_node("cancel_analysis_plan", cancel_analysis_plan_node) # New
+
+    workflow.add_node("extract_data_requirements", extract_data_requirements_node)
+    workflow.add_node("information_gathering", information_gathering_node)
     workflow.add_node("find_similar_query", find_similar_query_node)
     workflow.add_node("sql", sql_node)
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
-    workflow.add_node("metadata_retrieval", metadata_retrieval_node) # 新しいノードを追加
-    workflow.add_node("clear_data", clear_data_node) # Add clear_data node
+    workflow.add_node("suggest_analysis_paths", suggest_analysis_paths_node)
+    workflow.add_node("metadata_retrieval", metadata_retrieval_node)
+    workflow.add_node("clear_data", clear_data_node)
     
+    # Define edges
+    workflow.set_entry_point("classify")
     workflow.add_conditional_edges("classify", classify_next)
-    workflow.add_edge("extract_data_requirements", "find_similar_query") # Edge from new node
-    workflow.add_conditional_edges("find_similar_query", find_similar_next)
+
+    workflow.add_edge("clear_data", END)
+    workflow.add_edge("metadata_retrieval", END)
+    workflow.add_edge("cancel_analysis_plan", "suggest_analysis_paths") # Or END if preferred after cancellation
+
+    # Analysis Planning Path
+    workflow.add_conditional_edges("analysis_planning", analysis_planning_next)
+    workflow.add_conditional_edges("execute_planned_step", execute_planned_step_next)
+
+    # Edges from action nodes (sql, interpret, chart) now go to their respective "_next" router
+    # which will decide if they go to plan_step_transition or old path.
     workflow.add_conditional_edges("sql", sql_next)
     workflow.add_conditional_edges("chart", chart_next)
-    workflow.add_edge("interpret", END)
-    workflow.add_edge("metadata_retrieval", END) # メタデータ検索後は終了
-    workflow.add_edge("clear_data", END) # Add edge for clear_data node
+    # workflow.add_edge("interpret", "suggest_analysis_paths") # Old edge
+    workflow.add_conditional_edges("interpret", interpret_next) # New conditional edge for interpret
 
-    workflow.set_entry_point("classify")
+    workflow.add_conditional_edges("plan_step_transition", plan_step_transition_next)
+
+    # Original Single-Step Path (after analysis_planning decides it's single_step_request)
+    workflow.add_edge("extract_data_requirements", "information_gathering")
+    workflow.add_conditional_edges("information_gathering", information_gathering_next)
+    workflow.add_conditional_edges("find_similar_query", find_similar_next)
+
+    # Common end path after single or planned analysis (if not ending sooner)
+    workflow.add_conditional_edges("suggest_analysis_paths", suggest_analysis_paths_next)
     return workflow.compile(checkpointer=memory)
 
 user_query = "カテゴリの合計販売金額を出して" # This will not trigger metadata_retrieval
