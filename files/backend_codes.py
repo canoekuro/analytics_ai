@@ -60,7 +60,7 @@ class MyState(TypedDict, total=False):
     analysis_options: Optional[List[str]] = None
     user_clarification: Optional[str] = None
     # For multi-stage analysis planning
-    analysis_plan: Optional[List[dict]] = None # Stores the list of steps, e.g., [{"node": "sql", "params": {...}}, {"node": "interpret"}]
+    analysis_plan: Optional[List[dict]] = None # Stores the list of analysis steps, e.g., [{"action": "sql", "details": "Overall monthly sales"}, {"action": "interpret", "details": "Interpret monthly sales data"}]
     current_plan_step_index: Optional[int] = None # Index of the current step in analysis_plan
     awaiting_step_confirmation: Optional[bool] = None # True if waiting for user to proceed to next step
     complex_analysis_original_query: Optional[str] = None # Stores the original multi-step query
@@ -116,9 +116,20 @@ def analysis_planning_node(state: MyState) -> MyState:
             if not isinstance(parsed_plan, list) or not all(isinstance(step, dict) and "action" in step and "details" in step for step in parsed_plan):
                 raise ValueError("Plan is not a list of dicts with action and details")
 
+            if not parsed_plan: # Check if the list is empty after parsing
+                # This handles cases where the LLM might return an empty list '[]' for the plan
+                logging.warning("LLM generated an empty plan. Treating as single_step_request.")
+                return {
+                    **state,
+                    "analysis_plan": None, # Ensure plan is None
+                    "input": state.get("complex_analysis_original_query", user_query), # Restore original input
+                    "condition": "single_step_request"
+                }
+
             # Set input for the first step.
             # Subsequent steps will have their input set by execute_planned_step_node or plan_step_transition_node
-            first_step_input = parsed_plan[0].get("details", "") if parsed_plan else ""
+            first_step_input = parsed_plan[0].get("details", "") # Now safe to access parsed_plan[0]
+            first_step_action = parsed_plan[0].get("action")
 
             return {
                 **state,
@@ -127,7 +138,7 @@ def analysis_planning_node(state: MyState) -> MyState:
                 "current_plan_step_index": 0,
                 "awaiting_step_confirmation": False, # Initially false, set to true after a step completes
                 "input": first_step_input, # Modify input to be for the first step
-                "data_requirements": [first_step_input] if parsed_plan[0].get("action") == "sql" else [], # Pre-populate data_requirements for first SQL step
+                "data_requirements": [first_step_input] if first_step_action == "sql" and first_step_input else [], # Pre-populate data_requirements for first SQL step
                 "condition": "plan_generated"
             }
         except (json.JSONDecodeError, ValueError) as e:
@@ -893,17 +904,17 @@ If no, reply with NO_CLARIFICATION_NEEDED.
         llm_response_text = "NO_CLARIFICATION_NEEDED"
 
     if llm_response_text != "NO_CLARIFICATION_NEEDED":
-        return {{
+        return {
             **state,
             "clarification_question": llm_response_text,
             "condition": "awaiting_user_clarification"
-        }}
+        }
     else:
-        return {{
+        return {
             **state,
             "clarification_question": None,
             "condition": "clarification_not_needed"
-        }}
+        }
 
 # classifyノードの分岐（次に何へ進むか？）
 def classify_next(state: MyState):

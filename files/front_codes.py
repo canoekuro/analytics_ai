@@ -1,14 +1,14 @@
 import streamlit as st
 import base64
 import pandas as pd
-from PIL import Image
-from io import BytesIO
+# from PIL import Image # Unused
+# from io import BytesIO # Unused
 import time
 from files.backend_codes import build_workflow
 import uuid # Add this import
 import collections # Add this import
 
-compiled_workflow = build_workflow()
+# compiled_workflow = build_workflow() # Redundant, get_workflow() is used
 
 # --- 1. セッション状態で履歴＆state管理 ---
 if "chat_history" not in st.session_state:
@@ -133,9 +133,9 @@ if st.session_state.awaiting_clarification_input and st.session_state.clarificat
     if submit_clarification_button and clarification_answer:
         st.session_state["chat_history"].append({"role": "user", "content": clarification_answer, "type": "clarification_answer"})
 
-        current_memory_state = dict(st.session_state.get("memory_state", {}))
-        current_memory_state["user_clarification"] = clarification_answer
-        # 'input' and 'clarification_question' should still be in current_memory_state from the backend's last response.
+        # current_memory_state = dict(st.session_state.get("memory_state", {})) # Unused assignment
+        # current_memory_state["user_clarification"] = clarification_answer # This was not updating session_state.memory_state
+        # The user_clarification is correctly added to invoke_payload later.
 
         st.session_state.disabled = True # Disable main input during processing
         st.session_state.awaiting_clarification_input = False
@@ -191,10 +191,7 @@ if st.session_state.disabled: # This will be true after user submits new input O
     # --- 6. LangGraphバックエンド呼び出し ---
     # Use the session-specific thread_id
     config = {'configurable': {'thread_id': st.session_state["session_thread_id"]}}
-    # Retrieve the latest user_input from chat_history as user_input variable might be from previous run post rerun
-    current_user_input = st.session_state["chat_history"][-1]["content"]
-
-    config = {'configurable': {'thread_id': st.session_state["session_thread_id"]}}
+    # current_user_input = st.session_state["chat_history"][-1]["content"] # Unused variable
 
     user_action_type = st.session_state.get("user_input_type")
     current_memory = dict(st.session_state.get("memory_state", {}))
