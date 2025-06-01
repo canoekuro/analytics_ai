@@ -30,7 +30,7 @@ jobs:
 
     - name: Run tests
       env:
-        GOOGLE_API_KEY: "DUMMY_KEY_FOR_CI" # Using a direct dummy key for simplicity
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         LLM_MODEL_NAME: "gemini-1.5-flash-latest"
       run: |
         python -m unittest discover -s ./files -p "test_*.py"
