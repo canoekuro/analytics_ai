@@ -440,7 +440,10 @@ def interpret_node(state: MyState) -> MyState:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ])
-    return {**state, "interpretation": response.content.strip(), "condition": "解釈完了"}
+    interpretation_text = ""
+    if response.content is not None:
+        interpretation_text = response.content.strip()
+    return {**state, "interpretation": interpretation_text, "condition": "解釈完了"}
 
 
 def chart_node(state: MyState) -> MyState:
