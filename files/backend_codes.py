@@ -839,10 +839,10 @@ def interpret_next(state: MyState):
     return END
 
 # 分析計画（analysis_plan）」の現在ステップに応じて、次にどのノード（処理）に進むかを決定
-def execute_plan_route_step(state: MyState) -> str:
+def execute_plan_dispatch_step(state: MyState) -> str:
     # Clarify（追加質問）へのユーザー回答があれば、分析プランを再生成する
     if state.get("user_clarification"):
-        logging.info("execute_plan_route_step: ユーザーの追加情報が入力されたため、分析プランを再作成します。")
+        logging.info("execute_plan_dispatch_step: ユーザーの追加情報が入力されたため、分析プランを再作成します。")
         return "create_analysis_plan"
     
     analysis_plan = state.get("analysis_plan")
@@ -850,7 +850,7 @@ def execute_plan_route_step(state: MyState) -> str:
 
     # プランが存在しない・インデックスが不正・プラン完了時は初期化して提案ノードに遷移
     if not analysis_plan or current_plan_step_index is None or not (0 <= current_plan_step_index < len(analysis_plan)):
-        logging.info("execute_plan_route_step: プランが完了、または不正な状態です。")
+        logging.info("execute_plan_dispatch_step: プランが完了、または不正な状態です。")
         state["analysis_plan"] = None
         state["current_plan_step_index"] = None
         state["awaiting_step_confirmation"] = False
@@ -858,7 +858,7 @@ def execute_plan_route_step(state: MyState) -> str:
         
     current_step = analysis_plan[current_plan_step_index]
     action = current_step.get("action")
-    logging.info(f"execute_plan_route_step: Dispatching to action '{action}' for step {current_plan_step_index}.")
+    logging.info(f"execute_plan_dispatch_step: Dispatching to action '{action}' for step {current_plan_step_index}.")
     details = current_step.get("details", "")
     state["input"] = details
     
@@ -910,7 +910,7 @@ def build_workflow():
 
     workflow.add_conditional_edges(
         "dispatch_plan_step",
-        execute_plan_route_step,
+        execute_plan_dispatch_step,
         {
             "create_analysis_plan": "create_analysis_plan",
             "check_history": "check_history",
