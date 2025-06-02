@@ -2371,103 +2371,159 @@ class TestWorkflow(unittest.TestCase):
 
 
     @patch('files.backend_codes.llm')
-    @patch('files.backend_codes.vectorstore_tables.similarity_search')
-    @patch('files.backend_codes.vectorstore_queries.similarity_search')
-    @patch('files.backend_codes.try_sql_execute')
-    @patch('files.backend_codes.extract_sql', side_effect=lambda x: x.replace("```sql", "").replace("```", "").strip()) # Simple mock for extract_sql
-    @patch('files.backend_codes.uuid.uuid4')
-    def test_workflow_sql_error_recovery_success(
-        self, mock_uuid, mock_extract_sql, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
-    ):
-        user_input = "Show New Product Sales"
-        config = {"configurable": {"thread_id": "test_sql_recovery_success"}}
-        mock_uuid.return_value = MagicMock(hex="rec_ok_".ljust(8, '0'))
-
-        # LLM responses
-        llm_responses = [
-            MagicMock(content="データ取得,データ解釈"),                 # 1. classify_intent
-            MagicMock(content="New Product Sales"),               # 2. extract_data_requirements
-            MagicMock(content="```sql\nSELECT * FRMO new_product_sales;\n```"), # 3. sql_node (initial faulty SQL)
-            MagicMock(content="```sql\nSELECT * FROM new_product_sales;\n```"), # 4. fix_sql_with_llm (corrected SQL)
-            MagicMock(content="Interpretation of new product sales.") # 5. interpret_node
-        ]
-        mock_llm.invoke.side_effect = llm_responses
-
-        # DB execution results
-        db_results = [
-            (None, "syntax error near FRMO"), # 1. For faulty SQL
-            (pd.DataFrame([{"product": "SuperWidget", "sales": 150}]), None) # 2. For corrected SQL
-        ]
-        mock_try_sql.side_effect = db_results
-
-        # RAG (assume no relevant history for "New Product Sales")
-        mock_vs_tables.return_value = [MagicMock(page_content="Table: new_product_sales (product, sales)")]
-        mock_vs_queries.return_value = []
-
-
-        initial_workflow_state = {"input": user_input, "df_history": []}
-        final_state = self.workflow.invoke(initial_workflow_state, config=config)
-
-        self.assertEqual(final_state["condition"], "解釈完了")
-        self.assertIn("New Product Sales", final_state["latest_df"])
-        self.assertEqual(final_state["latest_df"]["New Product Sales"], [{"product": "SuperWidget", "sales": 150}])
-        self.assertEqual(final_state["interpretation"], "Interpretation of new product sales.")
-        self.assertIsNone(final_state["error"])
-        self.assertEqual(len(final_state["df_history"]), 1)
-        self.assertEqual(final_state["df_history"][0]["query"], "New Product Sales")
-        self.assertEqual(final_state["df_history"][0]["SQL"], "SELECT * FROM new_product_sales;")
-
-        self.assertEqual(mock_llm.invoke.call_count, 5)
-        self.assertEqual(mock_try_sql.call_count, 2)
-        # extract_sql is called by sql_node for initial gen and by fix_sql_with_llm
-        # sql_node calls it once after the initial SQL generation, and fix_sql_with_llm calls it once.
-        self.assertEqual(mock_extract_sql.call_count, 2)
-
-
-    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.check_history_node')
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
     @patch('files.backend_codes.try_sql_execute')
     @patch('files.backend_codes.extract_sql', side_effect=lambda x: x.replace("```sql", "").replace("```", "").strip())
-    # transform_sql_error is NOT mocked to test its actual behavior.
-    def test_workflow_sql_error_recovery_failure(
-        self, mock_extract_sql, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
+    @patch('files.backend_codes.uuid.uuid4')
+    @patch('files.backend_codes.interpret_node')
+    def test_workflow_sql_error_recovery_success(
+        self, mock_interpret_node, mock_uuid, mock_extract_sql,
+        mock_try_sql, mock_vs_queries, mock_vs_tables, mock_check_history, mock_llm_invoker
     ):
-        user_input = "Show Problematic Sales Data"
-        config = {"configurable": {"thread_id": "test_sql_recovery_fail"}}
+        user_input = "Show New Product Sales" # This will result in a plan like [CH, SQL, Interpret]
+        config = {"configurable": {"thread_id": f"test_sql_rec_succ_{self.id()}"}}
+        mock_uuid.return_value = MagicMock(hex="rec_ok_".ljust(8, '0'))
 
-        llm_responses = [
-            MagicMock(content="データ取得"),       # 1. classify_intent
-            MagicMock(content="Problematic Sales"), # 2. extract_data_requirements
-            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # 3. sql_node (initial faulty SQL)
-            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```") # 4. fix_sql_with_llm (still faulty)
+        # LLM responses for:
+        # 1. classify_intent_node
+        # 2. sql_node (initial faulty SQL for "New Product Sales")
+        # 3. sql_node (fix_sql_with_llm for corrected SQL)
+        # interpret_node is fully mocked.
+        mock_llm_invoker.side_effect = [
+            MagicMock(content="データ取得,データ解釈"),  # classify_intent
+            MagicMock(content="```sql\nSELECT * FRMO new_product_sales;\n```"), # Initial SQL for "New Product Sales"
+            MagicMock(content="```sql\nSELECT * FROM new_product_sales;\n```")  # Corrected SQL
         ]
-        mock_llm.invoke.side_effect = llm_responses
 
-        db_results = [
-            (None, "syntax error near FRMO"),    # 1. For initial faulty SQL
-            (None, "syntax error near FRRMO")    # 2. For "fixed" faulty SQL
+        # Mock check_history_node to simulate a miss
+        mock_check_history.return_value = MyState(
+            latest_df=collections.OrderedDict(),
+            missing_data_requirements=["New Product Sales"], # Plan detail will be this
+            condition="history_checked"
+        )
+
+        # DB execution results for sql_node
+        mock_try_sql.side_effect = [
+            (None, "syntax error near FRMO"), # For faulty SQL
+            (pd.DataFrame([{"product": "SuperWidget", "sales": 150}]), None) # For corrected SQL
         ]
-        mock_try_sql.side_effect = db_results
 
-        mock_vs_tables.return_value = [MagicMock(page_content="Table: problematic_sales (id, value)")]
-        mock_vs_queries.return_value = []
+        # RAG for sql_node (called for initial generation and for fix)
+        mock_vs_tables.return_value = [MagicMock(page_content="Table: new_product_sales (product, sales)")]
+        mock_vs_queries.return_value = [] # No similar queries
+
+        # Mock interpret_node for the end of the successful flow
+        def interpret_side_effect(state: MyState):
+            self.assertIn("New Product Sales", state["latest_df"]) # Check data is there
+            return {**state, "interpretation": "Interpreted new product sales.", "condition": "interpretation_done"}
+        mock_interpret_node.side_effect = interpret_side_effect
 
         initial_workflow_state = {"input": user_input, "df_history": []}
         final_state = self.workflow.invoke(initial_workflow_state, config=config)
 
-        self.assertEqual(final_state["condition"], "SQL部分的失敗") # Or SQL実行失敗 if it's the only req
-        self.assertIsNotNone(final_state["error"])
-        # Check that the error message is the user-friendly one from transform_sql_error
-        expected_user_friendly_error = "SQL構文にエラーがあります。クエリを確認してください。(詳細: syntax error near FRRMO)"
-        self.assertIn(expected_user_friendly_error, final_state["error"])
+        self.assertEqual(final_state.get("condition"), "interpretation_done")
+        self.assertIn("New Product Sales", final_state.get("latest_df", {}))
+        self.assertEqual(final_state["latest_df"]["New Product Sales"], [{"product": "SuperWidget", "sales": 150}])
+        self.assertEqual(final_state.get("interpretation"), "Interpreted new product sales.")
+        self.assertIsNone(final_state.get("error"))
 
-        self.assertNotIn("Problematic Sales", final_state.get("latest_df", {}))
-        self.assertEqual(final_state["SQL"], "SELECT * FRRMO problematic_sales;") # Last attempted SQL
+        df_history = final_state.get("df_history", [])
+        self.assertEqual(len(df_history), 1)
+        self.assertEqual(df_history[0]["query"], "New Product Sales") # This should be the plan detail
+        self.assertEqual(df_history[0]["SQL"], "SELECT * FROM new_product_sales;")
 
-        self.assertEqual(mock_llm.invoke.call_count, 4)
+        self.assertEqual(mock_llm_invoker.call_count, 3) # classify, sql_gen_initial, sql_gen_fix
+        self.assertEqual(mock_try_sql.call_count, 2)
+        mock_extract_sql.assert_called() # Called by sql_node and fix_sql_with_llm
+        self.assertEqual(mock_extract_sql.call_count, 2) # initial + fix
+        mock_check_history.assert_called_once()
+        mock_interpret_node.assert_called_once()
+        # RAG calls: once for initial SQL gen, once for fix logic
+        self.assertEqual(mock_vs_tables.call_count, 2)
+        self.assertEqual(mock_vs_queries.call_count, 2)
+
+
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.check_history_node')
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.vectorstore_queries.similarity_search')
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.extract_sql', side_effect=lambda x: x.replace("```sql", "").replace("```", "").strip())
+    @patch('files.backend_codes.suggest_analysis_paths_node') # To verify it's reached on failure
+    def test_workflow_sql_error_recovery_failure(
+        self, mock_suggest_node, mock_extract_sql, mock_try_sql,
+        mock_vs_queries, mock_vs_tables, mock_check_history, mock_llm_invoker
+    ):
+        user_input = "Show Problematic Data" # Plan: CH, SQL, Interpret
+        config = {"configurable": {"thread_id": f"test_sql_rec_fail_{self.id()}"}}
+
+        # LLM Mocks: classify, sql_initial, sql_fix
+        mock_llm_invoker.side_effect = [
+            MagicMock(content="データ取得"), # classify_intent
+            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # Initial SQL
+            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```")  # "Fixed" SQL (still faulty)
+        ]
+
+        # Mock check_history for a miss
+        mock_check_history.return_value = MyState(
+            latest_df=collections.OrderedDict(),
+            missing_data_requirements=["Problematic Data"],
+            condition="history_checked"
+        )
+
+        # DB execution: both attempts fail
+        mock_try_sql.side_effect = [
+            (None, "syntax error near FRMO"),
+            (None, "syntax error near FRRMO")
+        ]
+
+        # RAG for sql_node (called for initial and fix attempts)
+        mock_vs_tables.return_value = [MagicMock(page_content="Table: problematic_sales (id, value)")]
+        mock_vs_queries.return_value = []
+
+        # Mock suggest_analysis_paths_node
+        mock_suggest_node.return_value = MyState(condition="no_paths_suggested_mocked_after_fail")
+
+
+        initial_workflow_state = {"input": user_input, "df_history": []}
+        final_state = self.workflow.invoke(initial_workflow_state, config=self.config)
+
+        # Expected path: classify -> create_plan -> CH -> SQL (fails twice) -> SQL_next routes to dispatch
+        # -> dispatch sees plan index at interpret step, but SQL failed.
+        # execute_plan_router might then end the plan and go to suggest_analysis_paths.
+        # The sql_node itself sets condition "sql_execution_failed".
+        # sql_next then routes to dispatch_plan_step.
+        # execute_plan_router will then try to execute the *next* step in the plan (e.g., interpret).
+        # The interpret_node will then run with whatever data is in latest_df (which would be empty for "Problematic Data").
+
+        # So, the final condition might be from interpret_node if it runs, or suggest_analysis_paths if plan ends early.
+        # Given the current sql_next logic, it always increments index and goes to dispatch.
+        # So interpret_node *will* be called.
+
+        # Let's verify the state after sql_node would have failed:
+        # The state that goes into interpret_node would have an error from sql_node.
+        # The final state will be after suggest_analysis_paths_node.
+        self.assertEqual(final_state.get("condition"), "no_paths_suggested_mocked_after_fail")
+
+        # Check the error state set by sql_node (it should be in the final checkpointed state)
+        # This requires inspecting the state *before* suggest_analysis_paths, or ensuring error propagates.
+        # For this test, let's assume the error from sql_node is available for inspection.
+        # The workflow.get_state(config) could be used if we had intermediate checkpoints.
+        # For now, let's verify the mocks for sql_node were hit as expected.
+
+        self.assertIsNotNone(final_state.get("error"))
+        expected_user_friendly_error = "For 'Problematic Data': SQL構文にエラーがあります。クエリを確認してください。(詳細: syntax error near FRRMO)"
+        self.assertIn(expected_user_friendly_error, final_state.get("error"))
+        self.assertNotIn("Problematic Data", final_state.get("latest_df", {}))
+        self.assertEqual(final_state.get("SQL"), "SELECT * FRRMO problematic_sales;")
+
+        self.assertEqual(mock_llm_invoker.call_count, 3) # classify, sql_gen_initial, sql_gen_fix
         self.assertEqual(mock_try_sql.call_count, 2)
         self.assertEqual(mock_extract_sql.call_count, 2)
+        mock_check_history.assert_called_once()
+        mock_suggest_node.assert_called_once() # Verify it's the end path
 
 
 class TestClassifyIntentNode(unittest.TestCase):

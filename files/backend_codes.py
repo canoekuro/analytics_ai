@@ -17,6 +17,7 @@ from datetime import datetime
 import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+import json # Moved import json to the top
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO)
@@ -243,7 +244,7 @@ def cancel_analysis_plan_node(state: MyState) -> MyState:
         "user_action": None
     }
 
-import json
+# import json # Removed from here
 
 def extract_sql(sql_text):
     match = re.search(r"```sql\s*(.*?)```", sql_text, re.DOTALL | re.IGNORECASE)
@@ -326,27 +327,65 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
     return fixed_sql
 
 def check_history_node(state: MyState) -> MyState:
+    analysis_plan = state.get("analysis_plan")
     current_plan_step_index = state.get("current_plan_step_index")
-    analysis_plan = state.get("analysis_plan", [])
+
+    if not analysis_plan or not isinstance(analysis_plan, list) or not analysis_plan: # Check if empty list
+        # If plan is None, not a list, or empty, it's invalid for this node's core logic
+        return {
+            **state,
+            "latest_df": collections.OrderedDict(),
+            "missing_data_requirements": [],
+            "condition": "history_checked_invalid_plan_or_index",
+            "error": "Analysis plan is missing or empty in check_history_node."
+        }
+
+    if current_plan_step_index is None or \
+       not isinstance(current_plan_step_index, int) or \
+       not (0 <= current_plan_step_index < len(analysis_plan)):
+        # If index is None, not an int, or out of bounds
+        safe_details_for_error_msg = []
+        if analysis_plan and \
+           isinstance(analysis_plan, list) and \
+           current_plan_step_index is not None and \
+           isinstance(current_plan_step_index, int) and \
+           0 <= current_plan_step_index < len(analysis_plan) and \
+           isinstance(analysis_plan[current_plan_step_index], dict):
+            safe_details_for_error_msg = analysis_plan[current_plan_step_index].get("details", [])
+
+        return {
+            **state,
+            "latest_df": collections.OrderedDict(),
+            "missing_data_requirements": safe_details_for_error_msg,
+            "condition": "history_checked_invalid_plan_or_index",
+            "error": f"Invalid current_plan_step_index ({current_plan_step_index}) for analysis_plan length ({len(analysis_plan) if analysis_plan else 0}) in check_history_node."
+        }
+
+    # df_history is retrieved after initial plan checks, as it's not needed for those checks.
     df_history = state.get("df_history", [])
     data_requirements_for_step = []
-
-    current_step_details = state.get("input")
+    current_step_details = state.get("input") # This is set by execute_plan_router to current_step["details"]
 
     if isinstance(current_step_details, str):
         data_requirements_for_step = [current_step_details]
     elif isinstance(current_step_details, list):
         data_requirements_for_step = [str(item) for item in current_step_details]
 
-    if not analysis_plan or current_plan_step_index is None or not (0 <= current_plan_step_index < len(analysis_plan)):
-        logging.warning("check_history_node: Invalid plan index or plan, or details not correctly in state.input.")
-        if not data_requirements_for_step and current_plan_step_index is not None and analysis_plan:
-             current_step = analysis_plan[current_plan_step_index]
-             raw_details = current_step.get("details")
-             if isinstance(raw_details, str): data_requirements_for_step = [raw_details]
-             elif isinstance(raw_details, list): data_requirements_for_step = [str(item) for item in raw_details]
+    # The following block for trying to get details from plan if not in input might be redundant
+    # if execute_plan_router *always* sets state.input correctly from plan[index].details.
+    # However, keeping it for robustness or if node is called outside typical router flow.
+    if not data_requirements_for_step:
+        # This check is now safe due to the guards at the beginning of the function
+        current_step = analysis_plan[current_plan_step_index]
+        raw_details = current_step.get("details")
+        logging.warning(f"check_history_node: state.input was empty or not list/str. Falling back to plan details: {raw_details}")
+        if isinstance(raw_details, str):
+            data_requirements_for_step = [raw_details]
+        elif isinstance(raw_details, list):
+            data_requirements_for_step = [str(item) for item in raw_details]
 
     if not data_requirements_for_step:
+        # This means state.input was not valid, AND plan[index].details was also not valid.
         return {
             **state,
             "latest_df": collections.OrderedDict(),
@@ -539,33 +578,44 @@ def interpret_node(state: MyState) -> MyState:
     # Context for interpretation comes from state.input (set by execute_plan_router from plan step details)
     plan_details_context = state.get("input", "全般的な傾向") # Default if no specific detail
 
-    if not latest_df_data:
-        logging.info("interpret_node: No data in latest_df to interpret.")
+    if latest_df_data is None:
+        logging.info("interpret_node: latest_df is None. No data to interpret.")
         return {**state, "interpretation": "解釈するデータがありません。", "condition": "interpretation_failed_no_data"}
 
-    full_data_string = ""
-    if isinstance(latest_df_data, collections.OrderedDict):
-        if not latest_df_data: # Check if OrderedDict is empty
-             logging.info("interpret_node: latest_df is an empty OrderedDict.")
-             return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"}
-        for req_string, df_data_list in latest_df_data.items():
-            if df_data_list:
-                try:
-                    df = pd.DataFrame(df_data_list)
-                    if not df.empty:
-                        full_data_string += f"■「{req_string}」に関するデータ:\n{df.to_string(index=False)}\n\n"
-                    else:
-                        full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータは空でした)\n\n"
-                except Exception as e:
-                    logging.error(f"interpret_node: Error converting data for '{req_string}' to DataFrame: {e}")
-                    full_data_string += f"■「{req_string}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n"
-            else:
-                full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータはありませんでした)\n\n"
-    else:
-        logging.error("interpret_node: latest_df is not an OrderedDict.")
+    if not isinstance(latest_df_data, collections.OrderedDict):
+        logging.error(f"interpret_node: latest_df is not an OrderedDict (type: {type(latest_df_data)}).")
         return {**state, "interpretation": "データの形式が不正です (OrderedDictではありません)。", "condition": "interpretation_failed_bad_format"}
 
-    if not full_data_string.strip() or all("(この要件に対するデータはありませんでした)" in part or "(データ形式エラーのため表示できません)" in part or "(この要件に対するデータは空でした)" in part for part in full_data_string.split("■")[1:] if part):
+    if not latest_df_data: # Check if the OrderedDict is empty
+        logging.info("interpret_node: latest_df is an empty OrderedDict.")
+        return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"}
+
+    full_data_string = ""
+    for req_string, df_data_list in latest_df_data.items():
+        if df_data_list:
+            try:
+                df = pd.DataFrame(df_data_list)
+                if not df.empty:
+                    full_data_string += f"■「{req_string}」に関するデータ:\n{df.to_string(index=False)}\n\n"
+                else:
+                    full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータは空でした)\n\n"
+            except Exception as e:
+                logging.error(f"interpret_node: Error converting data for '{req_string}' to DataFrame: {e}")
+                full_data_string += f"■「{req_string}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n"
+        else:
+            full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータはありませんでした)\n\n"
+
+    # Check if, after attempting to process all entries, the resulting string for LLM is still effectively empty.
+    # This covers cases where all lists in latest_df were empty or resulted in empty string representations.
+    processed_parts = [part for part in full_data_string.split("■")[1:] if part] # Get non-empty parts after splitting by "■"
+    all_parts_indicate_no_data = all(
+        "(この要件に対するデータはありませんでした)" in part or \
+        "(データ形式エラーのため表示できません)" in part or \
+        "(この要件に対するデータは空でした)" in part \
+        for part in processed_parts
+    )
+
+    if not full_data_string.strip() or (processed_parts and all_parts_indicate_no_data):
         logging.info("interpret_node: No valid data content to interpret after processing latest_df.")
         return {**state, "interpretation": "解釈対象の有効なデータがありませんでした。", "condition": "interpretation_failed_empty_data"}
 
