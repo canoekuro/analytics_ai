@@ -3,7 +3,7 @@ import base64
 import pandas as pd
 # from PIL import Image # 未使用
 # from io import BytesIO # 未使用
-import time
+# import time # Streamlitのst.statusを使用するため、手動のtime.sleepは不要になります
 from files.backend_codes import build_workflow
 import uuid # このインポートを追加
 import collections # このインポートを追加
@@ -182,11 +182,12 @@ if user_input and not st.session_state.awaiting_clarification_input and not st.s
 # 処理が必要な場合、st.session_state.disabledがTrueであることに依存します。
 if st.session_state.disabled: # これは、ユーザーが新しい入力または明確化を送信した後（再実行のため）にtrueになります
     # --- 5. AIバブル(typing演出) ---
-    ai_msg_placeholder = st.empty()
-    for i in range(8):  # 約4秒間タイピング演出
-        dots = "." * ((i % 4) + 1)
-        ai_msg_placeholder.chat_message("assistant").write(f"AIが思考中です{dots} _タイピング中_ :speech_balloon:")
-        time.sleep(0.5)
+    ai_msg_placeholder = st.empty() # 以前のメッセージをクリアするために保持、またはst.statusが完全に置き換える場合は削除検討
+    # for i in range(8):  # 約4秒間タイピング演出
+    #     dots = "." * ((i % 4) + 1)
+    #     ai_msg_placeholder.chat_message("assistant").write(f"AIが思考中です{dots} _タイピング中_ :speech_balloon:")
+    #     time.sleep(0.5)
+    ai_msg_placeholder.empty() # st.statusを使う前にプレースホルダーをクリア
 
     # --- 6. LangGraphバックエンド呼び出し ---
     # セッション固有のthread_idを使用
@@ -265,32 +266,55 @@ if st.session_state.disabled: # これは、ユーザーが新しい入力また
         st.rerun()
         return
 
-    res = compiled_workflow.invoke(invoke_payload, config=config)
+    # res = compiled_workflow.invoke(invoke_payload, config=config) # invokeからstreamに変更
+    stream = compiled_workflow.stream(invoke_payload, config=config)
+    
+    final_res = None
+    with st.status("AIが処理を実行中...", expanded=True) as status_ui:
+        for event in stream:
+            current_state_snapshot = None
+            if event:
+                event_key = list(event.keys())[0] 
+                if event_key and isinstance(event[event_key], dict):
+                     current_state_snapshot = event[event_key]
+
+            if current_state_snapshot and "current_status_message" in current_state_snapshot and current_state_snapshot["current_status_message"]:
+                status_ui.update(label=current_state_snapshot["current_status_message"])
+            
+            if current_state_snapshot: 
+                final_res = current_state_snapshot
+    
+    res = final_res
+    if res is None: 
+        res = {} 
+        st.warning("AIからの応答が期待通りに受信できませんでした。")
 
     # --- 7. AIバブル差し替え & Clarification Check ---
+    # ai_msg_placeholder は st.status で置き換えられたため、直接操作しない。
+    # 結果の表示は st.status ブロックの外で行う。
     if "clarification_question" in res and res["clarification_question"]:
             st.session_state.awaiting_clarification_input = True
             st.session_state.clarification_question_text = res["clarification_question"]
             st.session_state["chat_history"].append({"role": "assistant", "content": res["clarification_question"], "type": "clarification_request"})
             st.session_state["memory_state"] = res
-            ai_msg_placeholder.empty()
+            # ai_msg_placeholder.empty() # st.statusがUIを管理
             st.session_state.disabled = False
             st.rerun()
-        else:
-            # 通常の応答処理
-            with ai_msg_placeholder.chat_message("assistant"):
-                if "error" in res and res["error"]:
-                    st.error(res['error'])
+    else:
+        # 通常の応答処理をチャットメッセージとして表示
+        with st.chat_message("assistant"): # このブロックは `st.status` の後、最終結果を表示するために必要
+            if "error" in res and res["error"]:
+                st.error(res['error'])
 
-                if "interpretation" in res and res["interpretation"]:
-                    st.write(res["interpretation"])
+            if "interpretation" in res and res["interpretation"]:
+                st.write(res["interpretation"])
 
-                # --- ライブ応答からのlatest_dfの表示 ---
-        if "latest_df" in res and res["latest_df"] is not None:
-            latest_df_data = res["latest_df"]
-            if isinstance(latest_df_data, dict): # 新しいOrderedDict形式
-                if not latest_df_data:
-                     st.write("取得されたデータはありません。")
+            # --- ライブ応答からのlatest_dfの表示 ---
+            if "latest_df" in res and res["latest_df"] is not None:
+                latest_df_data = res["latest_df"]
+                if isinstance(latest_df_data, dict): # 新しいOrderedDict形式
+                    if not latest_df_data:
+                        st.write("取得されたデータはありません。")
                 for req_string, df_data_list in latest_df_data.items():
                     st.write(f"データ: 「{req_string}」")
                     if df_data_list:
@@ -360,13 +384,14 @@ if st.session_state.disabled: # これは、ユーザーが新しい入力また
                     }
                     st.session_state.memory_state = new_input_context
                     st.session_state.disabled = True # バックエンド処理をトリガー
-                    # ここでai_msg_placeholder.empty()を呼び出す必要はありません。このwithブロックの外側にあるためです。
+                    # st.status がUIを管理するため、ai_msg_placeholder の直接操作は不要
                     st.rerun()
                     break # ボタンがクリックされて再実行がトリガーされたらループを終了
 
     # --- 8. 履歴に保存 & 入力フィールドを再度有効化 ---
     # ボタンクリックによる再実行がまだ行われていない場合にのみ、これを実行することを確認
-    if not (st.session_state.disabled and any(entry.get("type") == "analysis_selection" for entry in st.session_state.chat_history[-1:])):
+    # また、resがNoneでないことも確認 (ストリームが空だった場合など)
+    if res and not (st.session_state.disabled and any(entry.get("type") == "analysis_selection" for entry in st.session_state.chat_history[-1:])):
         st.session_state["chat_history"].append({"role": "assistant", **res})
         st.session_state["memory_state"] = res # 完全な状態を保存
 
