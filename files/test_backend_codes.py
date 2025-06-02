@@ -20,6 +20,7 @@ from files.backend_codes import (
     sql_node,
     build_workflow,
     try_sql_execute, # Import for direct testing
+    transform_sql_error, # Added for new tests
     # For mocking, we might need to patch where they are *used* if not careful with direct imports
     # However, for llm, vectorstores, these are global in backend_codes, so patching them there is fine.
 )
@@ -305,6 +306,78 @@ class TestSqlNode(unittest.TestCase):
         # it should become empty.
         self.assertEqual(result_state.get("missing_data_requirements"), [])
 
+    def setUp(self):
+        self.initial_state = MyState(
+            input="test query",
+            missing_data_requirements=["some requirement"],
+            latest_df=collections.OrderedDict(),
+            df_history=[],
+            complex_analysis_original_query="test query context"
+        )
+
+    @patch('files.backend_codes.vectorstore_queries')
+    @patch('files.backend_codes.vectorstore_tables')
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.fix_sql_with_llm')
+    @patch('files.backend_codes.try_sql_execute')
+    def test_sql_node_handles_persistent_execution_error(
+        self, mock_try_sql_execute, mock_fix_sql_with_llm, mock_llm,
+        mock_vectorstore_tables, mock_vectorstore_queries
+    ):
+        # Mock RAG components
+        mock_vectorstore_tables.similarity_search.return_value = [MagicMock(page_content="table info")]
+        mock_vectorstore_queries.similarity_search.return_value = [MagicMock(page_content="query info")]
+
+        # Mock LLM for initial SQL generation
+        mock_llm.invoke.return_value = MagicMock(content="SELECT * FROM test_table")
+
+        # Mock try_sql_execute to simulate persistent failure
+        mock_try_sql_execute.side_effect = [
+            (None, "Initial SQL error"), # First attempt fails
+            (None, "Fixed SQL error")    # Second attempt (after fix) also fails
+        ]
+
+        # Mock fix_sql_with_llm to return a dummy fixed SQL
+        mock_fix_sql_with_llm.return_value = "SELECT * FROM fixed_test_table"
+
+        # Expected user-friendly error
+        expected_user_error = transform_sql_error("Fixed SQL error")
+
+        result_state = sql_node(self.initial_state)
+
+        self.assertEqual(result_state["condition"], "sql_execution_failed")
+        self.assertIn("SQLの実行に失敗しました", result_state["error"])
+        self.assertIn("some requirement", result_state["error"])
+        self.assertIn(expected_user_error, result_state["error"])
+        self.assertEqual(result_state["missing_data_requirements"], ["some requirement"])
+        self.assertEqual(mock_try_sql_execute.call_count, 2) # Both initial and fixed SQL were tried
+
+    @patch('files.backend_codes.vectorstore_queries')
+    @patch('files.backend_codes.vectorstore_tables')
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.try_sql_execute')
+    def test_sql_node_handles_empty_result(
+        self, mock_try_sql_execute, mock_llm,
+        mock_vectorstore_tables, mock_vectorstore_queries
+    ):
+        # Mock RAG components
+        mock_vectorstore_tables.similarity_search.return_value = [MagicMock(page_content="table info")]
+        mock_vectorstore_queries.similarity_search.return_value = [MagicMock(page_content="query info")]
+
+        # Mock LLM for SQL generation
+        mock_llm.invoke.return_value = MagicMock(content="SELECT * FROM test_table_empty")
+
+        # Mock try_sql_execute to return an empty DataFrame
+        empty_df = pd.DataFrame()
+        mock_try_sql_execute.return_value = (empty_df, None) # Successful execution, but empty df
+
+        result_state = sql_node(self.initial_state)
+
+        self.assertEqual(result_state["condition"], "sql_execution_empty_result")
+        self.assertIn("SQLの実行結果が空でした", result_state["error"])
+        self.assertIn("some requirement", result_state["error"])
+        self.assertEqual(result_state["missing_data_requirements"], ["some requirement"])
+        mock_try_sql_execute.assert_called_once()
 
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
