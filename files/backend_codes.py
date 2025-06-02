@@ -232,14 +232,14 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         ```
         
         例3: データ加工を含むリクエスト
-        ユーザーのクエリ: "ユーザーのクエリ: "顧客データセットを読み込み、'age'列を基に新しい列'age_group'を追加し（例: 18歳未満: Teen, 18-65歳: Adult, 65歳超: Senior）、処理後のデータの最初の5行を見せてください。"
+        ユーザーのクエリ: "顧客データセットを読み込み、'age'列を基に新しい列'age_group'を追加し（例: 18歳未満: Teen, 18-65歳: Adult, 65歳超: Senior）、処理後のデータの最初の5行を見せてください。"
         生成されるプラン:
         ```json
         [
           {"action": "check_history", "details": ["顧客データセット"]},
           {"action": "sql", "details": "顧客データセット"},
           {"action": "data_processing", "details": "DF_KEY['顧客データセット']の'age'列を基に、新しい列'age_group'を追加する（例：18歳未満: Teen, 18-65歳: Adult, 65歳超: Senior）"},
-          {"action": "interpret", "details": "D新しい'age_group'列を含む、処理後の顧客データセット（DF_KEY['顧客データセット']）の最初の5行を説明する"}
+          {"action": "interpret", "details": "新しい'age_group'列を含む、処理後の顧客データセット（DF_KEY['顧客データセット']）の最初の5行を説明する"}
         ]
         ```
         
