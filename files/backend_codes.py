@@ -10,6 +10,7 @@ from langchain.agents import Tool, initialize_agent
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
 import os
 import base64
+import io
 import re
 from typing import TypedDict, List, Optional, Any
 import ast # literal_evalのため
@@ -798,44 +799,66 @@ def data_processing_node(state: MyState) -> MyState:
         }
 
     df_to_process = None
-    selected_key = None
+    selected_key = None # This will store the key of the df that is chosen for processing
     processing_context_message = ""
 
-    # Try to find a DataFrame based on instruction key reference
-    if isinstance(processing_instructions, str):
-        for key in latest_df_data.keys():
-            if latest_df_data.get(key) and isinstance(latest_df_data[key], list) and len(latest_df_data[key]) > 0 and key.lower() in processing_instructions.lower():
-                selected_key = key
-                break
+    # New logic: Check for DF_KEY['key_name'] pattern in instructions
+    df_key_match = re.search(r"DF_KEY\['(.*?)'\]", processing_instructions)
 
-    if selected_key and latest_df_data.get(selected_key):
-        try:
-            df_candidate = pd.DataFrame(latest_df_data[selected_key])
-            if not df_candidate.empty:
-                df_to_process = df_candidate
-                processing_context_message = f"以下の「{selected_key}」に関するデータと、ユーザーからの「{processing_instructions}」という指示に基づいて"
-            else:
-                logging.warning(f"data_processing_node: 選択されたキー '{selected_key}' のDataFrameが空です。フォールバックを試みます。")
-                selected_key = None # Invalidate to trigger fallback
-        except Exception as e:
-            logging.error(f"data_processing_node: 選択されたキー '{selected_key}' のDataFrame作成中にエラー: {e}")
-            selected_key = None # Invalidate to trigger fallback
+    if df_key_match:
+        explicit_key = df_key_match.group(1)
+        if explicit_key in latest_df_data and latest_df_data[explicit_key] and isinstance(latest_df_data[explicit_key], list):
+            try:
+                df_candidate = pd.DataFrame(latest_df_data[explicit_key])
+                if not df_candidate.empty:
+                    df_to_process = df_candidate
+                    selected_key = explicit_key
+                    processing_context_message = f"DF_KEY['{explicit_key}']で指定されたデータと、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                    logging.info(f"data_processing_node: DF_KEY syntax found. Processing DataFrame with key '{selected_key}'.")
+                else:
+                    logging.warning(f"data_processing_node: DF_KEY['{explicit_key}'] found, but the data is empty. Proceeding to fallback selection.")
+            except Exception as e:
+                logging.error(f"data_processing_node: DF_KEY['{explicit_key}'] found, but failed to create DataFrame: {e}. Proceeding to fallback selection.")
+        else:
+            logging.warning(f"data_processing_node: DF_KEY['{explicit_key}'] not found in latest_df_data or data is invalid/empty. Proceeding to fallback selection.")
 
-    if df_to_process is None: # Fallback: Use the first non-empty DataFrame
-        for key, data_list in latest_df_data.items():
-            if data_list and isinstance(data_list, list) and len(data_list) > 0:
-                try:
-                    df_candidate = pd.DataFrame(data_list)
-                    if not df_candidate.empty:
-                        df_to_process = df_candidate
-                        selected_key = key
-                        processing_context_message = f"以下の「{selected_key}」に関するデータ（指示に明確な対象がなかったため、利用可能な最初のデータセットを選択）と、ユーザーからの「{processing_instructions}」という指示に基づいて"
-                        if len(latest_df_data) > 1 and (not isinstance(processing_instructions, str) or selected_key.lower() not in processing_instructions.lower()):
-                             logging.warning(f"data_processing_node: 複数のDataFrameが存在します。処理指示 ('{processing_instructions}') が特定のキーに言及していないため、最初の空でないDataFrame ('{selected_key}') を使用します。")
-                        break
-                except Exception as e:
-                    logging.error(f"data_processing_node: フォールバック中にlatest_dfキー '{key}' からDataFrameを作成中にエラー: {e}")
-                    continue
+    # Fallback logic: If DF_KEY was not used, or was invalid.
+    if df_to_process is None:
+        # Try to find a DataFrame based on instruction key reference (original fallback)
+        if isinstance(processing_instructions, str):
+            for key_option in latest_df_data.keys(): # iterate through available DFs
+                # Check if key_option is mentioned in instructions (and not part of a DF_KEY pattern already handled)
+                # This check is simplified; more robust would be to ensure it's not within DF_KEY[...]
+                if key_option.lower() in processing_instructions.lower() and (not df_key_match or key_option != df_key_match.group(1)):
+                    if latest_df_data.get(key_option) and isinstance(latest_df_data[key_option], list) and len(latest_df_data[key_option]) > 0:
+                        try:
+                            df_candidate = pd.DataFrame(latest_df_data[key_option])
+                            if not df_candidate.empty:
+                                df_to_process = df_candidate
+                                selected_key = key_option # Set selected_key here
+                                processing_context_message = f"指示内容で言及されたキー「{selected_key}」のデータと、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                                logging.info(f"data_processing_node: Fallback - Found matching key '{selected_key}' in instructions.")
+                                break # Found a suitable DF by instruction mention
+                        except Exception as e:
+                            logging.error(f"data_processing_node: Fallback - Error creating DataFrame for key '{key_option}': {e}")
+                            continue # Try next key
+
+        if df_to_process is None: # If still no DF, use the first non-empty one
+            for key_option, data_list in latest_df_data.items():
+                if data_list and isinstance(data_list, list) and len(data_list) > 0:
+                    try:
+                        df_candidate = pd.DataFrame(data_list)
+                        if not df_candidate.empty:
+                            df_to_process = df_candidate
+                            selected_key = key_option # Set selected_key here
+                            processing_context_message = f"利用可能な最初のデータセット「{selected_key}」と、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                            logging.info(f"data_processing_node: Fallback - No specific key matched or DF_KEY invalid. Using first available non-empty DataFrame with key '{selected_key}'.")
+                            if len(latest_df_data) > 1:
+                                 logging.warning(f"data_processing_node: 複数のDataFrameが存在し、特定のDFが指示されなかったため、最初の空でないDataFrame（'{selected_key}'）を使用します。特定のDFを対象にするには DF_KEY['キー名'] を使用してください。")
+                            break
+                    except Exception as e:
+                        logging.error(f"data_processing_node: Fallback - Error creating first available DataFrame for key '{key_option}': {e}")
+                        continue
 
     if df_to_process is None or df_to_process.empty:
         return {
@@ -855,11 +878,29 @@ def data_processing_node(state: MyState) -> MyState:
         agent_kwargs={"handle_parsing_errors": "True"} # より堅牢なエラー処理
     )
 
+    # df.info()の出力を文字列としてキャプチャ
+    buffer = io.StringIO()
+    df_to_process.info(buf=buffer)
+    df_info_str = buffer.getvalue()
+
+    available_dataframes_info = "\n".join([f"- '{key}': {len(value)}行" for key, value in latest_df_data.items() if isinstance(value, list)])
+
+    prompt_guidance_for_df_selection = ""
+    if len(latest_df_data) > 1:
+        prompt_guidance_for_df_selection = (
+            f"複数のDataFrameが利用可能です。特定のDataFrameを処理対象とする場合、指示内に `DF_KEY['キー名']` という形式で指定してください。\n"
+            f"例: `DF_KEY['sales_data_2023'] 列'A'の値を2倍にする`\n"
+            f"利用可能なDataFrame (キー: 行数):\n{available_dataframes_info}\n"
+            f"DF_KEY構文を使用しない場合、最も適切と思われるDataFrameを自動選択します。\n"
+        )
+
     processing_prompt = f"""
     あなたはPythonプログラミングとデータ処理の専門家です。
+    {prompt_guidance_for_df_selection}
     {processing_context_message}pandas DataFrameに必要な処理を実行してください。
     処理後のDataFrameは、必ず 'df' という名前の変数に再代入してください。
-    dfの列情報: {df_to_process.info()}
+    dfの列情報:
+{df_info_str}
     dfの最初の5行:
     {df_to_process.head().to_string(index=False)}
     処理指示: {processing_instructions}
