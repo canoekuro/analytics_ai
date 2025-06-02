@@ -36,7 +36,7 @@ def get_workflow():
 compiled_workflow = get_workflow()
 
 # --- Clear History Button ---
-if st.button("Clear Chat History"):
+if st.button("チャット履歴をクリア"):
     st.session_state.chat_history = []
     st.session_state.memory_state = {} # Clear local frontend state
     st.session_state.awaiting_clarification_input = False # Reset clarification state
@@ -53,9 +53,9 @@ if st.button("Clear Chat History"):
     try:
         # Directly invoke the backend with the special clear command
         compiled_workflow.invoke({"input": "SYSTEM_CLEAR_HISTORY"}, config=config)
-        st.success(f"Chat history and associated backend state for your session have been cleared.")
+        st.success(f"セッションのチャット履歴と関連するバックエンドの状態がクリアされました。")
     except Exception as e:
-        st.error(f"Error clearing backend state for session {session_specific_thread_id}: {e}")
+        st.error(f"セッション {session_specific_thread_id} のバックエンド状態のクリア中にエラーが発生しました: {e}")
     st.rerun() # Rerun to refresh the UI cleanly after clearing
 
 # --- 3. チャットUI ---
@@ -80,7 +80,7 @@ with history_container:
                         current_step_info = plan[current_idx]
                         action = current_step_info.get('action', 'N/A')
                         details = current_step_info.get('details', 'N/A')
-                        st.info(f"Multi-step Analysis: Step {current_idx + 1} of {total_steps} (Action: {action}, Details: {details})")
+                        st.info(f"複数ステップ分析: ステップ {current_idx + 1} / {total_steps} (アクション: {action}, 詳細: {details})")
 
                 if "error" in entry and entry["error"]: # Simplified check
                     st.error(entry['error']) # Display user-friendly error directly
@@ -127,8 +127,8 @@ if st.session_state.awaiting_clarification_input and st.session_state.clarificat
     st.info(st.session_state.clarification_question_text) # Display the question
 
     with st.form(key="clarification_form"):
-        clarification_answer = st.text_input("Please provide the requested information:")
-        submit_clarification_button = st.form_submit_button(label="Submit Clarification")
+        clarification_answer = st.text_input("要求された情報を入力してください:")
+        submit_clarification_button = st.form_submit_button(label="明確化情報を送信")
 
     if submit_clarification_button and clarification_answer:
         st.session_state["chat_history"].append({"role": "user", "content": clarification_answer, "type": "clarification_answer"})
@@ -156,17 +156,17 @@ user_input = st.chat_input(
 if st.session_state.get("memory_state", {}).get("awaiting_step_confirmation"):
     # Display intermediate results (already handled by chat history loop)
     st.markdown("---") # Separator
-    st.write("The analysis is paused. Choose an action:")
+    st.write("分析は一時停止中です。アクションを選択してください:")
     button_cols = st.columns([1, 1, 2]) # Adjust column ratios as needed
 
-    if button_cols[0].button("Proceed to Next Step", key="proceed_step_button"):
+    if button_cols[0].button("次のステップへ進む", key="proceed_step_button"):
         st.session_state["user_input_type"] = "proceed_analysis_step"
         # The memory_state (which includes the plan) is already set from the last backend response.
         # We just need to signal the intent to proceed.
         st.session_state.disabled = True # Trigger backend processing
         st.rerun()
 
-    if button_cols[1].button("Cancel Analysis Plan", key="cancel_plan_button"):
+    if button_cols[1].button("分析計画をキャンセル", key="cancel_plan_button"):
         st.session_state["user_input_type"] = "cancel_analysis_plan"
         st.session_state.disabled = True # Trigger backend processing
         st.rerun()
@@ -185,7 +185,7 @@ if st.session_state.disabled: # This will be true after user submits new input O
     ai_msg_placeholder = st.empty()
     for i in range(8):  # 約4秒間タイピング演出
         dots = "." * ((i % 4) + 1)
-        ai_msg_placeholder.chat_message("assistant").write(f"AI is thinking{dots} _typing_ :speech_balloon:")
+        ai_msg_placeholder.chat_message("assistant").write(f"AIが思考中{dots} _入力中_ :speech_balloon:")
         time.sleep(0.5)
 
     # --- 6. LangGraphバックエンド呼び出し ---
@@ -201,10 +201,10 @@ if st.session_state.disabled: # This will be true after user submits new input O
         # Backend needs the current memory state to know about the plan, index etc.
         # And user_action to be routed correctly.
         invoke_payload = {**current_memory, "user_action": "proceed_analysis_step", "awaiting_step_confirmation": False}
-        st.session_state["chat_history"].append({"role": "user", "content": "User chose to proceed to the next step.", "type": "system_action"})
+        st.session_state["chat_history"].append({"role": "user", "content": "ユーザーは次のステップへ進むことを選択しました。", "type": "system_action"})
     elif user_action_type == "cancel_analysis_plan":
         invoke_payload = {**current_memory, "user_action": "cancel_analysis_plan", "awaiting_step_confirmation": False}
-        st.session_state["chat_history"].append({"role": "user", "content": "User chose to cancel the analysis plan.", "type": "system_action"})
+        st.session_state["chat_history"].append({"role": "user", "content": "ユーザーは分析計画のキャンセルを選択しました。", "type": "system_action"})
     else:
         # This is the existing logic for handling normal user input, clarifications, or analysis option selections.
         last_user_message_entry = next((msg for msg in reversed(st.session_state.chat_history) if msg["role"] == "user"), None)
@@ -260,7 +260,7 @@ if st.session_state.disabled: # This will be true after user submits new input O
     st.session_state["user_input_type"] = None
 
     if not invoke_payload:
-        st.warning("Something went wrong, no action to take. Please try again.")
+        st.warning("問題が発生しました。実行するアクションがありません。もう一度お試しください。")
         st.session_state.disabled = False
         st.rerun()
         return
@@ -320,7 +320,7 @@ if st.session_state.disabled: # This will be true after user submits new input O
         # --- Display Analysis Options (if any) ---
         if "analysis_options" in res and res["analysis_options"] and isinstance(res["analysis_options"], list) and len(res["analysis_options"]) > 0:
             st.markdown("---") # Separator
-            st.write("Suggested next steps:")
+            st.write("提案される次のステップ:")
             for i, option_text in enumerate(res["analysis_options"]):
                 if not isinstance(option_text, str): # Ensure option_text is a string
                     continue # Skip if not a string

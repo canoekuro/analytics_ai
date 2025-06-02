@@ -659,7 +659,7 @@ class TestWorkflow(unittest.TestCase):
         # or test nodes more individually. Here, we check the overall outcome.
 
         # The 'condition' in the final state will be from the last executed node before END (suggest_analysis_paths_node)
-        self.assertEqual(final_state.get("condition"), "no_paths_suggested_mocked")
+        self.assertEqual(final_state.get("condition"), "no_paths_suggested_mocked") # This is a mock condition, remains as is.
 
         # Key things to check from create_analysis_plan_node's effect (persisted in checkpoint):
         # Need to get the actual state from the checkpointer to see intermediate results.
@@ -667,7 +667,7 @@ class TestWorkflow(unittest.TestCase):
         # A more rigorous test would involve:
         # state_after_create_plan = self.workflow.get_state(self.config) # after create_analysis_plan
         # self.assertEqual(state_after_create_plan.get("analysis_plan"), [])
-        # self.assertEqual(state_after_create_plan.get("condition"), "empty_plan_generated")
+        # self.assertEqual(state_after_create_plan.get("condition"), "計画空で完了") # Updated "empty_plan_generated"
 
         # Check that suggest_analysis_paths_node was indeed called
         mock_suggest_node.assert_called_once()
@@ -695,7 +695,7 @@ class TestWorkflow(unittest.TestCase):
 
         self.assertIsNotNone(final_state.get("clarification_question"))
         self.assertIn("Could you please specify", final_state.get("clarification_question"))
-        self.assertEqual(final_state.get("condition"), "awaiting_user_clarification")
+        self.assertEqual(final_state.get("condition"), "ユーザー明確化待ち")
         self.assertIsNotNone(final_state.get("analysis_plan")) # Plan should still be there
         self.assertEqual(final_state.get("analysis_plan")[0]["action"], "clarify")
 
@@ -735,7 +735,7 @@ class TestWorkflow(unittest.TestCase):
 
         # Assert that create_analysis_plan_node was called and generated a new plan
         # (based on its internal mock logic for user_clarification)
-        self.assertEqual(final_state.get("condition"), "history_checked") # Assuming new plan [check_history, sql, interpret] and check_history ran
+        self.assertEqual(final_state.get("condition"), "履歴確認完了") # Assuming new plan [check_history, sql, interpret] and check_history ran
         self.assertIsNone(final_state.get("user_clarification")) # Should be consumed
         self.assertEqual(final_state.get("complex_analysis_original_query"), original_query)
 
@@ -780,7 +780,7 @@ class TestWorkflow(unittest.TestCase):
         mock_check_history_node.return_value = MyState(
             latest_df=collections.OrderedDict(), # No data found in history
             missing_data_requirements=["product X sales"], # The requirement is missing
-            condition="history_checked"
+            condition="履歴確認完了"
             # other state fields are passed through or set by the node
         )
 
@@ -793,7 +793,7 @@ class TestWorkflow(unittest.TestCase):
         # --- Mock interpret_node ---
         mock_interpret_node.return_value = MyState(
             interpretation="Successfully interpreted product X sales.",
-            condition="interpretation_done"
+            condition="解釈完了"
         )
 
         initial_state = MyState(input=user_input, df_history=[]) # Start with empty history
@@ -806,7 +806,7 @@ class TestWorkflow(unittest.TestCase):
         # -> dispatch -> interpret (mocked) -> its _next increments index
         # -> dispatch -> execute_plan_router (plan complete) -> suggest_analysis_paths -> END
 
-        self.assertEqual(final_state.get("condition"), "interpretation_done")
+        self.assertEqual(final_state.get("condition"), "解釈完了")
         self.assertEqual(final_state.get("interpretation"), "Successfully interpreted product X sales.")
 
         # Verify latest_df contains data from sql_node
@@ -861,7 +861,7 @@ class TestWorkflow(unittest.TestCase):
         mock_check_history_node.return_value = MyState(
             latest_df=collections.OrderedDict({"known product Y sales": known_product_y_data}),
             missing_data_requirements=[],
-            condition="history_checked"
+            condition="履歴確認完了"
         )
 
         # --- Mock sql_node ---
@@ -883,7 +883,7 @@ class TestWorkflow(unittest.TestCase):
             # Crucially, it should pass on latest_df.
             return {
                 **state,
-                "condition": "sql_execution_done", # or skipped if it has that logic
+                "condition": "SQL実行完了", # or skipped if it has that logic
                 "SQL": "SELECT * FROM y_sales_mocked_sql_node;", # To show it was "called"
                 # latest_df should remain as set by check_history_node if sql_node doesn't modify for this req
             }
@@ -898,7 +898,7 @@ class TestWorkflow(unittest.TestCase):
             return {
                 **state,
                 "interpretation": "Interpreted known product Y sales from history.",
-                "condition": "interpretation_done"
+                "condition": "解釈完了"
             }
         mock_interpret_node.side_effect = interpret_node_side_effect
 
@@ -912,7 +912,7 @@ class TestWorkflow(unittest.TestCase):
         # -> dispatch -> interpret (mocked, uses data from latest_df)
         # -> dispatch -> suggest_analysis_paths -> END
 
-        self.assertEqual(final_state.get("condition"), "interpretation_done")
+        self.assertEqual(final_state.get("condition"), "解釈完了")
         self.assertEqual(final_state.get("interpretation"), "Interpreted known product Y sales from history.")
 
         # Verify latest_df still primarily reflects the data from history
@@ -979,7 +979,7 @@ class TestWorkflow(unittest.TestCase):
         mock_check_history.return_value = MyState(
             latest_df=collections.OrderedDict(), # Cache miss
             missing_data_requirements=["sales data"],
-            condition="history_checked"
+            condition="履歴確認完了"
         )
 
         # --- Mock RAG & DB for sql_node (for "sales data") ---
@@ -1037,7 +1037,7 @@ class TestWorkflow(unittest.TestCase):
         final_state_after_chart = self.workflow.invoke(initial_state, config=self.config)
 
         # --- Assertions for CH -> SQL -> Chart part ---
-        self.assertEqual(final_state_after_chart.get("condition"), "chart_generation_done")
+        self.assertEqual(final_state_after_chart.get("condition"), "グラフ生成完了")
         self.assertEqual(final_state_after_chart.get("chart_result"), "fake_chart_base64_string")
         self.assertIn("sales data", final_state_after_chart.get("latest_df", {}))
         self.assertEqual(final_state_after_chart["latest_df"]["sales data"], sales_df_data)
@@ -2401,7 +2401,7 @@ class TestWorkflow(unittest.TestCase):
         mock_check_history.return_value = MyState(
             latest_df=collections.OrderedDict(),
             missing_data_requirements=["New Product Sales"], # Plan detail will be this
-            condition="history_checked"
+            condition="履歴確認完了"
         )
 
         # DB execution results for sql_node
@@ -2417,13 +2417,13 @@ class TestWorkflow(unittest.TestCase):
         # Mock interpret_node for the end of the successful flow
         def interpret_side_effect(state: MyState):
             self.assertIn("New Product Sales", state["latest_df"]) # Check data is there
-            return {**state, "interpretation": "Interpreted new product sales.", "condition": "interpretation_done"}
+            return {**state, "interpretation": "Interpreted new product sales.", "condition": "解釈完了"}
         mock_interpret_node.side_effect = interpret_side_effect
 
         initial_workflow_state = {"input": user_input, "df_history": []}
         final_state = self.workflow.invoke(initial_workflow_state, config=config)
 
-        self.assertEqual(final_state.get("condition"), "interpretation_done")
+        self.assertEqual(final_state.get("condition"), "解釈完了")
         self.assertIn("New Product Sales", final_state.get("latest_df", {}))
         self.assertEqual(final_state["latest_df"]["New Product Sales"], [{"product": "SuperWidget", "sales": 150}])
         self.assertEqual(final_state.get("interpretation"), "Interpreted new product sales.")
@@ -2470,7 +2470,7 @@ class TestWorkflow(unittest.TestCase):
         mock_check_history.return_value = MyState(
             latest_df=collections.OrderedDict(),
             missing_data_requirements=["Problematic Data"],
-            condition="history_checked"
+            condition="履歴確認完了"
         )
 
         # DB execution: both attempts fail
