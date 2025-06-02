@@ -69,7 +69,7 @@ class MyState(TypedDict, total=False):
     user_action: Optional[str] = None # New field for frontend actions like "proceed_analysis_step" or "cancel_analysis_plan"
 
 #ユーザーの入力に応じて意図を分類
-def classify_intent_node(state):
+def classify_intent_node(state: MyState):
     user_input = state["input"]
     if user_input == "SYSTEM_CLEAR_HISTORY":
         current_history = state.get("query_history", [])
@@ -109,7 +109,7 @@ def classify_intent_node(state):
 
     return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
-def metadata_retrieval_node(state):
+def metadata_retrieval_node(state: MyState):
     user_query = state["input"]
     retrieved_docs = vectorstore_tables.similarity_search(user_query)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
@@ -130,7 +130,7 @@ def metadata_retrieval_node(state):
     answer = response.content.strip()
     return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
 
-def clear_data_node(state):
+def clear_data_node(state: MyState):
     return {
         "input": state.get("input"),
         "intent_list": state.get("intent_list"),
@@ -818,9 +818,6 @@ def sql_next(state: MyState):
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
     logging.warning("sql_next: SQL node executed outside of a planned context.")
-    intents = state.get("intent_list", [])
-    if "グラフ作成" in intents: return "chart"
-    if "データ解釈" in intents: return "interpret"
     return END
 
 def chart_next(state: MyState):
@@ -830,7 +827,7 @@ def chart_next(state: MyState):
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
     logging.warning("chart_next: Chart node executed outside of a planned context.")
-    if "データ解釈" in state.get("intent_list", []): return "interpret"
+    return END
 
 def interpret_next(state: MyState):
     current_index = state.get("current_plan_step_index")
@@ -839,6 +836,7 @@ def interpret_next(state: MyState):
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
     logging.warning("interpret_next: Interpret node executed outside of a planned context.")
+    return END
 
 # 分析計画（analysis_plan）」の現在ステップに応じて、次にどのノード（処理）に進むかを決定
 def execute_plan_router(state: MyState) -> str:
