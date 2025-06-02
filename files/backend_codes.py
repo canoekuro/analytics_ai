@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime
 import japanize_matplotlib
 import seaborn as sns
+import plotly.express as px
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 import json # import jsonを先頭に移動しました
 import google.generativeai as genai # Gemini API のインポート
@@ -55,7 +56,7 @@ class MyState(TypedDict, total=False):
     df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
-    chart_result: Optional[str]      # グラフ画像（base64など）
+    chart_result: Optional[str]      # Plotlyによって生成されたグラフのJSON文字列
     metadata_answer: Optional[str]   # メタデータ検索結果の回答
     error: Optional[str]             # SQL等でエラーがあれば
     query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
@@ -859,47 +860,54 @@ def chart_node(state: MyState) -> MyState:
         return {**state, "chart_result": None, "condition": "chart_generation_failed_empty_selected_data", "error": "チャート作成に適したデータが見つかりませんでした。"} # Includes current_status_message
 
     python_tool = PythonAstREPLTool(
-        locals={"df": df_to_plot, "sns": sns, "pd": pd, "japanize_matplotlib": japanize_matplotlib},
+        locals={"df": df_to_plot, "px": px, "pd": pd},
         description=(
             "Pythonコードを実行してデータを分析・グラフ化できます。dfとしてプロット対象のDataFrameが定義済みです。"
-            "グラフは 'output.png' として保存してください。日本語対応のため japanize_matplotlib.japanize() を実行し、sns.set(font='IPAexGothic') も試してください。"
+            "plotly.express (px) を使用してインタラクティブなグラフを生成し、fig.to_json() でJSON文字列として出力してください。"
         )
     )
     tools = [python_tool]
     agent = initialize_agent(
         tools, llm, agent="zero-shot-react-description", verbose=True, handle_parsing_errors=True,
-        agent_kwargs={"handle_parsing_errors": True} # LLMの出力がエージェントにとって不適切だった場合の、より堅牢なエラー処理のために追加
+        agent_kwargs={"handle_parsing_errors": True}
     )
+
+    # df.info()の出力を文字列としてキャプチャ
+    buffer = io.StringIO()
+    df_to_plot.info(buf=buffer)
+    df_info_str = buffer.getvalue()
 
     chart_prompt = f"""
     あなたはPythonプログラミングとデータ可視化の専門家です。
-    {chart_context_message}最適なグラフを生成し、'output.png'というファイル名で保存してください。
-    日本語フォントを利用するために、コードの先頭で `import japanize_matplotlib; japanize_matplotlib.japanize()` を実行してください。
-    Seabornを使用する場合は `sns.set(font='IPAexGothic')` も試してください。
-    dfの列情報: {df_to_plot.info()}
+    {chart_context_message}最適なインタラクティブグラフを `plotly.express` (例: `px`) を使用して生成してください。
+    生成したFigureオブジェクトを `fig` という変数に格納し、その後 `fig.to_json()` を呼び出してJSON文字列に変換し、そのJSON文字列を `print` してください。
+    dfの列情報: {df_info_str}
     dfの最初の5行:
     {df_to_plot.head().to_string(index=False)}
     指示: {chart_instructions}
+    実行例:
+    import plotly.express as px
+    fig = px.line(df, x='your_x_column', y='your_y_column')
+    print(fig.to_json())
     """
     try:
-        if os.path.exists("output.png"):
-            os.remove("output.png")
-
         agent_response = agent.invoke(chart_prompt)
         logging.info(f"chart_node: Agent response: {agent_response}")
 
-        if os.path.exists("output.png"):
-            fig = base64.b64encode(open("output.png", "rb").read()).decode('utf-8')
-            return {**state, "chart_result": fig, "condition": "chart_generation_done"} # Includes current_status_message
-        else:
-            logging.error("chart_node: エージェントは実行されましたが、output.pngが見つかりませんでした。エージェントの出力に理由が示されている可能性があります。")
-            error_message = "グラフファイルの生成に失敗しました。"
-            if isinstance(agent_response, dict) and "output" in agent_response:
-                error_message += f" (エージェント: {agent_response['output']})"
-            return {**state, "chart_result": None, "condition": "chart_generation_failed_no_output_file", "error": error_message} # Includes current_status_message
+        # The agent's output should be the Plotly JSON string
+        plotly_json_string = agent_response['output']
+
+        # Attempt to parse the JSON to ensure it's valid before returning
+        try:
+            json.loads(plotly_json_string) # This will raise an error if not valid JSON
+            return {**state, "chart_result": plotly_json_string, "condition": "chart_generation_done"}
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"chart_node: Agent output was not valid JSON: {e}. Output: {plotly_json_string}")
+            return {**state, "chart_result": None, "condition": "chart_generation_failed_invalid_json", "error": f"生成されたグラフのJSONが無効です: {e}"}
+
     except Exception as e:
         logging.error(f"chart_node: エージェント実行中にエラーが発生しました: {e}", exc_info=True)
-        return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)} # Includes current_status_message
+        return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)}
 
 def data_processing_node(state: MyState) -> MyState:
     # Set status message
