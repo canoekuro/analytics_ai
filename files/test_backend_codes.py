@@ -2768,24 +2768,6 @@ TestMetadataRetrievalNode.test_metadata_retrieval_specific_column_question = add
 TestMetadataRetrievalNode.test_metadata_retrieval_vague_question = add_new_metadata_tests
 # Note: The "non-existent table" case is already well-covered by test_metadata_retrieval_no_rag_docs_found.
 
-
-class TestDataProcessingNode(unittest.TestCase):
-
-    def setUp(self):
-        self.initial_df_list = [{"colA": 1, "colB": 2}, {"colA": 3, "colB": 4}]
-        self.initial_df = pd.DataFrame(self.initial_df_list)
-        self.default_input_instruction = "Perform some processing on data1"
-        self.default_state = MyState(
-            latest_df=collections.OrderedDict({"data1": self.initial_df_list}),
-            input=self.default_input_instruction,
-        )
-
-import io # Add io for simulating df.info() output
-
-# Import data_processing_node if it's not already (it should be)
-from files.backend_codes import data_processing_node
-
-
 class TestDataProcessingNode(unittest.TestCase):
 
     def setUp(self):
