@@ -225,7 +225,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         ```json
         [
           {"action": "check_history", "details": ["先月の製品Xの総売上"]},
-          {"action": "sql", "details": "先月の製品Xの総売上},
+          {"action": "sql", "details": "先月の製品Xの総売上"},
           {"action": "chart", "details": "先月の製品Xの総売上を棒グラフで表示"},
           {"action": "interpret", "details": "先月の製品Xの総売上の棒グラフを解釈"}
         ]
