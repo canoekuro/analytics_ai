@@ -27,6 +27,8 @@ from google.api_core import exceptions as google_exceptions # Google APIエラ�
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
+# 環境変数からLLMモデル名を取得します（デフォルト値あり）
+llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-pro") # デフォルトをgemini-1.5-proに変更
 google_api_key = os.getenv("GOOGLE_API_KEY")
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # または他の適切なGemini埋め込みモデル
 SIMILARITY_THRESHOLD = 0.8
@@ -34,9 +36,6 @@ SIMILARITY_THRESHOLD = 0.8
 # ベクトルストア
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
-
-# 環境変数からLLMモデル名を取得します（デフォルト値あり）
-llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-pro") # デフォルトをgemini-1.5-proに変更
 
 llm = ChatGoogleGenerativeAI(
     model=llm_model_name,
@@ -68,7 +67,7 @@ class MyState(TypedDict, total=False):
     analysis_plan: Optional[List[dict]] = None # 分析ステップのリストを格納します。例：[{"action": "sql", "details": "月次総売上"},{"action": "interpret", "details": "月次売上データを解釈"}]
     current_plan_step_index: Optional[int] = None # analysis_plan内の現在のステップのインデックス
     awaiting_step_confirmation: Optional[bool] = None # ユーザーが次のステップに進むのを待機している場合はTrue
-    complex_analysis_original_query: Optional[str] = None # 元の複数ステップのクエリを格納します
+    original_query: Optional[str] = None # 元の複数ステップのクエリを格納します
     user_action: Optional[str] = None # "proceed_analysis_step"や"cancel_analysis_plan"のようなフロントエンドアクション用の新しいフィールド
 
 #ユーザーの入力に応じて意図を分類
@@ -158,11 +157,6 @@ def create_analysis_plan_node(state: MyState) -> MyState:
     parsed_plan = None # 初期化
 
     try:
-        # Geminiモデルの初期化
-        model_name_for_genai = "gemini-1.5-pro"
-        model = genai.GenerativeModel(model_name_for_genai)
-        genai.configure(api_key=google_api_key)
-
         # ツールのスキーマ定義
         plan_generation_tool = genai.types.Tool(
         function_declarations=[
@@ -197,57 +191,60 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         )
 
         SYSTEM_PROMPT = """あなたはAIデータアナリストです。ユーザーの要求を分析し、ステップバイステップの分析計画を作成してください。
-利用可能なアクションは次のとおりです:
-- clarify: ユーザーに詳細を質問します。 (例: "期間の指定を求める")
-  - "details": (string) ユーザーへの質問文。
-- check_history: 過去に同様のデータが取得されているか確認します。 (例: "'月次売上データ'を確認")
-  - "details": (array of strings) 確認するデータ要件のリスト。
-- sql: データベースからデータを取得します。 (例: "'特定の製品の売上データを取得'")
-  - "details": (string) SQLで取得する具体的なデータの内容。
-- chart: 取得したデータからグラフを作成します。 (例: "'売上データを棒グラフで表示'")
-  - "details": (string) グラフ作成の指示 (例: "売上データを棒グラフで表示", "DF_KEY['売上データ'] を使用して時系列グラフを作成")。
-- interpret: データやグラフを解釈し、洞察を提供します。 (例: "'売上傾向を分析する'")
-  - "details": (string) 解釈の焦点や内容。
-- data_processing: 既存のデータを加工・変換します。 (例: "'売上データに利益率列を追加する'")
-  - "details": (string) データ加工の具体的な指示。処理対象のDataFrameを指定するには `DF_KEY['your_dataframe_key_in_latest_df']` を含めてください。
-
-以下は計画作成の例です:
-
-例1: 曖昧なリクエスト
-ユーザーのクエリ: "Show me sales data."
-生成されるプラン:
-```json
-[
-  {"action": "clarify", "details": "Could you please specify the time period for the sales data (e.g., last month, last quarter)?"}
-]
-```
-
-例2: 複数ステップのリクエスト
-ユーザーのクエリ: "Get the total sales for product X last month, then visualize it as a bar chart, and finally interpret the chart."
-生成されるプラン:
-```json
-[
-  {"action": "check_history", "details": ["total sales for product X last month"]},
-  {"action": "sql", "details": "total sales for product X last month"},
-  {"action": "chart", "details": "bar chart of total sales for product X last month"},
-  {"action": "interpret", "details": "interpret the bar chart of total sales for product X last month"}
-]
-```
-
-例3: データ加工を含むリクエスト
-ユーザーのクエリ: "Load the customer dataset, then add a new column 'age_group' based on the 'age' column (e.g., <18: Teen, 18-65: Adult, >65: Senior), and show the first 5 rows of the processed data."
-生成されるプラン:
-```json
-[
-  {"action": "check_history", "details": ["customer dataset"]},
-  {"action": "sql", "details": "customer dataset"},
-  {"action": "data_processing", "details": "Add a new column 'age_group' to DF_KEY['customer dataset'] based on the 'age' column (e.g., <18: Teen, 18-65: Adult, >65: Senior)"},
-  {"action": "interpret", "details": "Describe the first 5 rows of the processed customer dataset (DF_KEY['customer dataset']) including the new 'age_group' column."}
-]
-```
-
-必ずJSON形式で plan_steps を含む応答を生成してください。
-"""
+        # 指示
+        - KPI・ブランド・期間など、分析に必要な情報が不足していれば `clarify` を必ずプランの先頭に置いてください。
+        - 具体的な情報が揃っている場合は `clarify` は不要です。
+        - 利用可能なアクションはclarify`, `check_history`, `sql`, `chart`, `interpret` です。各アクションの具体的な内容は以下のとおりです。
+            - clarify: ユーザーに詳細を質問します。 (例: "期間の指定を求める")
+              - "details": (string) ユーザーへの質問文。
+            - check_history: 過去に同様のデータが取得されているか確認します。 (例: "'月次売上データ'を確認")
+              - "details": (array of strings) 確認するデータ要件のリスト。
+            - sql: データベースからデータを取得します。 (例: "'特定の製品の売上データを取得'")
+              - "details": (string) SQLで取得する具体的なデータの内容。
+            - chart: 取得したデータからグラフを作成します。 (例: "'売上データを棒グラフで表示'")
+              - "details": (string) グラフ作成の指示 (例: "売上データを棒グラフで表示", "DF_KEY['売上データ'] を使用して時系列グラフを作成")。
+            - interpret: データやグラフを解釈し、洞察を提供します。 (例: "'売上傾向を分析する'")
+              - "details": (string) 解釈の焦点や内容。
+            - data_processing: 既存のデータを加工・変換します。 (例: "'売上データに利益率列を追加する'")
+              - "details": (string) データ加工の具体的な指示。処理対象のDataFrameを指定するには `DF_KEY['your_dataframe_key_in_latest_df']` を含めてください。
+            
+        以下は計画作成の例です:
+        
+        例1: 曖昧なリクエスト
+        ユーザーのクエリ: "売上を見せて"
+        生成されるプラン:
+        ```json
+        [
+          {"action": "clarify", "details": "Could you please specify the time period for the sales data (e.g., last month, last quarter)?"}
+        ]
+        ```
+        
+        例2: 複数ステップのリクエスト
+        ユーザーのクエリ: "先月の製品Xの総売上を取得し、棒グラフで可視化して、最後にそのグラフを解釈してください。"
+        生成されるプラン:
+        ```json
+        [
+          {"action": "check_history", "details": ["先月の製品Xの総売上"]},
+          {"action": "sql", "details": "先月の製品Xの総売上},
+          {"action": "chart", "details": "先月の製品Xの総売上を棒グラフで表示"},
+          {"action": "interpret", "details": "先月の製品Xの総売上の棒グラフを解釈"}
+        ]
+        ```
+        
+        例3: データ加工を含むリクエスト
+        ユーザーのクエリ: "ユーザーのクエリ: "顧客データセットを読み込み、'age'列を基に新しい列'age_group'を追加し（例: 18歳未満: Teen, 18-65歳: Adult, 65歳超: Senior）、処理後のデータの最初の5行を見せてください。"
+        生成されるプラン:
+        ```json
+        [
+          {"action": "check_history", "details": ["顧客データセット"]},
+          {"action": "sql", "details": "顧客データセット"},
+          {"action": "data_processing", "details": "DF_KEY['顧客データセット']の'age'列を基に、新しい列'age_group'を追加する（例：18歳未満: Teen, 18-65歳: Adult, 65歳超: Senior）"},
+          {"action": "interpret", "details": "D新しい'age_group'列を含む、処理後の顧客データセット（DF_KEY['顧客データセット']）の最初の5行を説明する"}
+        ]
+        ```
+        
+        必ずJSON形式で plan_steps を含む応答を生成してください。
+        """
         prompt_parts = [SYSTEM_PROMPT]
 
         # Add query history to prompt
@@ -258,7 +255,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
             relevant_history = query_history[history_start_index:-1] if len(query_history) > 1 else []
             if relevant_history:
                 formatted_history = "\n\n過去の関連する問い合わせ履歴 (新しいものが最後):\n"
-                for i, hist_item in enumerate(relevant_history):
+                for hist_item in relevant_history:
                     formatted_history += f"- {hist_item}\n"
                 prompt_parts.append(formatted_history)
 
@@ -267,16 +264,16 @@ def create_analysis_plan_node(state: MyState) -> MyState:
 
         if user_clarification:
             prompt_parts.append(f"\nユーザーからの追加情報: {user_clarification}")
-            original_query = state.get("complex_analysis_original_query", "")
+            original_query = state.get("original_query", "")
             if original_query and original_query != user_query :
-                 prompt_parts.append(f"\n(この追加情報は、以前のクエリ「{original_query}」に関連しています)")
+                prompt_parts.append(f"\n(この追加情報は、以前のクエリ「{original_query}」に関連しています)")
 
         final_prompt_string = "".join(prompt_parts)
         logging.info(f"Geminiへの最終プロンプト:\n{final_prompt_string}")
 
         # APIコールとレスポンス処理
         try:
-            response = model.generate_content(
+            response = llm.generate_content(
                 final_prompt_string,
                 tools=[plan_generation_tool],
                 generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
@@ -341,17 +338,17 @@ def create_analysis_plan_node(state: MyState) -> MyState:
             "condition": "plan_generation_failed", "error": f"分析計画の作成中に予期せぬシステムエラーが発生しました。管理者にご連絡ください。(詳細: {str(e_outer)})"
         }
 
-    # current_inputの取得とcomplex_analysis_original_queryのロジックは変更なし
+    # current_inputの取得とoriginal_queryのロジックは変更なし
     current_input = state.get("input", "")
-    original_query_for_complex = state.get("complex_analysis_original_query")
-    if parsed_plan and not original_query_for_complex and \
+    original_query = state.get("original_query")
+    if parsed_plan and not original_query and \
        ("clarify" in [step.get("action") for step in parsed_plan if isinstance(step, dict)] or user_clarification) :
-        original_query_for_complex = user_query
+        original_query = user_query
 
     # user_clarification はここで消費されるのでNoneにする
     return {
         **state,
-        "complex_analysis_original_query": original_query_for_complex,
+        "original_query": original_query,
         "analysis_plan": parsed_plan, # parsed_planがNoneの場合もある（エラー時など）
         "current_plan_step_index": 0 if parsed_plan else None,
         "awaiting_step_confirmation": False,
@@ -393,13 +390,13 @@ def clarify_node(state: MyState) -> MyState:
 
 # 追加質問をした際に、実行をキャンセルした際のノード
 def cancel_analysis_plan_node(state: MyState) -> MyState:
-    original_query = state.get("complex_analysis_original_query", "分析計画はキャンセルされました。")
+    original_query = state.get("original_query", "分析計画はキャンセルされました。")
     return {
         **state,
         "analysis_plan": None,
         "current_plan_step_index": None,
         "awaiting_step_confirmation": False,
-        "complex_analysis_original_query": None,
+        "original_query": None,
         "input": original_query,
         "interpretation": "複数ステップの分析計画はユーザーによってキャンセルされました。",
         "condition": "plan_cancelled",
@@ -613,7 +610,7 @@ def sql_node(state: MyState) -> MyState:
 
     # 全体の質問文脈（Clarify含む）があればそちら、なければ直近入力
     current_df_history = state.get("df_history", [])
-    overall_user_input_context = state.get("complex_analysis_original_query", state.get("input", "")) # これはexecute_plan_routerによってcurrent_step["details"]に設定されます
+    overall_user_input_context = state.get("original_query", state.get("input", "")) # これはexecute_plan_routerによってcurrent_step["details"]に設定されます
     
     last_sql_generated = None
     any_error_occurred = False
