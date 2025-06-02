@@ -696,54 +696,34 @@ class TestWorkflow(unittest.TestCase):
         self.config = {"configurable": {"thread_id": f"test_thread_{self.id()}"}}
 
     @patch('files.backend_codes.llm') # Mock LLM for classify_intent_node
-    @patch('files.backend_codes.suggest_analysis_paths_node') # Mock to check it's reached
-    def test_workflow_greeting_to_empty_plan(self, mock_suggest_node, mock_llm_classify):
-        # create_analysis_plan_node has internal mock logic for "hello" -> empty plan
-        # No LLM mock needed for create_analysis_plan_node itself for this path.
-
-        # 1. Mock for classify_intent_node
-        # For a greeting, classify_intent_node might return empty or some general intent.
-        # Let's assume it correctly identifies it as not needing data operations.
-        # Or, more simply, the create_analysis_plan node's internal logic for "hello" is dominant.
-        # The 'classify_next' will route to 'create_analysis_plan' if no strong other intent.
-        mock_llm_classify.invoke.return_value = MagicMock(content="") # Empty intent list
-
-        # Mock suggest_analysis_paths_node to prevent its LLM call and simplify assertion
-        mock_suggest_node.return_value = MyState(condition="no_paths_suggested_mocked", analysis_options=[])
-
+    def test_workflow_greeting_to_empty_plan(self, mock_llm_classify):
+        # create_analysis_plan_node has internal mock logic for "hello" -> empty plan.
+        # classify_intent_node is mocked to return an empty intent list for "hello".
+        # create_analysis_plan_next routes to END if plan is empty.
 
         user_input = "hello"
-        initial_state = MyState(input=user_input)
+        mock_llm_classify.invoke.return_value = MagicMock(content="") # Empty intent list for classify_intent_node
 
-        # Run the workflow
+        initial_state = MyState(input=user_input)
         final_state = self.workflow.invoke(initial_state, config=self.config)
 
         # Expected sequence:
-        # classify -> create_analysis_plan (sees "hello", generates empty plan, condition="empty_plan_generated")
-        # -> create_analysis_plan_next routes to "suggest_analysis_paths"
-        # -> suggest_analysis_paths_node (mocked) -> suggest_analysis_paths_next routes to END.
+        # classify (mocked LLM, returns empty intent)
+        # -> classify_next routes to create_analysis_plan
+        # -> create_analysis_plan (internal mock for "hello" creates empty plan, condition="empty_plan_generated")
+        # -> create_analysis_plan_next (sees empty plan) routes to END.
 
-        # Verify classify_intent_node was called
+        # Verify classify_intent_node's LLM call was made
         mock_llm_classify.invoke.assert_called_once()
 
-        # Check the state after create_analysis_plan_node would have run.
-        # The final state will be after suggest_analysis_paths_node.
-        # To check intermediate states, one would need to inspect graph states if checkpointer was more accessible
-        # or test nodes more individually. Here, we check the overall outcome.
+        # Assertions for the final state:
+        # The condition should be from create_analysis_plan_node as it's the last node to set it.
+        self.assertEqual(final_state.get("condition"), "empty_plan_generated")
+        self.assertEqual(final_state.get("analysis_plan"), [])
+        self.assertIsNone(final_state.get("current_plan_step_index"))
 
-        # The 'condition' in the final state will be from the last executed node before END (suggest_analysis_paths_node)
-        self.assertEqual(final_state.get("condition"), "no_paths_suggested_mocked")
-
-        # Key things to check from create_analysis_plan_node's effect (persisted in checkpoint):
-        # Need to get the actual state from the checkpointer to see intermediate results.
-        # For simplicity in this test, we'll assume if suggest_paths is reached, create_analysis_plan did its job.
-        # A more rigorous test would involve:
-        # state_after_create_plan = self.workflow.get_state(self.config) # after create_analysis_plan
-        # self.assertEqual(state_after_create_plan.get("analysis_plan"), [])
-        # self.assertEqual(state_after_create_plan.get("condition"), "empty_plan_generated")
-
-        # Check that suggest_analysis_paths_node was indeed called
-        mock_suggest_node.assert_called_once()
+        # suggest_analysis_paths_node should not have been called.
+        # (No direct assertion possible without a mock, but the routing logic implies this)
 
 
     @patch('files.backend_codes.llm') # Mock LLM for classify_intent_node
@@ -2086,105 +2066,117 @@ class TestWorkflow(unittest.TestCase):
         # Build a new workflow for each test to ensure isolation
         self.workflow = build_workflow()
 
-    @patch('files.backend_codes.llm') # Mock for classify and extract_data_requirements, interpret
-    @patch('files.backend_codes.vectorstore_tables.similarity_search') # Mock for RAG in sql_node (if reached)
-    @patch('files.backend_codes.vectorstore_queries.similarity_search') # Mock for RAG in sql_node (if reached)
-    @patch('files.backend_codes.try_sql_execute') # Mock for DB in sql_node (if reached)
-    @patch('files.backend_codes.PythonAstREPLTool') # Mock for chart_node's tool
+    @patch('files.backend_codes.llm') # Mock for classify, interpret
+    @patch('files.backend_codes.check_history_node')
+    @patch('files.backend_codes.sql_node')
+    # PythonAstREPLTool is not used in this specific test path.
+    # try_sql_execute, vectorstore_queries, vectorstore_tables are used by sql_node, which is mocked.
     def test_workflow_all_data_found_then_interpret(
-        self, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
+        self, mock_sql_node, mock_check_history_node, mock_llm
     ):
         user_input = "A商品の売上と顧客属性について教えて"
         config = {"configurable": {"thread_id": "test_thread_all_found"}}
 
         # --- Mocking sequence for LLM calls ---
         # 1. classify_intent_node
+        # 2. interpret_node result
         mock_llm.invoke.side_effect = [
             MagicMock(content="データ取得,データ解釈"),  # classify_intent_node result
-            MagicMock(content="A商品の売上,顧客属性"), # extract_data_requirements_node result
             MagicMock(content="Interpreted results about A sales and customer attributes.") # interpret_node result
         ]
 
-        # --- Initial State (simulating history) ---
-        # We need to manually set up the df_history part of the state for find_similar_query
-        # This is a bit tricky with the actual checkpointer.
-        # A cleaner way for workflow tests is often to pre-populate the checkpointer's memory
-        # or mock the checkpointer's get/put methods.
-        # For now, let's assume we can pass a pre-populated df_history.
-        # However, the graph starts fresh. find_similar_query will use its passed state.
-        # So, we need to ensure that when find_similar_query_node is called,
-        # its 'df_history' is populated.
-        # The current workflow structure doesn't allow easily injecting df_history for a specific run via invoke.
-        # Let's patch find_similar_query_node itself for this specific workflow test to control its output,
-        # or accept that it will initially find nothing if history is empty.
-
-        # For this test, let's assume find_similar_query_node works as tested unit-wise,
-        # and we want to test the workflow path. So, we'll make it so "all_data_found" is the condition.
-        # To do this, we can patch `find_similar_query_node` to return a specific state.
-
+        # --- Predefined data ---
         predefined_data_for_A = [{"product": "A", "sales": 120}]
         predefined_data_for_cust = [{"attr": "loyal"}]
 
-        # Patching the node itself to control its output for the workflow test
-        # This is an alternative to deeply populating history for a workflow test run
-        with patch('files.backend_codes.find_similar_query_node') as mock_find_similar:
-            mock_find_similar.return_value = {
-                "input": user_input,
-                "intent_list": ["データ取得", "データ解釈"],
-                "data_requirements": ["A商品の売上", "顧客属性"],
-                "latest_df": collections.OrderedDict([
-                    ("A商品の売上", predefined_data_for_A),
-                    ("顧客属性", predefined_data_for_cust)
-                ]),
-                "missing_data_requirements": [],
-                "condition": "all_data_found", # CRITICAL for routing
-                "df_history": [ # Dummy history that would lead to this state
-                     {"id": "h1", "query": "A商品の売上", "dataframe_dict": predefined_data_for_A, "SQL": "S1"},
-                     {"id": "h2", "query": "顧客属性", "dataframe_dict": predefined_data_for_cust, "SQL": "S2"},
-                ],
-                "query_history": [user_input]
-            }
+        # --- Mock check_history_node ---
+        # Simulate that check_history_node finds all data.
+        # The plan details for check_history will be ["A商品の売上", "顧客属性"]
+        # This comes from create_analysis_plan_node's mock logic for the input.
+        # (Assuming create_analysis_plan_node correctly extracts these from the user_input)
+        mock_check_history_node.return_value = MyState(
+            input=user_input, # Or specific details if create_analysis_plan parsed them
+            intent_list=["データ取得", "データ解釈"], # From classify_intent
+            data_requirements=["A商品の売上", "顧客属性"], # From create_analysis_plan
+            latest_df=collections.OrderedDict([
+                ("A商品の売上", predefined_data_for_A),
+                ("顧客属性", predefined_data_for_cust)
+            ]),
+            missing_data_requirements=[], # All found
+            condition="history_checked",
+            df_history=[ # Dummy history to justify findings
+                {"id": "h1", "query": "A商品の売上", "dataframe_dict": predefined_data_for_A, "SQL": "S1"},
+                {"id": "h2", "query": "顧客属性", "dataframe_dict": predefined_data_for_cust, "SQL": "S2"},
+            ],
+            query_history=[user_input]
+            # analysis_plan and current_plan_step_index would be set by the workflow
+        )
 
-            # Invoke the workflow
-            final_state = self.workflow.invoke(
-                {"input": user_input, "df_history": []}, # df_history here is for the very start, find_similar is patched
-                config=config
-            )
+        # --- Mock sql_node ---
+        # sql_node is in the plan: [{"action": "sql", "details": ["A商品の売上", "顧客属性"]}]
+        # It should be called, but since all data is found by check_history_node,
+        # missing_data_requirements passed to it *should* be empty if the router logic is perfect.
+        # However, execute_plan_router sets missing_data_requirements to plan_step["details"].
+        # So, sql_node will receive ["A商品の売上", "顧客属性"] as requirements to fetch.
+        # It should then recognize these are already in latest_df or effectively "skip" fetching them.
+        def sql_node_side_effect(state: MyState):
+            # Assert that data from check_history is present.
+            self.assertIn("A商品の売上", state["latest_df"])
+            self.assertIn("顧客属性", state["latest_df"])
+            # Simulate that sql_node doesn't need to fetch again or fetches the same.
+            return {
+                **state,
+                "condition": "sql_execution_skipped_all_found", # Or "sql_execution_done" if it "fetched"
+                "SQL": "mocked_sql_not_run", # Or some indicator it was skipped
+                "missing_data_requirements": [], # It processed/found all its given requirements
+            }
+        mock_sql_node.side_effect = sql_node_side_effect
+
+        # --- Workflow Invocation ---
+        # Initial state for the workflow. df_history can be empty as check_history_node is mocked.
+        # create_analysis_plan_node will generate the plan:
+        # [{"action": "check_history", "details": ["A商品の売上", "顧客属性"]},
+        #  {"action": "sql", "details": ["A商品の売上", "顧客属性"]},
+        #  {"action": "interpret", "details": "A商品の売上と顧客属性について教えて"}]
+        # This plan is based on the internal mock logic of create_analysis_plan_node.
+
+        final_state = self.workflow.invoke(
+            {"input": user_input, "df_history": []},
+            config=config
+        )
 
         # --- Assertions ---
-        # 1. classify_intent_node (mocked)
-        # 2. extract_data_requirements_node (mocked)
-        # 3. find_similar_query_node (patched to return "all_data_found")
-        # 4. Next should be interpret_node (since "データ解釈" is in intent_list and "グラフ作成" is not)
-
-        # Check final state from interpret_node
+        # Path: classify -> create_analysis_plan -> dispatch -> check_history (mocked)
+        # -> dispatch -> sql (mocked) -> dispatch -> interpret (LLM mocked) -> END
         self.assertEqual(final_state["interpretation"], "Interpreted results about A sales and customer attributes.")
-        self.assertEqual(final_state["latest_df"]["A商品の売上"], predefined_data_for_A) # Ensure latest_df propagated
-        self.assertEqual(final_state["condition"], "解釈完了") # Condition from interpret_node
+        self.assertIn("A商品の売上", final_state["latest_df"])
+        self.assertEqual(final_state["latest_df"]["A商品の売上"], predefined_data_for_A)
+        self.assertIn("顧客属性", final_state["latest_df"])
+        self.assertEqual(final_state["latest_df"]["顧客属性"], predefined_data_for_cust)
+        self.assertEqual(final_state["condition"], "interpretation_done") # From interpret_node
 
         # Check LLM calls
         # Call 1 (classify): "データ取得,データ解釈"
-        # Call 2 (extract_data_req): "A商品の売上,顧客属性"
-        # Call 3 (interpret): "Interpreted results..."
-        self.assertEqual(mock_llm.invoke.call_count, 3)
+        # Call 2 (interpret): "Interpreted results..."
+        self.assertEqual(mock_llm.invoke.call_count, 2)
 
         llm_calls = mock_llm.invoke.call_args_list
         # Call 1: Classify intent
-        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0])) # Prompt for classify_intent
         self.assertIn(user_input, str(llm_calls[0].args[0]))
-        # Call 2: Extract data requirements
-        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0])) # Prompt for extract_data_requirements
-        self.assertIn(user_input, str(llm_calls[1].args[0]))
-        # Call 3: Interpret node
-        self.assertIn("以下のSQLクエリ実行結果群について", str(llm_calls[2].args[0])) # Prompt for interpret_node
-        self.assertIn("A商品の売上", str(llm_calls[2].args[0])) # Check if data is in prompt
-        self.assertIn("顧客属性", str(llm_calls[2].args[0]))
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
+        # Call 2: Interpret node
+        self.assertIn("以下のSQLクエリ実行結果群について", str(llm_calls[1].args[0]))
+        self.assertIn("A商品の売上", str(llm_calls[1].args[0]))
+        self.assertIn("顧客属性", str(llm_calls[1].args[0]))
+        self.assertIn("A商品の売上と顧客属性について教えて", str(llm_calls[1].args[0])) # Context from plan detail
 
-        # Ensure mocks for nodes not reached (sql_node, chart_node) were not called
-        mock_vs_tables.assert_not_called()
-        mock_vs_queries.assert_not_called()
-        mock_try_sql.assert_not_called()
-        mock_repl_tool.assert_not_called()
+        # Ensure node mocks were called
+        mock_check_history_node.assert_called_once()
+        mock_sql_node.assert_called_once()
+
+        # Ensure other tools/nodes that might have been part of original test are not called
+        # (e.g. if PythonAstREPLTool was directly patched for chart_node)
+        # No need to assert_not_called for mocks that were removed from patch list.
 
     @patch('files.backend_codes.llm')
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
@@ -2249,149 +2241,152 @@ class TestWorkflow(unittest.TestCase):
         # that nodes like extract_data_requirements, sql_node (SQL generation part), interpret_node, chart_node
         # were not called as they would have made additional LLM calls with different prompts.
 
-    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.llm') # For classify, sql_node, chart_node
+    @patch('files.backend_codes.check_history_node')
+    # sql_node itself is not mocked here, but its internal calls are, so we don't mock sql_node directly.
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
-    @patch('files.backend_codes.try_sql_execute') # Keep for sql_node
-    @patch('files.backend_codes.PythonAstREPLTool') # For chart_node
-    @patch('files.backend_codes.uuid.uuid4') # For sql_node history
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.initialize_agent')
+    @patch('files.backend_codes.os.path.exists')
+    @patch('builtins.open', new_callable=unittest.mock.mock_open) # Keep new_callable for read_data later
+    @patch('files.backend_codes.base64.b64encode')
     def test_workflow_missing_data_then_sql_then_chart(
-        self, mock_uuid, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
+        self, mock_b64encode, mock_open_file, mock_os_path_exists,
+        mock_initialize_agent, mock_python_tool, mock_try_sql,
+        mock_vs_queries, mock_vs_tables, mock_check_history_node, mock_llm
     ):
         user_input = "A商品の売上とB商品の在庫をグラフにして"
         config = {"configurable": {"thread_id": "test_thread_missing_sql_chart"}}
-        mock_uuid.return_value = MagicMock(hex=MagicMock(return_value="wf_sql_".ljust(8, '0')))
 
         # --- Mocking sequence for LLM calls ---
         # 1. classify_intent_node: "データ取得,グラフ作成"
-        # 2. extract_data_requirements_node: "A商品の売上,B商品の在庫"
-        # 3. sql_node (for B商品の在庫): generates SQL "SELECT * FROM B_inventory;"
-        # 4. chart_node: Python code for charting
+        # 2. sql_node (for B商品の在庫): generates SQL "SELECT * FROM B_inventory;"
+        # 3. chart_node: Python code for charting by the agent
         mock_llm.invoke.side_effect = [
-            MagicMock(content="データ取得,グラフ作成"),           # Call 1: classify_intent
-            MagicMock(content="A商品の売上,B商品の在庫"),       # Call 2: extract_data_requirements
-            MagicMock(content="SELECT * FROM B_inventory;"), # Call 3: sql_node (SQL gen for B商品の在庫)
-            MagicMock(content="print('Chart generated')")    # Call 4: chart_node (agent prompt)
+            MagicMock(content="データ取得,グラフ作成"),
+            MagicMock(content="SELECT * FROM B_inventory;"),
+            MagicMock(content="print('Chart generated')")
         ]
 
-        # --- Data for find_similar_query_node ---
-        # Assume "A商品の売上" is found in history, "B商品の在庫" is missing.
+        # --- Data for check_history_node ---
         data_A_sales = [{"product": "A", "sales": 200}]
         history_entry_A = {"id": "h_A", "query": "A商品の売上", "dataframe_dict": data_A_sales, "SQL": "SELECT A"}
 
-        # --- Data for sql_node (fetching B商品の在庫) ---
-        data_B_inventory_df = pd.DataFrame([{"item": "B", "stock": 30}])
+        # Mock check_history_node
+        # Plan details for check_history: ["A商品の売上", "B商品の在庫"]
+        # Plan details for chart: "A商品の売上とB商品の在庫をグラフ化"
+        mock_check_history_node.return_value = MyState(
+            input=["A商品の売上", "B商品の在庫"], # This would be set by execute_plan_router from plan
+            intent_list=["データ取得", "グラフ作成"],
+            latest_df=collections.OrderedDict([("A商品の売上", data_A_sales)]),
+            missing_data_requirements=["B商品の在庫"],
+            condition="history_checked",
+            df_history=[history_entry_A], # History that check_history_node would have used
+            query_history=[user_input],
+            analysis_plan = [ # Simplified plan for context within check_history_node if it needed it
+                {"action": "check_history", "details": ["A商品の売上", "B商品の在庫"]},
+                {"action": "sql", "details": ["A商品の売上", "B商品の在庫"]},
+                {"action": "chart", "details": "A商品の売上とB商品の在庫をグラフ化"}
+            ],
+            current_plan_step_index=0 # Index for the check_history step
+        )
 
-        # Mock RAG for sql_node (only for B商品の在庫)
+        # --- Data and Mocks for sql_node (fetching B商品の在庫) ---
+        data_B_inventory_df = pd.DataFrame([{"item": "B", "stock": 30}])
         mock_vs_tables.return_value = [MagicMock(page_content="Table info for B")]
         mock_vs_queries.return_value = [MagicMock(page_content="Query info for B")]
-        # Mock DB for sql_node
         mock_try_sql.return_value = (data_B_inventory_df, None)
 
-        # Mock the chart tool execution
-        mock_repl_tool_instance = mock_repl_tool.return_value
-        # The agent's invoke method is what's called by the chart_node's agent.invoke(chart_prompt)
-        # This should return a dict with an "output" key.
-        mock_repl_tool_instance.invoke.return_value = {"output": "Chart tool executed, output.png created"}
+        # --- Mocks for chart_node ---
+        mock_agent_instance = MagicMock()
+        mock_initialize_agent.return_value = mock_agent_instance
+        # The agent's invoke is the one that calls LLM for python code generation
+        # For chart_node, the agent's output (which contains python code) is then run by PythonAstREPLTool
+        # Here, we mock the LLM call made by the agent. The PythonAstREPLTool itself doesn't call LLM.
+        # The side_effect for mock_llm.invoke already covers the agent's LLM call.
+        # We need to mock the result of the REPL tool if its execution is crucial.
+        # However, chart_node primarily cares about the 'output.png' file.
+        mock_python_tool_instance = mock_python_tool.return_value # mock_python_tool is the class, instance is its return
+        # We don't need to mock python_tool_instance.run() or .invoke() unless we need to control its output
+        # The agent framework calls the tool. The critical part is that os.path.exists("output.png") becomes true.
 
-        # Mock os.path.exists for chart_node to simulate chart output file
-        with patch('files.backend_codes.os.path.exists') as mock_path_exists, \
-             patch('files.backend_codes.base64.b64encode') as mock_b64encode, \
-             patch('builtins.open', unittest.mock.mock_open(read_data=b"chart_bytes")) as mock_open_file, \
-             patch('files.backend_codes.find_similar_query_node') as mock_find_similar: # Patch to control its output
+        mock_os_path_exists.return_value = True
+        mock_b64encode.return_value = "encoded_chart_data"
+        # Configure mock_open_file for read_data, as it's new_callable
+        mock_open_file.return_value.read.return_value = b"chart_bytes"
 
-            mock_path_exists.return_value = True # Simulate output.png exists
-            mock_b64encode.return_value = "encoded_chart_data"
 
-            # Configure mock_find_similar to return "missing_data"
-            mock_find_similar.return_value = {
-                "input": user_input,
-                "intent_list": ["データ取得", "グラフ作成"],
-                "data_requirements": ["A商品の売上", "B商品の在庫"],
-                "latest_df": collections.OrderedDict([("A商品の売上", data_A_sales)]), # A is found
-                "missing_data_requirements": ["B商品の在庫"], # B is missing
-                "condition": "missing_data", # CRITICAL for routing to sql_node
-                "df_history": [history_entry_A],
-                "query_history": [user_input]
-            }
-
-            # Invoke the workflow
-            # Initial state for the workflow can include pre-existing df_history if desired
-            initial_workflow_state = {
-                "input": user_input,
-                "df_history": [history_entry_A], # History that find_similar_query_node should use
-                 # Other fields like latest_df, SQL, etc., should be empty or None initially for this test
-                "latest_df": collections.OrderedDict(),
-                "SQL": None,
-                "interpretation": None,
-                "chart_result": None,
-                "metadata_answer": None,
-                "error": None,
-                "query_history": [], # Will be populated by classify_intent_node
-                "data_requirements": [], # Will be populated by extract_data_requirements_node
-                "missing_data_requirements": [], # Will be populated by find_similar_query_node
-            }
-            final_state = self.workflow.invoke(initial_workflow_state, config=config)
-
+        # Invoke the workflow
+        initial_workflow_state = {
+            "input": user_input,
+            "df_history": [history_entry_A], # This is the history available at the start of the workflow
+            "latest_df": collections.OrderedDict(),
+            "SQL": None, "interpretation": None, "chart_result": None,
+            "metadata_answer": None, "error": None, "query_history": [],
+            "data_requirements": [], "missing_data_requirements": []
+        }
+        final_state = self.workflow.invoke(initial_workflow_state, config=config)
 
         # --- Assertions ---
-        # Path: classify -> extract_data -> find_similar (missing) -> sql -> chart -> END
-        self.assertEqual(final_state["condition"], "グラフ化完了")
+        # Path: classify -> create_analysis_plan -> dispatch -> check_history (mocked)
+        # -> dispatch -> sql (internals mocked) -> dispatch -> chart (internals mocked) -> END
+        self.assertEqual(final_state["condition"], "chart_generation_done") # From chart_node
         self.assertEqual(final_state["chart_result"], "encoded_chart_data")
 
-        # Check latest_df has both A (from history via find_similar) and B (from sql_node)
         self.assertIn("A商品の売上", final_state["latest_df"])
         self.assertEqual(final_state["latest_df"]["A商品の売上"], data_A_sales)
         self.assertIn("B商品の在庫", final_state["latest_df"])
         self.assertEqual(final_state["latest_df"]["B商品の在庫"], data_B_inventory_df.to_dict(orient="records"))
 
-        # Check history updates from sql_node (one original, one new from sql_node)
+        # df_history: one from initial state (via check_history's mock setup), one from sql_node
         self.assertEqual(len(final_state["df_history"]), 2)
-        self.assertTrue(any(h["query"] == "B商品の在庫" for h in final_state["df_history"]))
+        # Check entry from check_history (it should be based on history_entry_A)
+        self.assertTrue(any(h["query"] == "A商品の売上" for h in final_state["df_history"]))
+        # Check entry from sql_node for "B商品の在庫"
+        self.assertTrue(any(h["query"] == "B商品の在庫" and h["SQL"] == "SELECT * FROM B_inventory;" for h in final_state["df_history"]))
 
-        # LLM Calls: classify, extract_req, sql_gen_B, chart_agent_prompt
-        self.assertEqual(mock_llm.invoke.call_count, 4)
+
+        # LLM Calls: classify, sql_gen_B, chart_agent_llm_call
+        self.assertEqual(mock_llm.invoke.call_count, 3)
         llm_calls = mock_llm.invoke.call_args_list
         # Call 1: Classify intent
-        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
         self.assertIn(user_input, str(llm_calls[0].args[0]))
-        # Call 2: Extract data requirements
-        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0]))
-        self.assertIn(user_input, str(llm_calls[1].args[0]))
-        # Call 3: SQL node (for B商品の在庫)
-        self.assertIn("【現在の具体的なデータ取得要件】", str(llm_calls[2].args[0])) # Prompt for sql_node
-        self.assertIn("B商品の在庫", str(llm_calls[2].args[0]))
-        # Call 4: Chart node (agent prompt)
-        # The chart_node's agent is initialized with PythonAstREPLTool, and agent.invoke is called.
-        # The prompt to this agent.invoke is what we check here.
-        agent_chart_prompt = final_state.get("_chart_agent_prompt_for_test", "") # Assuming we store it for test
-                                                                                # Or, get from mock_repl_tool_instance.invoke.call_args
-
-        # The PythonAstREPLTool's .invoke method is called by the agent framework.
-        # The mock_repl_tool is the class, mock_repl_tool_instance is the instance.
-        # The agent's invoke (which is different from the tool's invoke) gets the chart_prompt.
-        # The PythonAstREPLTool itself is not directly invoked with the chart_prompt.
-        # The chart_prompt is for the LLM part of the agent.
-        # So, checking mock_llm.invoke.call_args_list[3] is correct for the agent's LLM call.
-        self.assertIn("最適なグラフをsns(seaborn)で作成して", str(llm_calls[3].args[0]))
-        self.assertIn(user_input, str(llm_calls[3].args[0]))
-        self.assertIn("A商品の売上", str(llm_calls[3].args[0]))
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
+        # Call 2: SQL node (for B商品の在庫)
+        self.assertIn("【現在の具体的なデータ取得要件】", str(llm_calls[1].args[0]))
+        self.assertIn("B商品の在庫", str(llm_calls[1].args[0]))
+        # Call 3: Chart node (agent's LLM call)
+        # The prompt for chart_node's agent includes the user input and data summary
+        self.assertIn("A商品の売上とB商品の在庫をグラフ化", str(llm_calls[2].args[0])) # Detail from plan for chart
+        self.assertIn("A商品の売上", str(llm_calls[2].args[0])) # Presence of data key
+        self.assertIn("B商品の在庫", str(llm_calls[2].args[0])) # Presence of data key
 
 
-        # RAG calls for B商品の在庫 in sql_node
+        # Node mocks
+        mock_check_history_node.assert_called_once()
+
+        # sql_node internal mocks (RAG and DB for B商品の在庫)
         mock_vs_tables.assert_called_once_with("B商品の在庫", k=3)
         mock_vs_queries.assert_called_once_with("B商品の在庫", k=3)
-
-        # DB call for B商品の在庫 in sql_node
         mock_try_sql.assert_called_once_with("SELECT * FROM B_inventory;")
 
-        # The agent.invoke is called with the chart_prompt.
-        # The PythonAstREPLTool instance's invoke method is called by the agent with the generated Python code.
-        # This was mocked as: mock_repl_tool_instance.invoke.return_value = {"output": "Chart tool executed, output.png created"}
-        mock_repl_tool_instance.invoke.assert_called_once() # This confirms the tool (Python code execution) was called.
+        # chart_node internal mocks
+        mock_initialize_agent.assert_called_once()
+        # The agent's invoke method (which calls the LLM) is implicitly tested by mock_llm.invoke call count and args.
+        # mock_python_tool.assert_called_once() # PythonAstREPLTool class is instantiated
+        # We need to check if the tool instance's method (like .run or .invoke) was called by the agent.
+        # The agent framework calls the tool's `run` method with the python code.
+        # For PythonAstREPLTool, it's `run`.
+        mock_python_tool_instance_from_patch = mock_python_tool.return_value
+        mock_python_tool_instance_from_patch.run.assert_called_once_with("print('Chart generated')")
 
-        mock_path_exists.assert_called_once_with("output.png")
+
+        mock_os_path_exists.assert_any_call("output.png") # Called multiple times, once before remove, once after agent
+        self.assertTrue(mock_os_path_exists.call_count >= 1) # Check it was called
         mock_b64encode.assert_called_once_with(b"chart_bytes")
+        mock_open_file.assert_called_once_with("output.png", "rb")
 
 
     @patch('files.backend_codes.llm')
@@ -2519,34 +2514,47 @@ class TestWorkflow(unittest.TestCase):
 
 
     @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.llm') # For classify, sql_node (initial, fix), interpret_node
     @patch('files.backend_codes.check_history_node')
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
     @patch('files.backend_codes.try_sql_execute')
-    @patch('files.backend_codes.extract_sql', side_effect=lambda x: x.replace("```sql", "").replace("```", "").strip())
-    @patch('files.backend_codes.suggest_analysis_paths_node') # To verify it's reached on failure
+    @patch('files.backend_codes.interpret_node') # Mock interpret_node
     def test_workflow_sql_error_recovery_failure(
-        self, mock_suggest_node, mock_extract_sql, mock_try_sql,
-        mock_vs_queries, mock_vs_tables, mock_check_history, mock_llm_invoker
+        self, mock_interpret_node, mock_try_sql,
+        mock_vs_queries, mock_vs_tables, mock_check_history_node, mock_llm
     ):
-        user_input = "Show Problematic Data" # Plan: CH, SQL, Interpret
+        user_input = "Show Problematic Data"
         config = {"configurable": {"thread_id": f"test_sql_rec_fail_{self.id()}"}}
 
-        # LLM Mocks: classify, sql_initial, sql_fix
-        mock_llm_invoker.side_effect = [
-            MagicMock(content="データ取得"), # classify_intent
-            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # Initial SQL
-            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```")  # "Fixed" SQL (still faulty)
+        # LLM Mocks: classify, sql_initial, sql_fix, interpret
+        mock_llm.side_effect = [
+            MagicMock(content="データ取得,データ解釈"), # classify_intent_node
+            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # Initial SQL for sql_node
+            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```"),  # "Fixed" SQL for sql_node (still faulty)
+            MagicMock(content="Could not interpret problematic data due to earlier errors.") # interpret_node
         ]
 
-        # Mock check_history for a miss
-        mock_check_history.return_value = MyState(
+        # Mock check_history_node for a miss
+        # Plan details for check_history: ["Problematic Data"]
+        # Plan details for interpret: "Interpret Problematic Data"
+        mock_check_history_node.return_value = MyState(
+            input=["Problematic Data"], # Set by execute_plan_router from plan
+            intent_list=["データ取得", "データ解釈"],
             latest_df=collections.OrderedDict(),
             missing_data_requirements=["Problematic Data"],
-            condition="history_checked"
+            condition="history_checked",
+            df_history=[],
+            query_history=[user_input],
+            analysis_plan = [ # Simplified plan for context
+                {"action": "check_history", "details": ["Problematic Data"]},
+                {"action": "sql", "details": "Problematic Data"},
+                {"action": "interpret", "details": "Interpret Problematic Data"}
+            ],
+            current_plan_step_index=0
         )
 
-        # DB execution: both attempts fail
+        # DB execution: both attempts fail for sql_node
         mock_try_sql.side_effect = [
             (None, "syntax error near FRMO"),
             (None, "syntax error near FRRMO")
