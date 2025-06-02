@@ -156,80 +156,6 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         "error": None
     }
 
-# """
-# # Execute Planned Step Node (OLD - To be removed)
-# def execute_planned_step_node(state: MyState) -> MyState:
-#     plan = state.get("analysis_plan")
-#     current_index = state.get("current_plan_step_index")
-
-#     if not plan or current_index is None or not (0 <= current_index < len(plan)):
-#         logging.error("Invalid plan or step index in execute_planned_step_node.")
-#         return {**state, "error": "Invalid plan state.", "condition": "plan_error"}
-
-#     current_step = plan[current_index]
-#     action = current_step.get("action")
-#     details = current_step.get("details", "")
-
-#     new_latest_df = state.get("latest_df")
-#     if action == "sql":
-#         new_latest_df = collections.OrderedDict()
-
-#     current_state_for_step = {
-#         **state,
-#         "input": details,
-#         "data_requirements": [details] if action == "sql" and details else [],
-#         "SQL": None,
-#         "interpretation": None,
-#         "chart_result": None,
-#         "error": None,
-#         "latest_df": new_latest_df,
-#         "missing_data_requirements": [],
-#         "clarification_question": None,
-#         "user_clarification": None,
-#         "user_action": None,
-#         "awaiting_step_confirmation": False,
-#         "condition": f"executing_plan_step_{action}"
-#     }
-#     return current_state_for_step
-# """
-
-# """
-# # Plan Step Transition Node (OLD - To be removed)
-# def plan_step_transition_node(state: MyState) -> MyState:
-#     current_index = state.get("current_plan_step_index")
-#     plan_length = len(state.get("analysis_plan", []))
-
-#     if current_index is None:
-#         logging.error("current_plan_step_index is None in plan_step_transition_node")
-#         return {**state, "error": "Plan execution error: step index missing.", "condition": "plan_error_no_index"}
-
-#     next_index = current_index + 1
-
-#     if next_index < plan_length:
-#         next_step_details = state["analysis_plan"][next_index].get("details", "")
-#         next_step_action = state["analysis_plan"][next_index].get("action")
-#         return {
-#             **state,
-#             "current_plan_step_index": next_index,
-#             "awaiting_step_confirmation": True,
-#             "input": next_step_details,
-#             "data_requirements": [next_step_details] if next_step_action == "sql" and next_step_details else [],
-#             "condition": "awaiting_next_step_confirmation"
-#         }
-#     else:
-#         original_query = state.get("complex_analysis_original_query", "")
-#         return {
-#             **state,
-#             "analysis_plan": None,
-#             "current_plan_step_index": None,
-#             "awaiting_step_confirmation": None,
-#             "complex_analysis_original_query": None,
-#             "input": original_query,
-#             "data_requirements": [],
-#             "condition": "plan_completed"
-#         }
-# """
-
 def cancel_analysis_plan_node(state: MyState) -> MyState:
     original_query = state.get("complex_analysis_original_query", "The analysis plan was cancelled.")
     return {
@@ -243,8 +169,6 @@ def cancel_analysis_plan_node(state: MyState) -> MyState:
         "condition": "plan_cancelled",
         "user_action": None
     }
-
-# import json # Removed from here
 
 def extract_sql(sql_text):
     match = re.search(r"```sql\s*(.*?)```", sql_text, re.DOTALL | re.IGNORECASE)
@@ -783,44 +707,6 @@ def classify_intent_node(state):
 
     return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
-# """
-# # データ要件抽出ノード (OLD - to be replaced/removed)
-# def extract_data_requirements_node(state):
-#     user_input = state["input"]
-#     prompt = f"""
-#     ユーザーの質問から、必要となる具体的なデータの要件を抽出してください。
-#     各データ要件は簡潔に記述し、複数ある場合はカンマ区切りで列挙してください。
-
-#     例:
-#     質問: 「A商品の売上集計とお客様属性のクロス集計グラフを出して」
-#     出力: A商品の売上集計,顧客属性データ
-
-#     質問: 「製品Xの月次販売数と、それに対応する主要な競合製品Yの販売数を比較したい。」
-#     出力: 製品Xの月次販売数,競合製品Yの月次販売数
-
-#     質問: 「東京23区内の平均家賃と、各区の人口密度、平均所得を地図上に可視化して。」
-#     出力: 東京23区内の平均家賃,東京23区の人口密度,東京23区の平均所得
-
-#     質問: 「{user_input}」
-#     出力:
-#     """
-#     response = llm.invoke(prompt)
-#     extracted_requirements_str = response.content.strip()
-#     # LLMの出力が空文字列の場合、空のリストを返す
-#     if not extracted_requirements_str:
-#         extracted_requirements = []
-#     else:
-#         extracted_requirements = [req.strip() for req in extracted_requirements_str.split(",") if req.strip()]
-
-#     # print(f"Extracted data requirements: {extracted_requirements}") # DEBUG
-
-#     return {
-#         **state,
-#         "data_requirements": extracted_requirements,
-#         "condition": "データ要件抽出完了"
-#     }
-# """
-
 def clarify_node(state: MyState) -> MyState:
     current_plan_step_index = state.get("current_plan_step_index")
     analysis_plan = state.get("analysis_plan", [])
@@ -902,53 +788,6 @@ def create_analysis_plan_next(state: MyState):
     else:
         logging.warning(f"create_analysis_plan_next: Unknown condition '{condition}'. Routing to END.")
         return END
-
-# """
-# # Conditional logic for execute_planned_step_node (OLD - to be removed)
-# def execute_planned_step_next(state: MyState):
-#     # This node prepares the state for the actual action node (sql, interpret, chart, check_history, clarify)
-#     # The condition was set to "executing_plan_step_{action}"
-#     condition = state.get("condition", "")
-#     action_to_execute = None
-#     if state.get("analysis_plan") and state.get("current_plan_step_index") is not None:
-#         current_idx = state.get("current_plan_step_index")
-#         plan = state.get("analysis_plan")
-#         if 0 <= current_idx < len(plan):
-#             action_to_execute = plan[current_idx].get("action")
-
-#     if action_to_execute == "sql":
-#         return "sql"
-#     elif action_to_execute == "interpret":
-#         return "interpret"
-#     elif action_to_execute == "chart":
-#         return "chart"
-#     elif action_to_execute == "check_history":
-#         return "check_history"
-#     elif action_to_execute == "clarify":
-#         return "clarify" # Route to the new clarify_node
-
-#     # Fallback or error if action isn't known or condition doesn't match
-#     logging.error(f"execute_planned_step_next: Unknown action ('{action_to_execute}') or invalid plan state. Condition: '{condition}'.")
-#     return END
-# """
-
-# """
-# # Conditional logic for plan_step_transition_node (OLD - to be removed)
-# def plan_step_transition_next(state: MyState):
-#     condition = state.get("condition")
-#     if condition == "awaiting_next_step_confirmation":
-#         # State now has awaiting_step_confirmation = True.
-#         # Frontend should get this, display results, and offer "Proceed".
-#         # When user clicks "Proceed", workflow is invoked again.
-#         # classify_next will see awaiting_step_confirmation = True and route to execute_planned_step.
-#         return END
-#     elif condition == "plan_completed":
-#         return "suggest_analysis_paths" # Or END, depending on desired final action
-#     elif condition == "plan_error_no_index": # Error case from plan_step_transition
-#         return END
-#     else: # Should not happen
-#         return END
-# """
 
 def execute_plan_router(state: MyState) -> str:
     if state.get("user_clarification"):
@@ -1093,21 +932,22 @@ def suggest_analysis_paths_node(state: MyState) -> MyState:
                 data_summary_parts.append(f"Data for '{req}': Empty or not available")
     data_summary = "\n".join(data_summary_parts) if data_summary_parts else "No data retrieved or all data was empty."
     recent_query_history_summary = "\n".join(query_history[-3:]) if query_history else "No query history."
-    prompt_for_suggestions = f"""
-You are an intelligent data analysis assistant. Based on the user's recent activity and the data obtained, suggest 2-3 relevant follow-up questions or analysis actions the user might be interested in.
-Format your response as a Python-style list of strings. For example: ["Show sales by region", "Analyze customer churn"]
-If no specific suggestions come to mind or if the data is insufficient for further meaningful analysis, return an empty list: [].
-
-User's original request: "{original_user_input}"
-Summary of current data:
-{data_summary}
-Current interpretation/summary of findings: "{current_interpretation if current_interpretation else 'Not yet available.'}"
-Recent query history:
-{recent_query_history_summary}
-
-Based on this, what are some logical next steps or questions?
-Response (as a Python list of strings):
-"""
+    prompt_for_suggestions = f """
+        You are an intelligent data analysis assistant. Based on the user's recent activity and the data obtained, suggest 2-3 relevant follow-up questions or analysis actions the user might be interested in.
+        Format your response as a Python-style list of strings. For example: ["Show sales by region", "Analyze customer churn"]
+        If no specific suggestions come to mind or if the data is insufficient for further meaningful analysis, return an empty list: [].
+        
+        User's original request: "{original_user_input}"　
+        Summary of current data:
+        {data_summary}
+        Current interpretation/summary of findings: "{current_interpretation if current_interpretation else 'Not yet available.'}"
+        Recent query history:
+        {recent_query_history_summary}
+        
+        Based on this, what are some logical next steps or questions?
+        Response (as a Python list of strings):
+        """
+    
     llm_response_str = "[]"
     if data_summary_parts:
         if "sales" in original_user_input.lower() or "売上" in original_user_input:
@@ -1131,11 +971,8 @@ def build_workflow():
     # Add all nodes
     workflow.add_node("classify", classify_intent_node)
     workflow.add_node("create_analysis_plan", create_analysis_plan_node)
-    # workflow.add_node("execute_planned_step", execute_planned_step_node) # OLD - Replaced by dispatch_plan_step + execute_plan_router
-    # workflow.add_node("plan_step_transition", plan_step_transition_node) # OLD - Replaced
     workflow.add_node("cancel_analysis_plan", cancel_analysis_plan_node)
     workflow.add_node("dispatch_plan_step", lambda state: state) # New dummy node for central routing logic
-    # workflow.add_node("extract_data_requirements", extract_data_requirements_node) # Commented out
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("check_history", check_history_node)
     workflow.add_node("sql", sql_node)
@@ -1150,8 +987,8 @@ def build_workflow():
     workflow.add_conditional_edges("classify", classify_next)
 
     workflow.add_edge("clear_data", END)
-    workflow.add_edge("metadata_retrieval", "suggest_analysis_paths")
-    workflow.add_edge("cancel_analysis_plan", "suggest_analysis_paths")
+    workflow.add_edge("metadata_retrieval", END)
+    workflow.add_edge("cancel_analysis_plan", END)
 
     workflow.add_conditional_edges("create_analysis_plan", create_analysis_plan_next)
 
@@ -1243,5 +1080,3 @@ res = workflow.invoke({"input": user_query}, config=config)
 # current_df_history = current_state.values.get('df_history', [])
 # current_df_history.append(sample_history_entry)
 # workflow.update_state(config, {"df_history": current_df_history})
-
-[end of files/backend_codes.py]
