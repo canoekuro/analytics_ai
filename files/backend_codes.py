@@ -67,7 +67,7 @@ class MyState(TypedDict, total=False):
     analysis_plan: Optional[List[dict]] = None # 分析ステップのリストを格納します。例：[{"action": "sql", "details": "月次総売上"},{"action": "interpret", "details": "月次売上データを解釈"}]
     current_plan_step_index: Optional[int] = None # analysis_plan内の現在のステップのインデックス
     awaiting_step_confirmation: Optional[bool] = None # ユーザーが次のステップに進むのを待機している場合はTrue
-    original_query: Optional[str] = None # 元の複数ステップのクエリを格納します
+    original_query: Optional[str] = None # clarifyが発生したときに元のクエリを格納します
     user_action: Optional[str] = None # "proceed_analysis_step"や"cancel_analysis_plan"のようなフロントエンドアクション用の新しいフィールド
 
 #ユーザーの入力に応じて意図を分類
@@ -194,7 +194,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         # 指示
         - KPI・ブランド・期間など、分析に必要な情報が不足していれば `clarify` を必ずプランの先頭に置いてください。
         - 具体的な情報が揃っている場合は `clarify` は不要です。
-        - 利用可能なアクションはclarify`, `check_history`, `sql`, `chart`, `interpret` です。各アクションの具体的な内容は以下のとおりです。
+        - 利用可能なアクションは`clarify`, `check_history`, `sql`, `chart`, `interpret` です。各アクションの具体的な内容は以下のとおりです。
             - clarify: ユーザーに詳細を質問します。 (例: "期間の指定を求める")
               - "details": (string) ユーザーへの質問文。
             - check_history: 過去に同様のデータが取得されているか確認します。 (例: "'月次売上データ'を確認")
