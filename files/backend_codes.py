@@ -287,7 +287,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
                 raise ValueError("Geminiからのレスポンスに有効な候補またはパートがありません。")
 
             function_call_part = next((part for part in response.candidates[0].content.parts if part.function_call), None)
-            
+
             if not function_call_part:
                 raw_text_response = response.text if hasattr(response, 'text') else "利用可能なテキストレスポンスがありません。"
                 logging.warning(f"Geminiレスポンスにfunction_callが含まれていません。テキストレスポンスを試みます: {raw_text_response}")
@@ -322,7 +322,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
                 allowed_actions = {"clarify", "check_history", "sql", "chart", "interpret", "data_processing"}
                 if step["action"] not in allowed_actions:
                     logging.warning(f"プランに未知のアクション '{step['action']}' が含まれています。")
-            
+
             parsed_plan = plan_steps
 
         except google_exceptions.GoogleAPICallError as e_api:
@@ -340,14 +340,14 @@ def create_analysis_plan_node(state: MyState) -> MyState:
             **state, "analysis_plan": None, "current_plan_step_index": None, "user_clarification": None,
             "condition": "plan_generation_failed", "error": f"分析計画の作成中に予期せぬシステムエラーが発生しました。管理者にご連絡ください。(詳細: {str(e_outer)})"
         }
-        
+
     # current_inputの取得とcomplex_analysis_original_queryのロジックは変更なし
     current_input = state.get("input", "")
     original_query_for_complex = state.get("complex_analysis_original_query")
     if parsed_plan and not original_query_for_complex and \
        ("clarify" in [step.get("action") for step in parsed_plan if isinstance(step, dict)] or user_clarification) :
         original_query_for_complex = user_query
-    
+
     # user_clarification はここで消費されるのでNoneにする
     return {
         **state,
@@ -355,7 +355,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         "analysis_plan": parsed_plan, # parsed_planがNoneの場合もある（エラー時など）
         "current_plan_step_index": 0 if parsed_plan else None,
         "awaiting_step_confirmation": False,
-        "user_clarification": None, 
+        "user_clarification": None,
         "condition": "plan_generated" if parsed_plan else "empty_plan_generated", # エラー時はplan_generation_failedがセットされているはず
         "error": state.get("error") # エラー時はここでセットされたエラーメッセージが維持される
     }

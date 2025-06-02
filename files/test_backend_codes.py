@@ -189,7 +189,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
         # Mock the instance of GenerativeModel
         self.mock_model_instance = MagicMock()
         self.mock_generative_model_cls.return_value = self.mock_model_instance
-        
+
         # This will be configured per test
         self.generate_content_mock = MagicMock()
         self.mock_model_instance.generate_content = self.generate_content_mock
@@ -201,7 +201,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
     def _create_mock_gemini_response(self, plan_steps_dict_or_str, has_function_call=True, text_response=None):
         response_mock = MagicMock()
         part_mock = MagicMock()
-        
+
         if has_function_call:
             function_call_mock = MagicMock()
             # plan_steps_dict_or_str could be a dict for args, or a string if testing string parsing
@@ -235,7 +235,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
         expected_plan = [{"action": "clarify", "details": "Please specify the period for sales data."}]
         mock_response_args = {"plan_steps": expected_plan}
         self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
-        
+
         state = MyState(input="sales data")
         result_state = create_analysis_plan_node(state)
 
@@ -257,7 +257,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
         self.assertEqual(result_state["analysis_plan"], expected_plan)
         self.assertEqual(result_state["condition"], "plan_generated")
         self.generate_content_mock.assert_called_once()
-        
+
     def test_prompt_includes_query_history(self):
         history = ["past query 1", "past query 2"]
         current_query = "current query based on history"
@@ -294,7 +294,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
 
         state = MyState(input="any query")
         result_state = create_analysis_plan_node(state)
-        
+
         self.assertIsNone(result_state["analysis_plan"])
         self.assertEqual(result_state["condition"], "plan_generation_failed")
         self.assertIn("モデル応答の解析に失敗しました", result_state["error"])
@@ -307,7 +307,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
             has_function_call=False,
             text_response="This is not a valid JSON plan."
         )
-        
+
         state = MyState(input="any query")
         result_state = create_analysis_plan_node(state)
 
@@ -318,7 +318,7 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
     def test_successful_plan_from_text_fallback_if_no_function_call(self):
         expected_plan = [{"action": "sql", "details": "data from text"}]
         valid_json_text_response = json.dumps(expected_plan) # '[{"action": "sql", "details": "data from text"}]'
-        
+
         self.generate_content_mock.return_value = self._create_mock_gemini_response(
             plan_steps_dict_or_str=None,
             has_function_call=False,
