@@ -967,10 +967,10 @@ def build_workflow():
 
     return workflow.compile(checkpointer=memory)
 
-user_query = "カテゴリの合計販売金額を出して"
-workflow = build_workflow()
-config = {"configurable": {"thread_id": "2"}}
-res = workflow.invoke({"input": user_query}, config=config)
+# user_query = "カテゴリの合計販売金額を出して"
+# workflow = build_workflow()
+# config = {"configurable": {"thread_id": "2"}}
+# res = workflow.invoke({"input": user_query}, config=config)
 # print(res)
 # sample_history_entry = {
 #     "id": "hist_001",
