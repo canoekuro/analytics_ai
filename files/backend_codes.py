@@ -10,6 +10,7 @@ from langchain.agents import Tool, initialize_agent
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
 import os
 import base64
+import io
 import re
 from typing import TypedDict, List, Optional, Any
 import ast # literal_evalのため
@@ -86,11 +87,12 @@ def classify_intent_node(state: MyState):
 
     prompt = f"""
     ユーザーの質問の意図を判定してください。
-    次の4つのうち、該当するものを「,」区切りで全て列挙してください：
+    次の5つのうち、該当するものを「,」区切りで全て列挙してください：
     - データ取得
     - グラフ作成
     - データ解釈
     - メタデータ検索
+    - データ加工
 
     質問: 「{user_input}」
     例: 
@@ -101,8 +103,9 @@ def classify_intent_node(state: MyState):
     input:「＊＊＊のデータのグラフ化と解釈して」 output:「データ取得,グラフ作成,データ解釈」
     input:「sales_dataテーブルにはどんなカラムがありますか？」 output:「メタデータ検索」
     input:「categoryカラムの情報を教えてください」 output:「メタデータ検索」
+    input:「AとBを結合して」 output:「データ加工」
 
-    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈,メタデータ検索」）だけを必ず返すようにしてください。
+    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈,メタデータ検索,データ加工」）だけを必ず返すようにしてください。
     """
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
@@ -153,6 +156,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
     # モッキング戦略
     mock_plan = []
     plan_json_str = ""
+    intent_list = state.get("intent_list", [])
 
     if user_clarification:
         original_query_for_llm = state.get("complex_analysis_original_query", user_query)
@@ -161,6 +165,8 @@ def create_analysis_plan_node(state: MyState) -> MyState:
             {"action": "sql", "details": "clarified sales data"},
             {"action": "interpret", "details": "interpret clarified sales data"}
         ]
+    elif "データ加工" in intent_list:
+        mock_plan = [{"action": "data_processing", "details": user_query}]
     elif "ambiguous" in user_query.lower() or "vague" in user_query.lower():
         mock_plan = [{"action": "clarify", "details": "Could you please specify the time period for the sales data?"}]
     elif "show sales then chart it" in user_query.lower():
@@ -780,6 +786,171 @@ def chart_node(state: MyState) -> MyState:
         logging.error(f"chart_node: エージェント実行中にエラーが発生しました: {e}", exc_info=True)
         return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)}
 
+def data_processing_node(state: MyState) -> MyState:
+    latest_df_data = state.get("latest_df")
+    processing_instructions = state.get("input", "データフレームに対して指示された処理を実行してください。") # Plan step details
+
+    if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v):
+        return {
+            **state,
+            "latest_df": latest_df_data, # Keep existing data even if empty
+            "condition": "data_processing_failed_no_data",
+            "error": "データ処理のための有効なデータがありません。"
+        }
+
+    df_to_process = None
+    selected_key = None # This will store the key of the df that is chosen for processing
+    processing_context_message = ""
+
+    # New logic: Check for DF_KEY['key_name'] pattern in instructions
+    df_key_match = re.search(r"DF_KEY\['(.*?)'\]", processing_instructions)
+
+    if df_key_match:
+        explicit_key = df_key_match.group(1)
+        if explicit_key in latest_df_data and latest_df_data[explicit_key] and isinstance(latest_df_data[explicit_key], list):
+            try:
+                df_candidate = pd.DataFrame(latest_df_data[explicit_key])
+                if not df_candidate.empty:
+                    df_to_process = df_candidate
+                    selected_key = explicit_key
+                    processing_context_message = f"DF_KEY['{explicit_key}']で指定されたデータと、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                    logging.info(f"data_processing_node: DF_KEY syntax found. Processing DataFrame with key '{selected_key}'.")
+                else:
+                    logging.warning(f"data_processing_node: DF_KEY['{explicit_key}'] found, but the data is empty. Proceeding to fallback selection.")
+            except Exception as e:
+                logging.error(f"data_processing_node: DF_KEY['{explicit_key}'] found, but failed to create DataFrame: {e}. Proceeding to fallback selection.")
+        else:
+            logging.warning(f"data_processing_node: DF_KEY['{explicit_key}'] not found in latest_df_data or data is invalid/empty. Proceeding to fallback selection.")
+
+    # Fallback logic: If DF_KEY was not used, or was invalid.
+    if df_to_process is None:
+        # Try to find a DataFrame based on instruction key reference (original fallback)
+        if isinstance(processing_instructions, str):
+            for key_option in latest_df_data.keys(): # iterate through available DFs
+                # Check if key_option is mentioned in instructions (and not part of a DF_KEY pattern already handled)
+                # This check is simplified; more robust would be to ensure it's not within DF_KEY[...]
+                if key_option.lower() in processing_instructions.lower() and (not df_key_match or key_option != df_key_match.group(1)):
+                    if latest_df_data.get(key_option) and isinstance(latest_df_data[key_option], list) and len(latest_df_data[key_option]) > 0:
+                        try:
+                            df_candidate = pd.DataFrame(latest_df_data[key_option])
+                            if not df_candidate.empty:
+                                df_to_process = df_candidate
+                                selected_key = key_option # Set selected_key here
+                                processing_context_message = f"指示内容で言及されたキー「{selected_key}」のデータと、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                                logging.info(f"data_processing_node: Fallback - Found matching key '{selected_key}' in instructions.")
+                                break # Found a suitable DF by instruction mention
+                        except Exception as e:
+                            logging.error(f"data_processing_node: Fallback - Error creating DataFrame for key '{key_option}': {e}")
+                            continue # Try next key
+            
+        if df_to_process is None: # If still no DF, use the first non-empty one
+            for key_option, data_list in latest_df_data.items():
+                if data_list and isinstance(data_list, list) and len(data_list) > 0:
+                    try:
+                        df_candidate = pd.DataFrame(data_list)
+                        if not df_candidate.empty:
+                            df_to_process = df_candidate
+                            selected_key = key_option # Set selected_key here
+                            processing_context_message = f"利用可能な最初のデータセット「{selected_key}」と、ユーザーからの「{processing_instructions}」という指示に基づいて"
+                            logging.info(f"data_processing_node: Fallback - No specific key matched or DF_KEY invalid. Using first available non-empty DataFrame with key '{selected_key}'.")
+                            if len(latest_df_data) > 1:
+                                 logging.warning(f"data_processing_node: 複数のDataFrameが存在し、特定のDFが指示されなかったため、最初の空でないDataFrame（'{selected_key}'）を使用します。特定のDFを対象にするには DF_KEY['キー名'] を使用してください。")
+                            break
+                    except Exception as e:
+                        logging.error(f"data_processing_node: Fallback - Error creating first available DataFrame for key '{key_option}': {e}")
+                        continue
+    
+    if df_to_process is None or df_to_process.empty:
+        return {
+            **state,
+            "latest_df": latest_df_data,
+            "condition": "data_processing_failed_empty_selected_data",
+            "error": "データ処理に適したデータが見つかりませんでした。"
+        }
+
+    python_tool = PythonAstREPLTool(
+        locals={"df": df_to_process.copy(), "pd": pd}, # dfのコピーを渡すことで、元のREPL環境への影響を限定
+        description="Pythonコードを実行してDataFrameを処理します。処理対象のDataFrameは 'df' として利用可能です。"
+    )
+    tools = [python_tool]
+    agent = initialize_agent(
+        tools, llm, agent="zero-shot-react-description", verbose=True, handle_parsing_errors=True,
+        agent_kwargs={"handle_parsing_errors": "True"} # より堅牢なエラー処理
+    )
+
+    # df.info()の出力を文字列としてキャプチャ
+    buffer = io.StringIO()
+    df_to_process.info(buf=buffer)
+    df_info_str = buffer.getvalue()
+
+    available_dataframes_info = "\n".join([f"- '{key}': {len(value)}行" for key, value in latest_df_data.items() if isinstance(value, list)])
+    
+    prompt_guidance_for_df_selection = ""
+    if len(latest_df_data) > 1:
+        prompt_guidance_for_df_selection = (
+            f"複数のDataFrameが利用可能です。特定のDataFrameを処理対象とする場合、指示内に `DF_KEY['キー名']` という形式で指定してください。\n"
+            f"例: `DF_KEY['sales_data_2023'] 列'A'の値を2倍にする`\n"
+            f"利用可能なDataFrame (キー: 行数):\n{available_dataframes_info}\n"
+            f"DF_KEY構文を使用しない場合、最も適切と思われるDataFrameを自動選択します。\n"
+        )
+
+    processing_prompt = f"""
+    あなたはPythonプログラミングとデータ処理の専門家です。
+    {prompt_guidance_for_df_selection}
+    {processing_context_message}pandas DataFrameに必要な処理を実行してください。
+    処理後のDataFrameは、必ず 'df' という名前の変数に再代入してください。
+    dfの列情報:
+{df_info_str}
+    dfの最初の5行:
+    {df_to_process.head().to_string(index=False)}
+    処理指示: {processing_instructions}
+
+    実行すべきPythonコードのみを考えてください。最終的なDataFrameは 'df' に格納する必要があります。
+    """
+
+    try:
+        agent_response = agent.invoke(processing_prompt)
+        logging.info(f"data_processing_node: Agent response: {agent_response}")
+
+        processed_df = python_tool.globals.get("df")
+
+        if not isinstance(processed_df, pd.DataFrame):
+            logging.error(f"data_processing_node: エージェント実行後、'df' はDataFrameではありません。Type: {type(processed_df)}")
+            # エージェントの出力（思考プロセスや最終的なテキスト応答）をエラーメッセージに含める
+            agent_output_for_error = agent_response.get('output', 'エージェントからの具体的な出力なし') if isinstance(agent_response, dict) else str(agent_response)
+            return {
+                **state,
+                "latest_df": latest_df_data, # Keep original data
+                "condition": "data_processing_failed_bad_output",
+                "error": f"データ処理後、期待されるDataFrame形式ではありませんでした。エージェントの出力: {agent_output_for_error}"
+            }
+        
+        if processed_df.equals(df_to_process):
+            logging.warning("data_processing_node: DataFrameはエージェントによって変更されませんでした。")
+            # ユーザーに通知するか、何もしないかは要件による。ここでは成功として扱うが、interpretationに含めることを検討。
+            # interpretation = state.get("interpretation", "") + "\n注意: データ処理の指示がありましたが、結果のデータに変更はありませんでした。"
+            # state["interpretation"] = interpretation
+
+        # Update latest_df with the processed DataFrame
+        updated_latest_df = latest_df_data.copy() # Make a copy to modify
+        updated_latest_df[selected_key] = processed_df.to_dict(orient="records")
+        
+        return {
+            **state,
+            "latest_df": updated_latest_df,
+            "condition": "data_processing_done",
+            "error": None 
+        }
+
+    except Exception as e:
+        logging.error(f"data_processing_node: エージェント実行または結果処理中にエラー: {e}", exc_info=True)
+        return {
+            **state,
+            "latest_df": latest_df_data, # Keep original data on error
+            "condition": "data_processing_failed_agent_error",
+            "error": f"データ処理エージェントの実行中にエラーが発生しました: {str(e)}"
+        }
+
 def classify_next(state: MyState):
     user_action = state.get("user_action")
     intents = state.get("intent_list", [])
@@ -866,6 +1037,15 @@ def interpret_next(state: MyState):
     logging.warning("interpret_next: 解釈ノードが計画外のコンテキストで実行されました。")
     return END
 
+def data_processing_next(state: MyState):
+    current_index = state.get("current_plan_step_index")
+    if current_index is not None:
+        state["current_plan_step_index"] = current_index + 1
+        state["awaiting_step_confirmation"] = False
+        return "dispatch_plan_step"
+    logging.warning("data_processing_next: データ処理ノードが計画外のコンテキストで実行されました。")
+    return END
+
 # 分析計画（analysis_plan）」の現在ステップに応じて、次にどのノード（処理）に進むかを決定
 def execute_plan_dispatch_step(state: MyState) -> str:
     # Clarify（追加質問）へのユーザー回答があれば、分析プランを再生成する
@@ -906,6 +1086,8 @@ def execute_plan_dispatch_step(state: MyState) -> str:
         return "chart"
     elif action == "interpret":
         return "interpret"
+    elif action == "data_processing":
+        return "data_processing"
     else:
         logging.error(f"プランに未対応のアクション '{action}' が含まれています。")
         state["error"] = f"プランに未対応のアクションが指定されています: {action}"
@@ -925,6 +1107,7 @@ def build_workflow():
     workflow.add_node("sql", sql_node)
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
+    workflow.add_node("data_processing", data_processing_node) # 新しいノードを追加
     workflow.add_node("metadata_retrieval", metadata_retrieval_node)
     workflow.add_node("clear_data", clear_data_node)
     
@@ -946,6 +1129,7 @@ def build_workflow():
             "sql": "sql",
             "chart": "chart",
             "interpret": "interpret",
+            "data_processing": "data_processing", # 新しいノードへのルーティングを追加
             "END": END
         }
     )
@@ -956,6 +1140,14 @@ def build_workflow():
         {
             "dispatch_plan_step": "dispatch_plan_step",
             END: END  # ENDが返される可能性がある場合は明示的にマッピング
+        }
+    )
+    workflow.add_conditional_edges(
+        "data_processing",
+        data_processing_next,
+        {
+            "dispatch_plan_step": "dispatch_plan_step",
+            END: END
         }
     )
     workflow.add_conditional_edges(
