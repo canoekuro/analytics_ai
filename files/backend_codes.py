@@ -540,11 +540,31 @@ def sql_node(state: MyState) -> MyState:
             result_df, sql_error = try_sql_execute(fixed_sql)
             if sql_error:
                 logging.error(f"'{req_string}'に対する修正SQLも失敗しました: {sql_error}。")
-                any_error_occurred = True
                 user_friendly_error = transform_sql_error(sql_error)
-                accumulated_errors.append(f"For '{req_string}': {user_friendly_error}")
+                # Return immediately if SQL execution fails after attempting to fix it
+                return {
+                    **state,
+                    "latest_df": current_latest_df,
+                    "df_history": current_df_history,
+                    "SQL": last_sql_generated,
+                    "condition": "sql_execution_failed",
+                    "error": f"SQLの実行に失敗しました (要件: '{req_string}'): {user_friendly_error}",
+                    "missing_data_requirements": requirements_to_fetch # Keep all requirements as missing if one fails
+                }
 
         if not sql_error and result_df is not None:
+            if result_df.empty:
+                logging.info(f"SQL for '{req_string}' は正常にSQL実行されましたが、データがありませんでした。")
+                # Return immediately if SQL execution returns no data
+                return {
+                    **state,
+                    "latest_df": current_latest_df,
+                    "df_history": current_df_history,
+                    "SQL": last_sql_generated,
+                    "condition": "sql_execution_empty_result",
+                    "error": f"SQLの実行結果が空でした (要件: '{req_string}')。",
+                    "missing_data_requirements": requirements_to_fetch # Keep all requirements as missing if one returns empty
+                }
             result_df_dict = result_df.to_dict(orient="records")
             current_latest_df[req_string] = result_df_dict # 取得したデータをlatest_dfに保存
             successfully_fetched_reqs.append(req_string)
@@ -554,10 +574,18 @@ def sql_node(state: MyState) -> MyState:
                 "dataframe_dict": result_df_dict, "SQL": last_sql_generated
             }
             current_df_history.append(new_history_entry)
-        elif not sql_error and result_df is None: # エラーはないがデータが0件
-             current_latest_df[req_string] = []
-             successfully_fetched_reqs.append(req_string)
+        elif not sql_error and result_df is None: # エラーはないがデータが0件 (念のため残すが、上のdf.emptyでカバーされるはず)
              logging.info(f"SQL for '{req_string}' は正常にSQL実行されましたが、データがありませんでした。")
+             # Return immediately if SQL execution returns no data
+             return {
+                 **state,
+                 "latest_df": current_latest_df,
+                 "df_history": current_df_history,
+                 "SQL": last_sql_generated,
+                 "condition": "sql_execution_empty_result",
+                 "error": f"SQLの実行結果が空でした (要件: '{req_string}')。",
+                 "missing_data_requirements": requirements_to_fetch # Keep all requirements as missing if one returns empty
+             }
 
     # 最終的なconditionを判定
     if not requirements_to_fetch: 
