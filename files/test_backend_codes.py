@@ -2769,5 +2769,197 @@ TestMetadataRetrievalNode.test_metadata_retrieval_vague_question = add_new_metad
 # Note: The "non-existent table" case is already well-covered by test_metadata_retrieval_no_rag_docs_found.
 
 
+class TestDataProcessingNode(unittest.TestCase):
+
+    def setUp(self):
+        self.initial_df_list = [{"colA": 1, "colB": 2}, {"colA": 3, "colB": 4}]
+        self.initial_df = pd.DataFrame(self.initial_df_list)
+        self.default_input_instruction = "Perform some processing on data1"
+        self.default_state = MyState(
+            latest_df=collections.OrderedDict({"data1": self.initial_df_list}),
+            input=self.default_input_instruction,
+        )
+
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.initialize_agent')
+    def test_successful_data_processing_add_column(self, MockInitializeAgent, MockPythonAstREPLTool):
+        mock_agent_instance = MockInitializeAgent.return_value
+
+        # This will be the REPL tool instance created within data_processing_node
+        mock_repl_tool_instance = MockPythonAstREPLTool.return_value
+        # Initialize .globals for the tool instance
+        mock_repl_tool_instance.globals = {"df": self.initial_df.copy(), "pd": pd}
+
+        def agent_invoke_side_effect(prompt_str):
+            # Simulate agent code execution: df['colC'] = df['colA'] * 2
+            # Modify the df in the tool's globals directly
+            current_df = mock_repl_tool_instance.globals["df"]
+            current_df['colC'] = current_df['colA'] * 2
+            mock_repl_tool_instance.globals["df"] = current_df
+            return {"output": "Agent executed: Added colC"}
+
+        mock_agent_instance.invoke.side_effect = agent_invoke_side_effect
+
+        state = self.default_state
+        state["input"] = "Add a new column 'colC' where colC = colA * 2 for data1"
+        result_state = data_processing_node(state)
+
+        self.assertEqual(result_state["condition"], "data_processing_done")
+        self.assertIsNone(result_state.get("error"))
+
+        processed_df_list = result_state["latest_df"]["data1"]
+        processed_df = pd.DataFrame(processed_df_list)
+
+        expected_df = self.initial_df.copy()
+        expected_df['colC'] = expected_df['colA'] * 2
+        pd.testing.assert_frame_equal(processed_df, expected_df)
+        MockInitializeAgent.assert_called_once()
+        MockPythonAstREPLTool.assert_called_once()
+
+
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.initialize_agent')
+    def test_data_processing_specific_key_filter(self, MockInitializeAgent, MockPythonAstREPLTool):
+        mock_agent_instance = MockInitializeAgent.return_value
+        mock_repl_tool_instance = MockPythonAstREPLTool.return_value
+
+        df1_list = [{"id": 1, "val": 10}, {"id": 2, "val": 20}]
+        df2_list = [{"id": 3, "val": 5}, {"id": 4, "val": 15}]
+        initial_latest_df = collections.OrderedDict({
+            "dataOne": df1_list,
+            "dataTwo": df2_list
+        })
+        # The tool will be initialized with dataTwo
+        mock_repl_tool_instance.globals = {"df": pd.DataFrame(df2_list).copy(), "pd": pd}
+
+
+        def agent_invoke_side_effect(prompt_str):
+            # Simulate agent: df = df[df['val'] > 10] for dataTwo
+            current_df = mock_repl_tool_instance.globals["df"]
+            mock_repl_tool_instance.globals["df"] = current_df[current_df['val'] > 10]
+            return {"output": "Agent executed: Filtered dataTwo"}
+
+        mock_agent_instance.invoke.side_effect = agent_invoke_side_effect
+
+        state = MyState(
+            latest_df=initial_latest_df,
+            input="For dataTwo, filter rows where val > 10"
+        )
+        result_state = data_processing_node(state)
+
+        self.assertEqual(result_state["condition"], "data_processing_done")
+        self.assertIsNone(result_state.get("error"))
+
+        # dataOne should be unchanged
+        pd.testing.assert_frame_equal(pd.DataFrame(result_state["latest_df"]["dataOne"]), pd.DataFrame(df1_list))
+
+        # dataTwo should be processed
+        processed_df2 = pd.DataFrame(result_state["latest_df"]["dataTwo"])
+        expected_df2 = pd.DataFrame([{"id": 4, "val": 15}]) # Only id 4, val 15 remains
+        pd.testing.assert_frame_equal(processed_df2, expected_df2, check_dtype=False) # Dtype can change with filtering
+
+    def test_no_suitable_dataframe_error_empty_latest_df(self):
+        state = MyState(latest_df=collections.OrderedDict(), input="Process something")
+        result_state = data_processing_node(state)
+        self.assertEqual(result_state["condition"], "data_processing_failed_no_data")
+        self.assertIn("データ処理のための有効なデータがありません。", result_state["error"])
+
+    def test_no_suitable_dataframe_error_target_key_not_found(self):
+        state = MyState(
+            latest_df=collections.OrderedDict({"actual_data": self.initial_df_list}),
+            input="Process non_existent_data" # Instruction refers to a key not in latest_df
+        )
+        # Fallback logic should pick "actual_data", so this test needs to ensure fallback also fails if actual_data was empty
+        # Or, if the goal is to test "selected_key not found and THEN fallback fails", make fallback fail.
+        state_target_key_not_found_empty_fallback = MyState(
+            latest_df=collections.OrderedDict({"actual_data": []}), # Fallback target is empty
+            input="Process non_existent_data"
+        )
+        result_state = data_processing_node(state_target_key_not_found_empty_fallback)
+        self.assertEqual(result_state["condition"], "data_processing_failed_empty_selected_data")
+        self.assertIn("データ処理に適したデータが見つかりませんでした。", result_state["error"])
+
+
+    def test_no_suitable_dataframe_error_target_df_is_empty_list(self):
+        state = MyState(
+            latest_df=collections.OrderedDict({"data1": []}), # Target DataFrame is an empty list
+            input="Process data1"
+        )
+        result_state = data_processing_node(state)
+        self.assertEqual(result_state["condition"], "data_processing_failed_empty_selected_data")
+        self.assertIn("データ処理に適したデータが見つかりませんでした。", result_state["error"])
+
+
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.initialize_agent')
+    def test_agent_returns_non_dataframe(self, MockInitializeAgent, MockPythonAstREPLTool):
+        mock_agent_instance = MockInitializeAgent.return_value
+        mock_repl_tool_instance = MockPythonAstREPLTool.return_value
+        mock_repl_tool_instance.globals = {"df": self.initial_df.copy(), "pd": pd}
+
+        def agent_invoke_side_effect(prompt_str):
+            # Simulate agent code execution resulting in non-DataFrame
+            mock_repl_tool_instance.globals["df"] = "This is not a DataFrame"
+            return {"output": "Agent executed: Returned a string"}
+
+        mock_agent_instance.invoke.side_effect = agent_invoke_side_effect
+
+        result_state = data_processing_node(self.default_state)
+
+        self.assertEqual(result_state["condition"], "data_processing_failed_bad_output")
+        self.assertIn("期待されるDataFrame形式ではありませんでした。", result_state["error"])
+        self.assertIn("Agent executed: Returned a string", result_state["error"])
+
+
+    @patch('files.backend_codes.initialize_agent')
+    def test_agent_execution_error_invoke_raises_exception(self, MockInitializeAgent):
+        mock_agent_instance = MockInitializeAgent.return_value
+        error_message = "Agent_invoke_failed_with_exception"
+        mock_agent_instance.invoke.side_effect = Exception(error_message)
+
+        # Need to ensure PythonAstREPLTool is also mocked if its constructor is called before agent.invoke
+        # For this test, initialize_agent is called, then agent.invoke.
+        # If PythonAstREPLTool constructor is called *before* initialize_agent (it's not), that would need mocking.
+        # Here, we only need to mock initialize_agent to return our mock_agent_instance.
+        # The PythonAstREPLTool will be instantiated with the real one, but its methods won't be an issue
+        # if agent.invoke fails before the tool is heavily used.
+
+        with patch('files.backend_codes.PythonAstREPLTool'): # Patch it to avoid issues if it's constructed
+            result_state = data_processing_node(self.default_state)
+
+        self.assertEqual(result_state["condition"], "data_processing_failed_agent_error")
+        self.assertIn(error_message, result_state["error"])
+
+
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.initialize_agent')
+    def test_data_processing_no_change_to_df(self, MockInitializeAgent, MockPythonAstREPLTool):
+        mock_agent_instance = MockInitializeAgent.return_value
+        mock_repl_tool_instance = MockPythonAstREPLTool.return_value
+
+        # Initialize globals with a copy of the initial DataFrame
+        mock_repl_tool_instance.globals = {"df": self.initial_df.copy(), "pd": pd}
+
+        def agent_invoke_side_effect(prompt_str):
+            # Simulate agent code that technically runs but makes no changes to 'df'
+            # For example, it might assign to a different variable or do a read-only operation.
+            # The 'df' in globals remains the same as initial_df.
+            return {"output": "Agent executed: No change to df"}
+
+        mock_agent_instance.invoke.side_effect = agent_invoke_side_effect
+
+        result_state = data_processing_node(self.default_state)
+
+        self.assertEqual(result_state["condition"], "data_processing_done") # Still considered done
+        self.assertIsNone(result_state.get("error"))
+
+        processed_df_list = result_state["latest_df"]["data1"]
+        processed_df = pd.DataFrame(processed_df_list)
+
+        # DataFrame should be identical to the original
+        pd.testing.assert_frame_equal(processed_df, self.initial_df)
+        # This test also implicitly checks that logging.warning for "no change" doesn't crash.
+
+
 if __name__ == '__main__':
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
