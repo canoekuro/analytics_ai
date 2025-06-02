@@ -1,6 +1,7 @@
 import streamlit as st
 import base64
 import pandas as pd
+import plotly.io as pio
 # from PIL import Image # 未使用
 # from io import BytesIO # 未使用
 # import time # Streamlitのst.statusを使用するため、手動のtime.sleepは不要になります
@@ -117,9 +118,14 @@ with history_container:
                         st.write("取得されたデータはありません。 (旧形式)")
                 # else: 状態が破損している場合、他の型である可能性があります。とりあえず無視します
 
-            if "chart_result" in entry and entry["chart_result"]:
-                chart_img = base64.b64decode(entry["chart_result"])
-                st.image(chart_img, caption="AI生成グラフ")
+            if "chart_result" in entry and entry["chart_result"] and isinstance(entry["chart_result"], str):
+                try:
+                    fig = pio.from_json(entry["chart_result"])
+                    st.plotly_chart(fig)
+                except Exception as e:
+                    st.error(f"グラフの表示に失敗しました (Plotly JSONエラー): {e}")
+                    # Optionally display raw data for debugging:
+                    # st.text_area("エラーが発生したグラフデータ:", value=entry["chart_result"], height=100)
 
 # 3.2 ユーザー入力受付 & Clarification Handling
 if st.session_state.awaiting_clarification_input and st.session_state.clarification_question_text:
@@ -338,8 +344,14 @@ if st.session_state.disabled: # これは、ユーザーが新しい入力また
                     st.write("取得されたデータはありません。 (旧形式)")
             # else: 状態が破損している場合、他の型である可能性があります。とりあえず無視します
 
-        if "chart_result" in res and res["chart_result"]:
-            st.image(base64.b64decode(res["chart_result"]), caption="AI生成グラフ")
+        if "chart_result" in res and res["chart_result"] and isinstance(res["chart_result"], str):
+            try:
+                fig_live = pio.from_json(res["chart_result"])
+                st.plotly_chart(fig_live)
+            except Exception as e:
+                st.error(f"ライブグラフの表示に失敗しました (Plotly JSONエラー): {e}")
+                # Optionally display raw data for debugging:
+                # st.text_area("エラーが発生したライブグラフデータ:", value=res["chart_result"], height=100)
 
         # --- 分析オプションの表示（もしあれば）---
         if "analysis_options" in res and res["analysis_options"] and isinstance(res["analysis_options"], list) and len(res["analysis_options"]) > 0:
