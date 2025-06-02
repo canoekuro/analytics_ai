@@ -1,7 +1,7 @@
 # 【重要！！】コメントアウトやエラーメッセージはできる限り日本語で残すこと。
 
 from langchain_community.vectorstores import FAISS
-import difflib # Make sure this import is added at the top of the file
+import difflib # このインポートがファイルの先頭に追加されていることを確認してください
 import sqlite3
 import pandas as pd
 import logging
@@ -12,34 +12,34 @@ import os
 import base64
 import re
 from typing import TypedDict, List, Optional, Any
-import ast # For literal_eval
+import ast # literal_evalのため
 from langgraph.checkpoint.memory import MemorySaver
 import uuid
 from datetime import datetime
 import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-import json # Moved import json to the top
+import json # import jsonを先頭に移動しました
 
-# Configure basic logging
+# 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
 google_api_key = os.getenv("GOOGLE_API_KEY")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # Or other suitable Gemini embedding model
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # または他の適切なGemini埋め込みモデル
 SIMILARITY_THRESHOLD = 0.8
 
 # ベクトルストア
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
 
-# Get LLM model name from environment variable, with a default
+# 環境変数からLLMモデル名を取得します（デフォルト値あり）
 llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-2.0-flash-lite")
 
 llm = ChatGoogleGenerativeAI(
     model=llm_model_name,
     temperature=0,
     google_api_key=google_api_key
-) # Or "gemini-1.5-flash", "gemini-1.5-pro" for higher capabilities
+) # または、より高性能な "gemini-1.5-flash"、"gemini-1.5-pro"
 
 DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
 
@@ -49,7 +49,7 @@ class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
     condition: Optional[str]         # 各ノードの実行状態
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
-    latest_df: Optional[collections.OrderedDict[str, list]] # Changed: Dict mapping requirement to its dataframe (list of records)
+    latest_df: Optional[collections.OrderedDict[str, list]] # 変更：要件をそのデータフレーム（レコードのリスト）にマッピングする辞書
     df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
     SQL: Optional[str]               # 生成されたSQL
     interpretation: Optional[str]    # データ解釈（分析コメント）
@@ -58,15 +58,15 @@ class MyState(TypedDict, total=False):
     error: Optional[str]             # SQL等でエラーがあれば
     query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
     data_requirements: List[str]     # データ要件
-    missing_data_requirements: Optional[List[str]] # New: List of data requirements not found in history
+    missing_data_requirements: Optional[List[str]] # 新規：履歴に見つからなかったデータ要件のリスト
     clarification_question: Optional[str] = None
     analysis_options: Optional[List[str]] = None
     user_clarification: Optional[str] = None
-    analysis_plan: Optional[List[dict]] = None # Stores the list of analysis steps, e.g., [{"action": "sql", "details": "Overall monthly sales"}, {"action": "interpret", "details": "Interpret monthly sales data"}]
-    current_plan_step_index: Optional[int] = None # Index of the current step in analysis_plan
-    awaiting_step_confirmation: Optional[bool] = None # True if waiting for user to proceed to next step
-    complex_analysis_original_query: Optional[str] = None # Stores the original multi-step query
-    user_action: Optional[str] = None # New field for frontend actions like "proceed_analysis_step" or "cancel_analysis_plan"
+    analysis_plan: Optional[List[dict]] = None # 分析ステップのリストを格納します。例：[{"action": "sql", "details": "月次総売上"},{"action": "interpret", "details": "月次売上データを解釈"}]
+    current_plan_step_index: Optional[int] = None # analysis_plan内の現在のステップのインデックス
+    awaiting_step_confirmation: Optional[bool] = None # ユーザーが次のステップに進むのを待機している場合はTrue
+    complex_analysis_original_query: Optional[str] = None # 元の複数ステップのクエリを格納します
+    user_action: Optional[str] = None # "proceed_analysis_step"や"cancel_analysis_plan"のようなフロントエンドアクション用の新しいフィールド
 
 #ユーザーの入力に応じて意図を分類
 def classify_intent_node(state: MyState):
@@ -145,12 +145,12 @@ def clear_data_node(state: MyState):
         "query_history": []
     }
     
-# New Analysis Planning Node (create_analysis_plan_node)
+# 新しい分析計画ノード (create_analysis_plan_node)
 def create_analysis_plan_node(state: MyState) -> MyState:
     user_query = state.get("input", "")
     user_clarification = state.get("user_clarification")
 
-    # Mocking Strategy
+    # モッキング戦略
     mock_plan = []
     plan_json_str = ""
 
@@ -188,7 +188,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
     try:
         plan_json_str = json.dumps(mock_plan)
     except Exception as e:
-        logging.error(f"Error serializing mock_plan to JSON: {e}")
+        logging.error(f"mock_planのJSONへのシリアル化中にエラーが発生しました: {e}")
         return {
             **state,
             "analysis_plan": None,
@@ -267,7 +267,7 @@ def clarify_node(state: MyState) -> MyState:
 
 # 追加質問をした際に、実行をキャンセルした際のノード
 def cancel_analysis_plan_node(state: MyState) -> MyState:
-    original_query = state.get("complex_analysis_original_query", "The analysis plan was cancelled.")
+    original_query = state.get("complex_analysis_original_query", "分析計画はキャンセルされました。")
     return {
         **state,
         "analysis_plan": None,
@@ -275,7 +275,7 @@ def cancel_analysis_plan_node(state: MyState) -> MyState:
         "awaiting_step_confirmation": False,
         "complex_analysis_original_query": None,
         "input": original_query,
-        "interpretation": "The multi-step analysis plan has been cancelled by the user.",
+        "interpretation": "複数ステップの分析計画はユーザーによってキャンセルされました。",
         "condition": "plan_cancelled",
         "user_action": None
     }
@@ -313,13 +313,13 @@ def check_history_node(state: MyState) -> MyState:
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": safe_details_for_error_msg,
             "condition": "history_checked_invalid_plan_or_index",
-            "error": f"Invalid current_plan_step_index ({current_plan_step_index}) for analysis_plan length ({len(analysis_plan) if analysis_plan else 0}) in check_history_node."
+            "error": f"check_history_nodeにおいて、analysis_planの長さ（{len(analysis_plan) if analysis_plan else 0}）に対して無効なcurrent_plan_step_index（{current_plan_step_index}）です。"
         }
 
     # df_historyを取得する
     df_history = state.get("df_history", [])
     data_requirements_for_step = []
-    current_step_details = state.get("input") # This is set by execute_plan_router to current_step["details"]
+    current_step_details = state.get("input") # これはexecute_plan_routerによってcurrent_step["details"]に設定されます
 
     # inputが文字列の場合はリスト化、リストならそのまま
     if isinstance(current_step_details, str):
@@ -407,7 +407,7 @@ def parse_llm_list_output(llm_output_str: str) -> List[str]:
             return parsed_list
         return []
     except (ValueError, SyntaxError) as e:
-        logging.warning(f"Failed to parse LLM list output with ast.literal_eval: {e}. Original string: '{llm_output_str}'. Falling back to newline split.")
+        logging.warning(f"ast.literal_evalによるLLMリスト出力の解析に失敗しました: {e}。元の文字列: '{llm_output_str}'。改行による分割にフォールバックします。")
         str_for_split = llm_output_str.strip()
         if str_for_split.startswith('[') and str_for_split.endswith(']'):
             str_for_split = str_for_split[1:-1]
@@ -426,7 +426,7 @@ def try_sql_execute(sql_text):
         df = pd.read_sql(sql_text, conn)
         return df, None
     except Exception as e:
-        logging.error(f"SQL execution failed. Error: {e}\nSQL: {sql_text}", exc_info=True)
+        logging.error(f"SQLの実行に失敗しました。エラー: {e}\nSQL: {sql_text}", exc_info=True)
         return None, str(e)
 
 #SQLのエラーがあった際にエラー内容を日本語にする
@@ -477,7 +477,7 @@ def sql_node(state: MyState) -> MyState:
             **state,
             "condition": "sql_execution_skipped_no_reqs",
             "SQL": None,
-            "error": "No requirements provided for SQL execution."
+            "error": "SQL実行のための要件が提供されていません。"
         }
 
     # latest_dfは必ずOrderedDictにして、すでにデータがあれば引き継ぐ
@@ -487,7 +487,7 @@ def sql_node(state: MyState) -> MyState:
 
     # 全体の質問文脈（Clarify含む）があればそちら、なければ直近入力
     current_df_history = state.get("df_history", [])
-    overall_user_input_context = state.get("complex_analysis_original_query", state.get("input", ""))
+    overall_user_input_context = state.get("complex_analysis_original_query", state.get("input", "")) # これはexecute_plan_routerによってcurrent_step["details"]に設定されます
     
     last_sql_generated = None
     any_error_occurred = False
@@ -534,12 +534,12 @@ def sql_node(state: MyState) -> MyState:
         result_df, sql_error = try_sql_execute(sql_generated_clean)
 
         if sql_error:
-            logging.warning(f"Initial SQL for '{req_string}' failed: {sql_error}. Retrying with fix.")
+            logging.warning(f"'{req_string}'に対する最初のSQLが失敗しました: {sql_error}。修正して再試行します。")
             fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, req_string)
-            last_sql_generated = fixed_sql
+            last_sql_generated = fixed_sql # この要件に対する最新のSQL試行を保存
             result_df, sql_error = try_sql_execute(fixed_sql)
             if sql_error:
-                logging.error(f"Fixed SQL for '{req_string}' also failed: {sql_error}.")
+                logging.error(f"'{req_string}'に対する修正SQLも失敗しました: {sql_error}。")
                 any_error_occurred = True
                 user_friendly_error = transform_sql_error(sql_error)
                 accumulated_errors.append(f"For '{req_string}': {user_friendly_error}")
@@ -586,7 +586,7 @@ def sql_node(state: MyState) -> MyState:
 def interpret_node(state: MyState) -> MyState:
     latest_df_data = state.get("latest_df")
     # 解釈用の文脈は state.input（execute_plan_router が plan step details からセット）を利用
-    plan_details_context = state.get("input", "全般的な傾向") # Default if no specific detail
+    plan_details_context = state.get("input", "全般的な傾向") # 特定の詳細がない場合のデフォルト
 
     if latest_df_data is None:
         logging.info("interpret_node: latest_dfがNoneのため、解釈できるデータがありません。")
@@ -596,7 +596,7 @@ def interpret_node(state: MyState) -> MyState:
         logging.error(f"interpret_node: latest_dfの型がOrderedDictではありません (type: {type(latest_df_data)}).")
         return {**state, "interpretation": "データの形式が不正です (OrderedDictではありません)。", "condition": "interpretation_failed_bad_format"}
 
-    if not latest_df_data: # Check if the OrderedDict is empty
+    if not latest_df_data: # OrderedDictが空かどうかを確認
         logging.info("interpret_node: latest_dfが空（データ無し）です。")
         return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"}
 
@@ -612,14 +612,14 @@ def interpret_node(state: MyState) -> MyState:
                 else:
                     full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータは空でした)\n\n"
             except Exception as e:
-                logging.error(f"interpret_node: Error converting data for '{req_string}' to DataFrame: {e}")
+                logging.error(f"interpret_node: '{req_string}'のデータをDataFrameに変換中にエラーが発生しました: {e}")
                 full_data_string += f"■「{req_string}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n"
         else:
             full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータはありませんでした)\n\n"
 
     # 一応OrderedDictとしてデータ構造はあるが、中身が全て空リストや形式エラーで“実質的に有効なデータが1件も無い”」場合にキャッチ
     # 例{"2022年売上": [], "2023年売上": []}
-    processed_parts = [part for part in full_data_string.split("■")[1:] if part] # Get non-empty parts after splitting by "■"
+    processed_parts = [part for part in full_data_string.split("■")[1:] if part] # "■"で分割した後、空でない部分を取得
     all_parts_indicate_no_data = all(
         "(この要件に対するデータはありませんでした)" in part or \
         "(データ形式エラーのため表示できません)" in part or \
@@ -646,13 +646,13 @@ def interpret_node(state: MyState) -> MyState:
         interpretation_text = response.content.strip() if response.content else ""
 
         if not interpretation_text:
-            logging.warning("interpret_node: LLM returned empty interpretation.")
+            logging.warning("interpret_node: LLMが空の解釈を返しました。")
             final_condition = "interpretation_failed"
             interpretation_text = "解釈の生成に失敗しました。"
         else:
             final_condition = "interpretation_done"
     except Exception as e:
-        logging.error(f"interpret_node: Exception during LLM call: {e}")
+        logging.error(f"interpret_node: LLM呼び出し中に例外が発生しました: {e}")
         interpretation_text = "解釈中にエラーが発生しました。"
         final_condition = "interpretation_failed"
     return {**state, "interpretation": interpretation_text, "condition": final_condition}
@@ -660,19 +660,19 @@ def interpret_node(state: MyState) -> MyState:
 
 def chart_node(state: MyState) -> MyState:
     latest_df_data = state.get("latest_df")
-    # Charting instructions from plan step details, now in state.input
+    # 計画ステップ詳細からのグラフ作成指示（現在はstate.input内）
     chart_instructions = state.get("input", "Generate a suitable chart for the available data.")
 
-    if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v): # ensure at least one df has data
+    if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v): # 少なくとも1つのdfにデータがあることを確認
         return {**state, "chart_result": None, "condition": "chart_generation_failed_no_data"}
 
     df_to_plot = None
     selected_key_for_chart = None
 
-    # Attempt to select DataFrame based on chart_instructions referencing a key
+    # chart_instructionsがキーを参照している場合、それに基づいてDataFrameを選択しようと試みます
     if isinstance(chart_instructions, str):
         for key in latest_df_data.keys():
-            # Ensure data for the key is not empty before considering it a match
+            # それを一致と見なす前に、キーのデータが空でないことを確認してください
             if latest_df_data.get(key) and isinstance(latest_df_data[key], list) and len(latest_df_data[key]) > 0 and key.lower() in chart_instructions.lower():
                 selected_key_for_chart = key
                 break
@@ -684,13 +684,13 @@ def chart_node(state: MyState) -> MyState:
                 df_to_plot = df_candidate
                 chart_context_message = f"以下の「{selected_key_for_chart}」に関するデータと、ユーザーからの「{chart_instructions}」という指示に基づいて"
             else:
-                logging.warning(f"chart_node: DataFrame for selected key '{selected_key_for_chart}' is empty.")
-                selected_key_for_chart = None # Nullify to trigger fallback
+                logging.warning(f"chart_node: 選択されたキー '{selected_key_for_chart}' のDataFrameが空です。")
+                selected_key_for_chart = None # フォールバックをトリガーするために無効化
         except Exception as e:
-            logging.error(f"chart_node: Error creating DataFrame for selected key '{selected_key_for_chart}': {e}")
-            selected_key_for_chart = None # Nullify to trigger fallback
+            logging.error(f"chart_node: 選択されたキー '{selected_key_for_chart}' のDataFrame作成中にエラーが発生しました: {e}")
+            selected_key_for_chart = None # フォールバックをトリガーするために無効化
 
-    if df_to_plot is None: # Fallback: use the first non-empty DataFrame
+    if df_to_plot is None: # フォールバック：最初の空でないDataFrameを使用
         for key, data_list in latest_df_data.items():
             if data_list and isinstance(data_list, list) and len(data_list) > 0:
                 try:
@@ -699,11 +699,11 @@ def chart_node(state: MyState) -> MyState:
                         df_to_plot = df_candidate
                         selected_key_for_chart = key
                         chart_context_message = f"以下の「{selected_key_for_chart}」に関するデータ（複数あるデータセットの最初で、有効なデータを含むもの）と、ユーザーからの「{chart_instructions}」という指示に基づいて"
-                        if len(latest_df_data) > 1 and (not isinstance(chart_instructions, str) or selected_key_for_chart.lower() not in chart_instructions.lower()): # Check if chart_instructions is not str OR selected_key not in chart_instructions
-                            logging.warning(f"chart_node: Multiple DataFrames available. Defaulting to first non-empty one ('{selected_key_for_chart}') due to generic or non-matching chart instructions: '{chart_instructions}'.")
+                        if len(latest_df_data) > 1 and (not isinstance(chart_instructions, str) or selected_key_for_chart.lower() not in chart_instructions.lower()): # chart_instructionsが文字列でないか、またはselected_keyがchart_instructionsに含まれていないかを確認
+                            logging.warning(f"chart_node: 複数のDataFrameが利用可能です。一般的または不一致のグラフ作成指示（'{chart_instructions}'）のため、最初の空でないDataFrame（'{selected_key_for_chart}'）をデフォルトとします。")
                         break
                 except Exception as e:
-                    logging.error(f"chart_node: Error creating DataFrame from latest_df key '{key}' during fallback: {e}")
+                    logging.error(f"chart_node: フォールバック中にlatest_dfキー '{key}' からDataFrameを作成中にエラーが発生しました: {e}")
                     continue
 
     if df_to_plot is None or df_to_plot.empty:
@@ -719,7 +719,7 @@ def chart_node(state: MyState) -> MyState:
     tools = [python_tool]
     agent = initialize_agent(
         tools, llm, agent="zero-shot-react-description", verbose=True, handle_parsing_errors=True,
-        agent_kwargs={"handle_parsing_errors": True} # Added for more robust error handling if LLM output is bad for agent
+        agent_kwargs={"handle_parsing_errors": True} # LLMの出力がエージェントにとって不適切だった場合の、より堅牢なエラー処理のために追加
     )
 
     chart_prompt = f"""
@@ -743,13 +743,13 @@ def chart_node(state: MyState) -> MyState:
             fig = base64.b64encode(open("output.png", "rb").read()).decode('utf-8')
             return {**state, "chart_result": fig, "condition": "chart_generation_done"}
         else:
-            logging.error("chart_node: Agent executed but output.png was not found. Agent output might indicate why.")
+            logging.error("chart_node: エージェントは実行されましたが、output.pngが見つかりませんでした。エージェントの出力に理由が示されている可能性があります。")
             error_message = "グラフファイルの生成に失敗しました。"
             if isinstance(agent_response, dict) and "output" in agent_response:
-                error_message += f" (Agent: {agent_response['output']})"
+                error_message += f" (エージェント: {agent_response['output']})"
             return {**state, "chart_result": None, "condition": "chart_generation_failed_no_output_file", "error": error_message}
     except Exception as e:
-        logging.error(f"chart_node: Error during agent execution: {e}", exc_info=True)
+        logging.error(f"chart_node: エージェント実行中にエラーが発生しました: {e}", exc_info=True)
         return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)}
 
 def classify_next(state: MyState):
@@ -786,7 +786,7 @@ def clarify_next(state: MyState):
     elif condition == "clarify_error_invalid_plan" or condition == "clarify_error_unexpected_action":
         return END
     else:
-        logging.warning(f"clarify_next: Unexpected condition '{condition}' from clarify_node. Defaulting to END.")
+        logging.warning(f"clarify_next: clarify_nodeから予期しない状態 '{condition}' が返されました。ENDにデフォルト設定します。")
         return END
 
 def create_analysis_plan_next(state: MyState):
@@ -798,10 +798,10 @@ def create_analysis_plan_next(state: MyState):
         logging.info("create_analysis_plan_next: Empty plan generated. Routing to END")
         return END
     elif condition == "plan_generation_failed":
-        logging.error("create_analysis_plan_next: Plan generation failed. Routing to END.")
+        logging.error("create_analysis_plan_next: 分析計画の生成に失敗しました。ENDにルーティングします。")
         return END
     else:
-        logging.warning(f"create_analysis_plan_next: Unknown condition '{condition}'. Routing to END.")
+        logging.warning(f"create_analysis_plan_next: 不明な状態 '{condition}' です。ENDにルーティングします。")
         return END
 
 def check_history_next(state: MyState):
@@ -817,7 +817,7 @@ def sql_next(state: MyState):
         state["current_plan_step_index"] = current_index + 1
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
-    logging.warning("sql_next: SQL node executed outside of a planned context.")
+    logging.warning("sql_next: SQLノードが計画外のコンテキストで実行されました。")
     return END
 
 def chart_next(state: MyState):
@@ -826,7 +826,7 @@ def chart_next(state: MyState):
         state["current_plan_step_index"] = current_index + 1
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
-    logging.warning("chart_next: Chart node executed outside of a planned context.")
+    logging.warning("chart_next: チャートノードが計画外のコンテキストで実行されました。")
     return END
 
 def interpret_next(state: MyState):
@@ -835,14 +835,14 @@ def interpret_next(state: MyState):
         state["current_plan_step_index"] = current_index + 1
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
-    logging.warning("interpret_next: Interpret node executed outside of a planned context.")
+    logging.warning("interpret_next: 解釈ノードが計画外のコンテキストで実行されました。")
     return END
 
 # 分析計画（analysis_plan）」の現在ステップに応じて、次にどのノード（処理）に進むかを決定
-def execute_plan_router(state: MyState) -> str:
+def execute_plan_route_step(state: MyState) -> str:
     # Clarify（追加質問）へのユーザー回答があれば、分析プランを再生成する
     if state.get("user_clarification"):
-        logging.info("execute_plan_router: ユーザーの追加情報が入力されたため、分析プランを再作成します。")
+        logging.info("execute_plan_route_step: ユーザーの追加情報が入力されたため、分析プランを再作成します。")
         return "create_analysis_plan"
     
     analysis_plan = state.get("analysis_plan")
@@ -850,7 +850,7 @@ def execute_plan_router(state: MyState) -> str:
 
     # プランが存在しない・インデックスが不正・プラン完了時は初期化して提案ノードに遷移
     if not analysis_plan or current_plan_step_index is None or not (0 <= current_plan_step_index < len(analysis_plan)):
-        logging.info("execute_plan_router: プランが完了、または不正な状態です。")
+        logging.info("execute_plan_route_step: プランが完了、または不正な状態です。")
         state["analysis_plan"] = None
         state["current_plan_step_index"] = None
         state["awaiting_step_confirmation"] = False
@@ -858,7 +858,7 @@ def execute_plan_router(state: MyState) -> str:
         
     current_step = analysis_plan[current_plan_step_index]
     action = current_step.get("action")
-    logging.info(f"execute_plan_router: Dispatching to action '{action}' for step {current_plan_step_index}.")
+    logging.info(f"execute_plan_route_step: Dispatching to action '{action}' for step {current_plan_step_index}.")
     details = current_step.get("details", "")
     state["input"] = details
     
@@ -891,7 +891,7 @@ def build_workflow():
     workflow.add_node("classify", classify_intent_node)
     workflow.add_node("create_analysis_plan", create_analysis_plan_node)
     workflow.add_node("cancel_analysis_plan", cancel_analysis_plan_node)
-    workflow.add_node("dispatch_plan_step", lambda state: state) # New dummy node for central routing logic
+    workflow.add_node("dispatch_plan_step", lambda state: state) # 中央ルーティングロジック用の新しいダミーノード
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("check_history", check_history_node)
     workflow.add_node("sql", sql_node)
@@ -910,7 +910,7 @@ def build_workflow():
 
     workflow.add_conditional_edges(
         "dispatch_plan_step",
-        execute_plan_router,
+        execute_plan_route_step,
         {
             "create_analysis_plan": "create_analysis_plan",
             "check_history": "check_history",
@@ -927,7 +927,7 @@ def build_workflow():
         sql_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            END: END  # Explicitly map END if it's a possible return
+            END: END  # ENDが返される可能性がある場合は明示的にマッピング
         }
     )
     workflow.add_conditional_edges(
@@ -935,7 +935,7 @@ def build_workflow():
         chart_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            END: END # Explicitly map END if it's a possible return (though not in current chart_next)
+            END: END # ENDが返される可能性がある場合は明示的にマッピング（現在のchart_nextにはありませんが）
         }
     )
     workflow.add_conditional_edges(
@@ -943,7 +943,7 @@ def build_workflow():
         interpret_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            END: END # Explicitly map END if it's a possible return (though not in current interpret_next)
+            END: END # ENDが返される可能性がある場合は明示的にマッピング（現在のinterpret_nextにはありませんが）
         }
     )
     workflow.add_conditional_edges(
@@ -951,8 +951,8 @@ def build_workflow():
         check_history_next,
         {
             "dispatch_plan_step": "dispatch_plan_step"
-            # If check_history_next could return other values, map them here.
-            # For now, it only returns "dispatch_plan_step".
+            # check_history_nextが他の値を返す可能性がある場合は、ここでマッピングします。
+            # 現時点では "dispatch_plan_step" のみを返します。
         }
     )
     workflow.add_conditional_edges(
@@ -960,7 +960,7 @@ def build_workflow():
         clarify_next,
         {
             END: END
-            # clarify_next always returns END or conditions that should lead to END.
+            # clarify_next は常に END または END につながる条件を返します。
         }
     )
 
