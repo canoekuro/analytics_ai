@@ -1,3 +1,5 @@
+# 【重要！！】コメントアウトやエラーメッセージはできる限り日本語で残すこと。
+
 from langchain_community.vectorstores import FAISS
 import difflib # Make sure this import is added at the top of the file
 import sqlite3
@@ -45,6 +47,7 @@ DATA_CLEARED_MESSAGE = "データが正常にクリアされました。"
 import collections
 class MyState(TypedDict, total=False):
     input: str                       # ユーザーの問い合わせ
+    condition: Optional[str]         # 各ノードの実行状態
     intent_list: List[str]           # 分類結果（データ取得/グラフ作成/データ解釈）
     latest_df: Optional[collections.OrderedDict[str, list]] # Changed: Dict mapping requirement to its dataframe (list of records)
     df_history: Optional[List[dict]] # SQL実行結果のDataFrameの履歴 {"id": str, "query": str, "timestamp": str, "dataframe_dict": list, "SQL": Optional[str]}
@@ -52,7 +55,6 @@ class MyState(TypedDict, total=False):
     interpretation: Optional[str]    # データ解釈（分析コメント）
     chart_result: Optional[str]      # グラフ画像（base64など）
     metadata_answer: Optional[str]   # メタデータ検索結果の回答
-    condition: Optional[str]         # 各ノードの実行状態
     error: Optional[str]             # SQL等でエラーがあれば
     query_history: Optional[List[str]] # ユーザーの問い合わせ履歴
     data_requirements: List[str]     # データ要件
@@ -60,13 +62,89 @@ class MyState(TypedDict, total=False):
     clarification_question: Optional[str] = None
     analysis_options: Optional[List[str]] = None
     user_clarification: Optional[str] = None
-    # For multi-stage analysis planning
     analysis_plan: Optional[List[dict]] = None # Stores the list of analysis steps, e.g., [{"action": "sql", "details": "Overall monthly sales"}, {"action": "interpret", "details": "Interpret monthly sales data"}]
     current_plan_step_index: Optional[int] = None # Index of the current step in analysis_plan
     awaiting_step_confirmation: Optional[bool] = None # True if waiting for user to proceed to next step
     complex_analysis_original_query: Optional[str] = None # Stores the original multi-step query
     user_action: Optional[str] = None # New field for frontend actions like "proceed_analysis_step" or "cancel_analysis_plan"
 
+#ユーザーの入力に応じて意図を分類
+def classify_intent_node(state):
+    user_input = state["input"]
+    if user_input == "SYSTEM_CLEAR_HISTORY":
+        current_history = state.get("query_history", [])
+        return {
+            **state,
+            "intent_list": ["clear_data_intent"],
+            "condition": "分類完了",
+            "query_history": current_history
+        }
+
+    current_history = state.get("query_history", [])
+    if not current_history or current_history[-1] != user_input:
+         current_history.append(user_input)
+
+    prompt = f"""
+    ユーザーの質問の意図を判定してください。
+    次の4つのうち、該当するものを「,」区切りで全て列挙してください：
+    - データ取得
+    - グラフ作成
+    - データ解釈
+    - メタデータ検索
+
+    質問: 「{user_input}」
+    例: 
+    input:「カテゴリの合計販売金額を出して」 output:「データ取得」
+    input:「＊＊＊のデータを出して」 output:「データ取得」
+    input:「＊＊＊のデータを取得してグラフ化して」 output:「データ取得,グラフ作成」
+    input:「＊＊＊のデータを取得して解釈して」 output:「データ取得,データ解釈」
+    input:「＊＊＊のデータのグラフ化と解釈して」 output:「データ取得,グラフ作成,データ解釈」
+    input:「sales_dataテーブルにはどんなカラムがありますか？」 output:「メタデータ検索」
+    input:「categoryカラムの情報を教えてください」 output:「メタデータ検索」
+
+    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈,メタデータ検索」）だけを必ず返すようにしてください。
+    """
+    result = llm.invoke(prompt).content.strip()
+    steps = [x.strip() for x in result.split(",") if x.strip()]
+
+    return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
+
+def metadata_retrieval_node(state):
+    user_query = state["input"]
+    retrieved_docs = vectorstore_tables.similarity_search(user_query)
+    retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    prompt_template = """
+    以下のテーブル定義情報を参照して、ユーザーの質問に答えてください。
+    ユーザーが理解しやすいように、テーブルやカラムの役割、データ型、関連性などを説明してください。
+
+    【テーブル定義情報】
+    {retrieved_table_info}
+
+    【ユーザー質問】
+    {user_query}
+
+    【回答】
+    """
+    llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, user_query=user_query)
+    response = llm.invoke(llm_prompt)
+    answer = response.content.strip()
+    return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
+
+def clear_data_node(state):
+    return {
+        "input": state.get("input"),
+        "intent_list": state.get("intent_list"),
+        "latest_df": collections.OrderedDict(),
+        "df_history": [],
+        "SQL": None,
+        "interpretation": DATA_CLEARED_MESSAGE,
+        "chart_result": None,
+        "metadata_answer": state.get("metadata_answer"),
+        "condition": "データクリア完了",
+        "error": None,
+        "query_history": []
+    }
+    
 # New Analysis Planning Node (create_analysis_plan_node)
 def create_analysis_plan_node(state: MyState) -> MyState:
     user_query = state.get("input", "")
@@ -117,27 +195,27 @@ def create_analysis_plan_node(state: MyState) -> MyState:
             "current_plan_step_index": None,
             "user_clarification": None,
             "condition": "plan_generation_failed",
-            "error": f"Failed to serialize mock plan: {e}"
+            "error": f"分析計画の保存中にエラーが発生しました。: {e}"
         }
 
     parsed_plan = None
     try:
         parsed_plan = json.loads(plan_json_str)
         if not isinstance(parsed_plan, list):
-            raise ValueError("Plan is not a list.")
+            raise ValueError("分析プランがリスト型になっていません。")
         for step in parsed_plan:
             if not isinstance(step, dict) or "action" not in step or "details" not in step:
-                raise ValueError("Invalid step in plan: must be dict with 'action' and 'details'.")
+                raise ValueError("分析プラン内の各ステップが正しい形式ではありません（'action'と'details'必須）。")
 
     except (json.JSONDecodeError, ValueError) as e:
-        logging.error(f"Failed to parse or validate LLM plan: {e}. Plan string: '{plan_json_str}'")
+        logging.error(f"分析計画のパース・検証に失敗: {e}. Plan string: '{plan_json_str}'")
         return {
             **state,
             "analysis_plan": None,
             "current_plan_step_index": None,
             "user_clarification": None,
             "condition": "plan_generation_failed",
-            "error": f"Invalid plan structure or JSON: {e}"
+            "error": f"分析計画の形式や内容に不備があります: {e}"
         }
 
     current_input = state.get("input", "")
@@ -156,6 +234,38 @@ def create_analysis_plan_node(state: MyState) -> MyState:
         "error": None
     }
 
+#分析計画に基づいて、ユーザーに質問
+def clarify_node(state: MyState) -> MyState:
+    current_plan_step_index = state.get("current_plan_step_index")
+    analysis_plan = state.get("analysis_plan", [])
+    if current_plan_step_index is None or not analysis_plan or not (0 <= current_plan_step_index < len(analysis_plan)):
+        logging.error("clarify_node:分析プランの状態が不正です。")
+        return {**state, "error": "分析プランの状態が不正です。", "condition": "clarify_error_invalid_plan"}
+
+    current_step = analysis_plan[current_plan_step_index]
+    action = current_step.get("action")
+
+    if action == "clarify":
+        clarification_question_from_plan = current_step.get("details")
+        if not isinstance(clarification_question_from_plan, str) or not clarification_question_from_plan.strip():
+            logging.warning("clarify_node: プランに具体的な質問文がありません。")
+            clarification_question_from_plan = "追加で確認したい内容がありますが、質問文がプランに見当たりません。"
+
+        return {
+            **state,
+            "clarification_question": clarification_question_from_plan,
+            "user_clarification": None,
+            "condition": "awaiting_user_clarification"
+        }
+    else:
+        logging.error(f"clarify_node: 想定外のアクションが渡されました。アクションの内容はこちらです。'{action}'")
+        return {
+            **state,
+            "error": f"想定外のアクションが渡されました。アクションの内容はこちらです。 {action}",
+            "condition": "clarify_error_unexpected_action"
+        }
+
+# 追加質問をした際に、実行をキャンセルした際のノード
 def cancel_analysis_plan_node(state: MyState) -> MyState:
     original_query = state.get("complex_analysis_original_query", "The analysis plan was cancelled.")
     return {
@@ -170,6 +280,108 @@ def cancel_analysis_plan_node(state: MyState) -> MyState:
         "user_action": None
     }
 
+# 過去取得したデータを参照するノード
+def check_history_node(state: MyState) -> MyState:
+    analysis_plan = state.get("analysis_plan")
+    current_plan_step_index = state.get("current_plan_step_index")
+
+    if not analysis_plan or not isinstance(analysis_plan, list) or not analysis_plan:
+        # プランがNone、リスト型でない、または空リストの場合はエラーとして返す
+        return {
+            **state,
+            "latest_df": collections.OrderedDict(),
+            "missing_data_requirements": [],
+            "condition": "history_checked_invalid_plan_or_index",
+            "error": "過去のデータをチェックしようとしましたが分析プランがありませんでした。"
+        }
+
+    if current_plan_step_index is None or \
+       not isinstance(current_plan_step_index, int) or \
+       not (0 <= current_plan_step_index < len(analysis_plan)):
+         # インデックスがNone、int型でない、範囲外の場合はエラーとして返す
+        safe_details_for_error_msg = []
+        if analysis_plan and \
+           isinstance(analysis_plan, list) and \
+           current_plan_step_index is not None and \
+           isinstance(current_plan_step_index, int) and \
+           0 <= current_plan_step_index < len(analysis_plan) and \
+           isinstance(analysis_plan[current_plan_step_index], dict):
+            safe_details_for_error_msg = analysis_plan[current_plan_step_index].get("details", [])
+
+        return {
+            **state,
+            "latest_df": collections.OrderedDict(),
+            "missing_data_requirements": safe_details_for_error_msg,
+            "condition": "history_checked_invalid_plan_or_index",
+            "error": f"Invalid current_plan_step_index ({current_plan_step_index}) for analysis_plan length ({len(analysis_plan) if analysis_plan else 0}) in check_history_node."
+        }
+
+    # df_historyを取得する
+    df_history = state.get("df_history", [])
+    data_requirements_for_step = []
+    current_step_details = state.get("input") # This is set by execute_plan_router to current_step["details"]
+
+    # inputが文字列の場合はリスト化、リストならそのまま
+    if isinstance(current_step_details, str):
+        data_requirements_for_step = [current_step_details]
+    elif isinstance(current_step_details, list):
+        data_requirements_for_step = [str(item) for item in current_step_details]
+    
+    # 以下のブロックは、inputに値が入っていない場合にプランからdetailsを取得していますが、
+    # execute_plan_routerが常にstate.inputにplan[index].detailsを正しくセットする場合は冗長かもしれません。
+    # ただし、堅牢性確保や、このノードが通常のルーターフロー以外から呼ばれた場合も考慮して残しています。
+    if not data_requirements_for_step:
+        # inputが正しくセットされていない場合、プランのdetailsから救済する（想定外呼び出し時の保険）
+        current_step = analysis_plan[current_plan_step_index]
+        raw_details = current_step.get("details")
+        logging.warning(f"過去のデータ履歴チェック中に不正なステップ番号（{current_plan_step_index}）が指定されました: {raw_details}")
+        if isinstance(raw_details, str):
+            data_requirements_for_step = [raw_details]
+        elif isinstance(raw_details, list):
+            data_requirements_for_step = [str(item) for item in raw_details]
+
+    if not data_requirements_for_step:
+        # それでも要件が取得できない場合はmissing_requirementsは空で返却
+        return {
+            **state,
+            "latest_df": collections.OrderedDict(),
+            "missing_data_requirements": [],
+            "condition": "history_checked_no_requirements",
+            "SQL": None, "interpretation": None, "chart_result": None
+        }
+
+    found_data_map = collections.OrderedDict()
+    missing_requirements = []
+    used_history_ids = set()
+
+    # 各要件について、過去履歴から最も類似するデータを1件だけ再利用する
+    for req in data_requirements_for_step:
+        found_for_req = False
+        best_similarity_for_req = 0.0
+        best_match_entry = None
+        for entry in df_history:
+            if entry.get("id") in used_history_ids:
+                continue
+            similarity = difflib.SequenceMatcher(None, req, entry.get("query", "")).ratio()
+            if similarity >= SIMILARITY_THRESHOLD and similarity > best_similarity_for_req:
+                best_similarity_for_req = similarity
+                best_match_entry = entry
+        if best_match_entry:
+            found_data_map[req] = best_match_entry["dataframe_dict"]
+            used_history_ids.add(best_match_entry.get("id"))
+        else:
+            missing_requirements.append(req)
+
+    return {
+        **state,
+        "latest_df": found_data_map,
+        "missing_data_requirements": missing_requirements,
+        "condition": "history_checked",
+        "SQL": None, "interpretation": None, "chart_result": None
+    }
+
+#SQL関連の関数
+#SQLのコードブロックがあった際にそれを削除
 def extract_sql(sql_text):
     match = re.search(r"```sql\s*(.*?)```", sql_text, re.DOTALL | re.IGNORECASE)
     if match:
@@ -179,6 +391,7 @@ def extract_sql(sql_text):
         return match.group(1).strip()
     return sql_text.strip()
 
+#SQLのアウトプットを必ずList[str]として後続処理に流す。
 def parse_llm_list_output(llm_output_str: str) -> List[str]:
     try:
         cleaned_str = re.sub(r'^\s*[-*]\s*', '', llm_output_str, flags=re.MULTILINE)
@@ -206,6 +419,7 @@ def parse_llm_list_output(llm_output_str: str) -> List[str]:
                  suggestions.append(item)
         return suggestions
 
+#SQLを実行
 def try_sql_execute(sql_text):
     try:
         conn = sqlite3.connect("my_data.db")
@@ -214,7 +428,8 @@ def try_sql_execute(sql_text):
     except Exception as e:
         logging.error(f"SQL execution failed. Error: {e}\nSQL: {sql_text}", exc_info=True)
         return None, str(e)
-    
+
+#SQLのエラーがあった際にエラー内容を日本語にする
 def transform_sql_error(sql_error: str) -> str:
     if "no such table" in sql_error.lower():
         return f"指定されたテーブルが見つからなかったため、クエリを実行できませんでした。テーブル名を確認してください。(詳細: {sql_error})"
@@ -225,6 +440,7 @@ def transform_sql_error(sql_error: str) -> str:
     else:
         return f"SQLクエリの処理中に予期せぬエラーが発生しました。管理者に連絡してください。(詳細: {sql_error})"
 
+#エラー内容に沿ってSQLを修正
 def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_query):
     prompt = f"""
     以下はユーザーの質問・関連情報・AIが生成したSQLとその実行時のエラー内容です。
@@ -250,134 +466,13 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
     fixed_sql = extract_sql(response.content)
     return fixed_sql
 
-def check_history_node(state: MyState) -> MyState:
-    analysis_plan = state.get("analysis_plan")
-    current_plan_step_index = state.get("current_plan_step_index")
-
-    if not analysis_plan or not isinstance(analysis_plan, list) or not analysis_plan: # Check if empty list
-        # If plan is None, not a list, or empty, it's invalid for this node's core logic
-        return {
-            **state,
-            "latest_df": collections.OrderedDict(),
-            "missing_data_requirements": [],
-            "condition": "history_checked_invalid_plan_or_index",
-            "error": "Analysis plan is missing or empty in check_history_node."
-        }
-
-    if current_plan_step_index is None or \
-       not isinstance(current_plan_step_index, int) or \
-       not (0 <= current_plan_step_index < len(analysis_plan)):
-        # If index is None, not an int, or out of bounds
-        safe_details_for_error_msg = []
-        if analysis_plan and \
-           isinstance(analysis_plan, list) and \
-           current_plan_step_index is not None and \
-           isinstance(current_plan_step_index, int) and \
-           0 <= current_plan_step_index < len(analysis_plan) and \
-           isinstance(analysis_plan[current_plan_step_index], dict):
-            safe_details_for_error_msg = analysis_plan[current_plan_step_index].get("details", [])
-
-        return {
-            **state,
-            "latest_df": collections.OrderedDict(),
-            "missing_data_requirements": safe_details_for_error_msg,
-            "condition": "history_checked_invalid_plan_or_index",
-            "error": f"Invalid current_plan_step_index ({current_plan_step_index}) for analysis_plan length ({len(analysis_plan) if analysis_plan else 0}) in check_history_node."
-        }
-
-    # df_history is retrieved after initial plan checks, as it's not needed for those checks.
-    df_history = state.get("df_history", [])
-    data_requirements_for_step = []
-    current_step_details = state.get("input") # This is set by execute_plan_router to current_step["details"]
-
-    if isinstance(current_step_details, str):
-        data_requirements_for_step = [current_step_details]
-    elif isinstance(current_step_details, list):
-        data_requirements_for_step = [str(item) for item in current_step_details]
-
-    # The following block for trying to get details from plan if not in input might be redundant
-    # if execute_plan_router *always* sets state.input correctly from plan[index].details.
-    # However, keeping it for robustness or if node is called outside typical router flow.
-    if not data_requirements_for_step:
-        # This check is now safe due to the guards at the beginning of the function
-        current_step = analysis_plan[current_plan_step_index]
-        raw_details = current_step.get("details")
-        logging.warning(f"check_history_node: state.input was empty or not list/str. Falling back to plan details: {raw_details}")
-        if isinstance(raw_details, str):
-            data_requirements_for_step = [raw_details]
-        elif isinstance(raw_details, list):
-            data_requirements_for_step = [str(item) for item in raw_details]
-
-    if not data_requirements_for_step:
-        # This means state.input was not valid, AND plan[index].details was also not valid.
-        return {
-            **state,
-            "latest_df": collections.OrderedDict(),
-            "missing_data_requirements": [],
-            "condition": "history_checked_no_requirements",
-            "SQL": None, "interpretation": None, "chart_result": None
-        }
-
-    found_data_map = collections.OrderedDict()
-    missing_requirements = []
-    used_history_ids = set()
-
-    for req in data_requirements_for_step:
-        found_for_req = False
-        best_similarity_for_req = 0.0
-        best_match_entry = None
-        for entry in df_history:
-            if entry.get("id") in used_history_ids:
-                continue
-            similarity = difflib.SequenceMatcher(None, req, entry.get("query", "")).ratio()
-            if similarity >= SIMILARITY_THRESHOLD and similarity > best_similarity_for_req:
-                best_similarity_for_req = similarity
-                best_match_entry = entry
-        if best_match_entry:
-            found_data_map[req] = best_match_entry["dataframe_dict"]
-            used_history_ids.add(best_match_entry.get("id"))
-        else:
-            missing_requirements.append(req)
-
-    return {
-        **state,
-        "latest_df": found_data_map,
-        "missing_data_requirements": missing_requirements,
-        "condition": "history_checked",
-        "SQL": None, "interpretation": None, "chart_result": None
-    }
-
+#SQLの生成と実行を行うノード
 def sql_node(state: MyState) -> MyState:
-    # Priority 1: state.missing_data_requirements (typically set by check_history or router)
+    # check_historyやルータでセットされるstate.missing_data_requirementsをデータ取得要件とする。
     requirements_to_fetch = state.get("missing_data_requirements", [])
 
-    # Priority 2: Plan details (via state.input, set by execute_plan_router)
-    # This is used if missing_data_requirements is empty, meaning check_history didn't run or found all its items,
-    # and this SQL step is a distinct data-fetching operation.
-    # The execute_plan_router already populates 'missing_data_requirements' from 'details' for SQL actions.
-    if not requirements_to_fetch and state.get("analysis_plan") and state.get("current_plan_step_index") is not None:
-        # This path implies that execute_plan_router should have set missing_data_requirements
-        # if this SQL node is meant to fetch specific data from the plan details.
-        # If missing_data_requirements is empty here, it might be an intentional skip,
-        # or an issue in how the plan was constructed or how the router set the state.
-        # For robustness, if it's an SQL action, we check state.input (which holds plan details).
-        details_from_plan = state.get("input")
-        if isinstance(details_from_plan, str) and details_from_plan:
-            requirements_to_fetch = [details_from_plan]
-        elif isinstance(details_from_plan, list) and all(isinstance(item, str) for item in details_from_plan):
-            requirements_to_fetch = details_from_plan
-
-    # Priority 3: Fallback to overall state.input (legacy mode, less common with planner)
-    if not requirements_to_fetch and not state.get("analysis_plan"):
-        logging.warning("sql_node: Executing in legacy mode using overall state.input.")
-        legacy_input = state.get("input")
-        if isinstance(legacy_input, str) and legacy_input:
-            requirements_to_fetch = [legacy_input]
-        # In legacy, state.input is unlikely to be a list of requirements.
-
-
     if not requirements_to_fetch:
-        logging.info("sql_node: No valid requirements to fetch. Setting condition to sql_execution_skipped_no_reqs.")
+        logging.info("sql_node: 取得すべき要件が見つからなかったためSQLの作成・実行をスキップします。")
         return {
             **state,
             "condition": "sql_execution_skipped_no_reqs",
@@ -385,18 +480,18 @@ def sql_node(state: MyState) -> MyState:
             "error": "No requirements provided for SQL execution."
         }
 
-    # Ensure latest_df is an OrderedDict and preserve existing data if any
+    # latest_dfは必ずOrderedDictにして、すでにデータがあれば引き継ぐ
     current_latest_df = state.get("latest_df", collections.OrderedDict())
     if not isinstance(current_latest_df, collections.OrderedDict):
         current_latest_df = collections.OrderedDict(current_latest_df or {})
 
+    # 全体の質問文脈（Clarify含む）があればそちら、なければ直近入力
     current_df_history = state.get("df_history", [])
-    # Use complex_analysis_original_query for broader context if available, otherwise current user_query
     overall_user_input_context = state.get("complex_analysis_original_query", state.get("input", ""))
     
     last_sql_generated = None
     any_error_occurred = False
-    successfully_fetched_reqs = [] # Keep track of requirements successfully fetched in this run
+    successfully_fetched_reqs = [] # 今回取得できた要件を記録
     accumulated_errors = []
 
     system_prompt_sql_generation = """
@@ -409,10 +504,10 @@ def sql_node(state: MyState) -> MyState:
 
     for req_string in requirements_to_fetch:
         if not req_string or not isinstance(req_string, str):
-            logging.warning(f"sql_node: Skipping invalid requirement: {req_string}")
+            logging.warning(f"sql_node: 無効な要件のためスキップ: {req_string}")
             continue
 
-        logging.info(f"sql_node: Processing requirement: '{req_string}'")
+        logging.info(f"sql_node: 要件を処理中: '{req_string}'")
         retrieved_tables_docs = vectorstore_tables.similarity_search(req_string, k=3)
         rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
         retrieved_queries_docs = vectorstore_queries.similarity_search(req_string, k=3)
@@ -441,7 +536,7 @@ def sql_node(state: MyState) -> MyState:
         if sql_error:
             logging.warning(f"Initial SQL for '{req_string}' failed: {sql_error}. Retrying with fix.")
             fixed_sql = fix_sql_with_llm(sql_generated_clean, sql_error, rag_tables, rag_queries, req_string)
-            last_sql_generated = fixed_sql # Update with the fixed SQL attempt
+            last_sql_generated = fixed_sql
             result_df, sql_error = try_sql_execute(fixed_sql)
             if sql_error:
                 logging.error(f"Fixed SQL for '{req_string}' also failed: {sql_error}.")
@@ -451,7 +546,7 @@ def sql_node(state: MyState) -> MyState:
 
         if not sql_error and result_df is not None:
             result_df_dict = result_df.to_dict(orient="records")
-            current_latest_df[req_string] = result_df_dict # Add or update data in latest_df
+            current_latest_df[req_string] = result_df_dict # 取得したデータをlatest_dfに保存
             successfully_fetched_reqs.append(req_string)
             new_history_entry = {
                 "id": uuid.uuid4().hex[:8], "query": req_string,
@@ -459,34 +554,25 @@ def sql_node(state: MyState) -> MyState:
                 "dataframe_dict": result_df_dict, "SQL": last_sql_generated
             }
             current_df_history.append(new_history_entry)
-        elif not sql_error and result_df is None: # No error, but empty result
+        elif not sql_error and result_df is None: # エラーはないがデータが0件
              current_latest_df[req_string] = []
              successfully_fetched_reqs.append(req_string)
-             logging.info(f"SQL for '{req_string}' executed successfully but returned no data.")
-        # If sql_error is still present, this requirement was not successfully fetched.
+             logging.info(f"SQL for '{req_string}' は正常にSQL実行されましたが、データがありませんでした。")
 
-    # Determine final condition
-    if not requirements_to_fetch: # Should have been caught earlier
+    # 最終的なconditionを判定
+    if not requirements_to_fetch: 
         final_condition = "sql_execution_skipped_no_reqs"
-    elif not successfully_fetched_reqs and any_error_occurred: # No successes, all errors
+    elif not successfully_fetched_reqs and any_error_occurred: # SQLが全部失敗
         final_condition = "sql_execution_failed"
-    elif any_error_occurred: # Some successes, some errors
+    elif any_error_occurred: # 一部成功・一部失敗
         final_condition = "sql_execution_partial_success"
-    else: # All attempted requirements succeeded
+    else: #全取得成功
         final_condition = "sql_execution_done"
 
-    # Update missing_data_requirements based on what was attempted in *this* run.
-    # If the input `requirements_to_fetch` was from `state.missing_data_requirements`, this correctly updates it.
-    # If `requirements_to_fetch` was from `state.input` (plan details), this correctly reflects what from *that list* failed.
+    # 取得できなかったものだけmissing_data_requirementsとして再セット
     current_missing_reqs_in_state = state.get("missing_data_requirements", [])
     updated_missing_requirements = [req for req in current_missing_reqs_in_state if req not in successfully_fetched_reqs]
-
-    # If requirements_to_fetch was populated directly from state.input (plan details) because missing_data_requirements was initially empty,
-    # then updated_missing_requirements should be based on what from *those* requirements failed.
-    if not state.get("missing_data_requirements") and requirements_to_fetch: # This condition means reqs came from state.input
-        updated_missing_requirements = [req for req in requirements_to_fetch if req not in successfully_fetched_reqs]
-
-
+    
     return {
         **state,
         "latest_df": current_latest_df,
@@ -499,22 +585,24 @@ def sql_node(state: MyState) -> MyState:
 
 def interpret_node(state: MyState) -> MyState:
     latest_df_data = state.get("latest_df")
-    # Context for interpretation comes from state.input (set by execute_plan_router from plan step details)
+    # 解釈用の文脈は state.input（execute_plan_router が plan step details からセット）を利用
     plan_details_context = state.get("input", "全般的な傾向") # Default if no specific detail
 
     if latest_df_data is None:
-        logging.info("interpret_node: latest_df is None. No data to interpret.")
+        logging.info("interpret_node: latest_dfがNoneのため、解釈できるデータがありません。")
         return {**state, "interpretation": "解釈するデータがありません。", "condition": "interpretation_failed_no_data"}
 
     if not isinstance(latest_df_data, collections.OrderedDict):
-        logging.error(f"interpret_node: latest_df is not an OrderedDict (type: {type(latest_df_data)}).")
+        logging.error(f"interpret_node: latest_dfの型がOrderedDictではありません (type: {type(latest_df_data)}).")
         return {**state, "interpretation": "データの形式が不正です (OrderedDictではありません)。", "condition": "interpretation_failed_bad_format"}
 
     if not latest_df_data: # Check if the OrderedDict is empty
-        logging.info("interpret_node: latest_df is an empty OrderedDict.")
+        logging.info("interpret_node: latest_dfが空（データ無し）です。")
         return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"}
 
     full_data_string = ""
+    
+    # 各要件ごとにDataFrameを生成し、テキスト化
     for req_string, df_data_list in latest_df_data.items():
         if df_data_list:
             try:
@@ -529,8 +617,8 @@ def interpret_node(state: MyState) -> MyState:
         else:
             full_data_string += f"■「{req_string}」に関するデータ:\n(この要件に対するデータはありませんでした)\n\n"
 
-    # Check if, after attempting to process all entries, the resulting string for LLM is still effectively empty.
-    # This covers cases where all lists in latest_df were empty or resulted in empty string representations.
+    # 一応OrderedDictとしてデータ構造はあるが、中身が全て空リストや形式エラーで“実質的に有効なデータが1件も無い”」場合にキャッチ
+    # 例{"2022年売上": [], "2023年売上": []}
     processed_parts = [part for part in full_data_string.split("■")[1:] if part] # Get non-empty parts after splitting by "■"
     all_parts_indicate_no_data = all(
         "(この要件に対するデータはありませんでした)" in part or \
@@ -540,7 +628,7 @@ def interpret_node(state: MyState) -> MyState:
     )
 
     if not full_data_string.strip() or (processed_parts and all_parts_indicate_no_data):
-        logging.info("interpret_node: No valid data content to interpret after processing latest_df.")
+        logging.info("interpret_node: データ内容が全て空またはエラーのため、解釈対象がありません。")
         return {**state, "interpretation": "解釈対象の有効なデータがありませんでした。", "condition": "interpretation_failed_empty_data"}
 
     system_prompt = "あなたは優秀なデータ分析の専門家です。"
@@ -567,8 +655,6 @@ def interpret_node(state: MyState) -> MyState:
         logging.error(f"interpret_node: Exception during LLM call: {e}")
         interpretation_text = "解釈中にエラーが発生しました。"
         final_condition = "interpretation_failed"
-
-
     return {**state, "interpretation": interpretation_text, "condition": final_condition}
 
 
@@ -666,77 +752,6 @@ def chart_node(state: MyState) -> MyState:
         logging.error(f"chart_node: Error during agent execution: {e}", exc_info=True)
         return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)}
 
-
-def classify_intent_node(state):
-    user_input = state["input"]
-    if user_input == "SYSTEM_CLEAR_HISTORY":
-        current_history = state.get("query_history", [])
-        return {
-            **state,
-            "intent_list": ["clear_data_intent"],
-            "condition": "分類完了",
-            "query_history": current_history
-        }
-
-    current_history = state.get("query_history", [])
-    if not current_history or current_history[-1] != user_input:
-         current_history.append(user_input)
-
-    prompt = f"""
-    ユーザーの質問の意図を判定してください。
-    次の4つのうち、該当するものを「,」区切りで全て列挙してください：
-    - データ取得
-    - グラフ作成
-    - データ解釈
-    - メタデータ検索
-
-    質問: 「{user_input}」
-    例: 
-    input:「カテゴリの合計販売金額を出して」 output:「データ取得」
-    input:「＊＊＊のデータを出して」 output:「データ取得」
-    input:「＊＊＊のデータを取得してグラフ化して」 output:「データ取得,グラフ作成」
-    input:「＊＊＊のデータを取得して解釈して」 output:「データ取得,データ解釈」
-    input:「＊＊＊のデータのグラフ化と解釈して」 output:「データ取得,グラフ作成,データ解釈」
-    input:「sales_dataテーブルにはどんなカラムがありますか？」 output:「メタデータ検索」
-    input:「categoryカラムの情報を教えてください」 output:「メタデータ検索」
-
-    他の情報は不要なので、outputの部分（「データ取得,グラフ作成,データ解釈,メタデータ検索」）だけを必ず返すようにしてください。
-    """
-    result = llm.invoke(prompt).content.strip()
-    steps = [x.strip() for x in result.split(",") if x.strip()]
-
-    return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
-
-def clarify_node(state: MyState) -> MyState:
-    current_plan_step_index = state.get("current_plan_step_index")
-    analysis_plan = state.get("analysis_plan", [])
-    if current_plan_step_index is None or not analysis_plan or not (0 <= current_plan_step_index < len(analysis_plan)):
-        logging.error("clarify_node: Invalid plan state for clarification.")
-        return {**state, "error": "Invalid plan state for clarification.", "condition": "clarify_error_invalid_plan"}
-
-    current_step = analysis_plan[current_plan_step_index]
-    action = current_step.get("action")
-
-    if action == "clarify":
-        clarification_question_from_plan = current_step.get("details")
-        if not isinstance(clarification_question_from_plan, str) or not clarification_question_from_plan.strip():
-            logging.warning("clarify_node: 'clarify' action in plan has no valid question in details.")
-            clarification_question_from_plan = "I need more details, but the specific question is missing from the plan."
-
-        return {
-            **state,
-            "clarification_question": clarification_question_from_plan,
-            "user_clarification": None,
-            "condition": "awaiting_user_clarification"
-        }
-    else:
-        logging.error(f"clarify_node: Called with an unexpected action '{action}' in the plan.")
-        return {
-            **state,
-            "error": f"Clarify_node called with unexpected action: {action}",
-            "condition": "clarify_error_unexpected_action"
-        }
-
 def classify_next(state: MyState):
     user_action = state.get("user_action")
     intents = state.get("intent_list", [])
@@ -780,50 +795,13 @@ def create_analysis_plan_next(state: MyState):
         logging.info("create_analysis_plan_next: Plan generated. Routing to dispatch_plan_step.")
         return "dispatch_plan_step"
     elif condition == "empty_plan_generated":
-        logging.info("create_analysis_plan_next: Empty plan generated. Routing to suggest_analysis_paths.")
-        return "suggest_analysis_paths"
+        logging.info("create_analysis_plan_next: Empty plan generated. Routing to END")
+        return END
     elif condition == "plan_generation_failed":
         logging.error("create_analysis_plan_next: Plan generation failed. Routing to END.")
         return END
     else:
         logging.warning(f"create_analysis_plan_next: Unknown condition '{condition}'. Routing to END.")
-        return END
-
-def execute_plan_router(state: MyState) -> str:
-    if state.get("user_clarification"):
-        logging.info("execute_plan_router: User clarification provided. Re-routing to create_analysis_plan.")
-        return "create_analysis_plan"
-    analysis_plan = state.get("analysis_plan")
-    current_plan_step_index = state.get("current_plan_step_index")
-    if not analysis_plan or current_plan_step_index is None or not (0 <= current_plan_step_index < len(analysis_plan)):
-        logging.info("execute_plan_router: Plan completed or invalid. Cleaning up and routing to suggest_analysis_paths.")
-        state["analysis_plan"] = None
-        state["current_plan_step_index"] = None
-        state["awaiting_step_confirmation"] = False
-        return "suggest_analysis_paths"
-    current_step = analysis_plan[current_plan_step_index]
-    action = current_step.get("action")
-    logging.info(f"execute_plan_router: Dispatching to action '{action}' for step {current_plan_step_index}.")
-    details = current_step.get("details", "")
-    state["input"] = details
-    if action == "sql":
-        state["missing_data_requirements"] = [details] if isinstance(details, str) else details if isinstance(details, list) else []
-        if not isinstance(state.get("latest_df"), collections.OrderedDict):
-            state["latest_df"] = collections.OrderedDict()
-        state["SQL"] = None
-        state["error"] = None
-        return "sql"
-    elif action == "check_history":
-        return "check_history"
-    elif action == "clarify":
-        return "clarify"
-    elif action == "chart":
-        return "chart"
-    elif action == "interpret":
-        return "interpret"
-    else:
-        logging.error(f"execute_plan_router: Unknown action '{action}' in plan.")
-        state["error"] = f"Unknown action in plan: {action}"
         return END
 
 def check_history_next(state: MyState):
@@ -853,7 +831,6 @@ def chart_next(state: MyState):
         return "dispatch_plan_step"
     logging.warning("chart_next: Chart node executed outside of a planned context.")
     if "データ解釈" in state.get("intent_list", []): return "interpret"
-    return "suggest_analysis_paths"
 
 def interpret_next(state: MyState):
     current_index = state.get("current_plan_step_index")
@@ -862,107 +839,51 @@ def interpret_next(state: MyState):
         state["awaiting_step_confirmation"] = False
         return "dispatch_plan_step"
     logging.warning("interpret_next: Interpret node executed outside of a planned context.")
-    return "suggest_analysis_paths"
 
-def suggest_analysis_paths_next(state: MyState):
-    return END
-
-def metadata_retrieval_node(state):
-    user_query = state["input"]
-    retrieved_docs = vectorstore_tables.similarity_search(user_query, k=3)
-    retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    prompt_template = """
-    以下のテーブル定義情報を参照して、ユーザーの質問に答えてください。
-    ユーザーが理解しやすいように、テーブルやカラムの役割、データ型、関連性などを説明してください。
-
-    【テーブル定義情報】
-    {retrieved_table_info}
-
-    【ユーザー質問】
-    {user_query}
-
-    【回答】
-    """
-    llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, user_query=user_query)
-    response = llm.invoke(llm_prompt)
-    answer = response.content.strip()
-    return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
-
-def clear_data_node(state):
-    return {
-        "input": state.get("input"),
-        "intent_list": state.get("intent_list"),
-        "latest_df": collections.OrderedDict(),
-        "df_history": [],
-        "SQL": None,
-        "interpretation": DATA_CLEARED_MESSAGE,
-        "chart_result": None,
-        "metadata_answer": state.get("metadata_answer"),
-        "condition": "データクリア完了",
-        "error": None,
-        "query_history": []
-    }
-
-def suggest_analysis_paths_node(state: MyState) -> MyState:
-    original_user_input = state.get("input", "")
-    latest_df_ordered_dict = state.get("latest_df")
-    current_interpretation = state.get("interpretation", "")
-    query_history = state.get("query_history", [])
-    no_data_messages = [
-        "まだデータがありません。",
-        "データが取得されましたが、内容は空です。",
-        "データが取得されましたが、内容は空でした。",
-        DATA_CLEARED_MESSAGE
-    ]
-    if not latest_df_ordered_dict and (not current_interpretation or any(msg in current_interpretation for msg in no_data_messages)):
-        return {**state, "analysis_options": [], "condition": "no_paths_suggested"}
-    data_summary_parts = []
-    if latest_df_ordered_dict:
-        for req, data_list in latest_df_ordered_dict.items():
-            if data_list:
-                try:
-                    df = pd.DataFrame(data_list)
-                    if not df.empty:
-                        data_summary_parts.append(f"Data for '{req}': {df.shape[0]} rows, {df.shape[1]} columns (Columns: {', '.join(df.columns)})")
-                    else:
-                        data_summary_parts.append(f"Data for '{req}': Empty")
-                except Exception:
-                    data_summary_parts.append(f"Data for '{req}': Could not load as DataFrame")
-            else:
-                data_summary_parts.append(f"Data for '{req}': Empty or not available")
-    data_summary = "\n".join(data_summary_parts) if data_summary_parts else "No data retrieved or all data was empty."
-    recent_query_history_summary = "\n".join(query_history[-3:]) if query_history else "No query history."
-    prompt_for_suggestions = f"""
-        You are an intelligent data analysis assistant. Based on the user's recent activity and the data obtained, suggest 2-3 relevant follow-up questions or analysis actions the user might be interested in.
-        Format your response as a Python-style list of strings. For example: ["Show sales by region", "Analyze customer churn"]
-        If no specific suggestions come to mind or if the data is insufficient for further meaningful analysis, return an empty list: [].
-        
-        User's original request: {original_user_input}
-        Summary of current data:
-        {data_summary}
-        Current interpretation/summary of findings: {current_interpretation if current_interpretation else 'Not yet available.'}
-        Recent query history:
-        {recent_query_history_summary}
-        
-        Based on this, what are some logical next steps or questions?
-        Response (as a Python list of strings):
-        """
+# 分析計画（analysis_plan）」の現在ステップに応じて、次にどのノード（処理）に進むかを決定
+def execute_plan_router(state: MyState) -> str:
+    # Clarify（追加質問）へのユーザー回答があれば、分析プランを再生成する
+    if state.get("user_clarification"):
+        logging.info("execute_plan_router: ユーザーの追加情報が入力されたため、分析プランを再作成します。")
+        return "create_analysis_plan"
     
-    llm_response_str = "[]"
-    if data_summary_parts:
-        if "sales" in original_user_input.lower() or "売上" in original_user_input:
-            llm_response_str = '["月別の売上トレンドを表示しますか？", "最も売上が高い商品カテゴリは何ですか？", "前期と比較した売上はどうですか？"]'
-        elif "customer" in original_user_input.lower() or "顧客" in original_user_input:
-            llm_response_str = '["顧客をデモグラフィック情報でセグメント分けしますか？", "新規顧客獲得数のトレンドを表示しますか？", "顧客の購入頻度を分析しますか？"]'
-        else:
-            llm_response_str = '["このデータを異なる種類のグラフで表示しますか？", "主要な発見を要約してください。", "業界ベンチマークと比較してどうですか？"]'
-    elif current_interpretation and len(current_interpretation) > 50 and not any(msg in current_interpretation for msg in no_data_messages):
-        llm_response_str = '["この分析の限界は何ですか？", "これをさらに詳細に分析できますか？"]'
-    parsed_options = parse_llm_list_output(llm_response_str)
-    if not parsed_options:
-        return {**state, "analysis_options": [], "condition": "no_paths_suggested"}
+    analysis_plan = state.get("analysis_plan")
+    current_plan_step_index = state.get("current_plan_step_index")
+
+    # プランが存在しない・インデックスが不正・プラン完了時は初期化して提案ノードに遷移
+    if not analysis_plan or current_plan_step_index is None or not (0 <= current_plan_step_index < len(analysis_plan)):
+        logging.info("execute_plan_router: プランが完了、または不正な状態です。")
+        state["analysis_plan"] = None
+        state["current_plan_step_index"] = None
+        state["awaiting_step_confirmation"] = False
+        return END
+        
+    current_step = analysis_plan[current_plan_step_index]
+    action = current_step.get("action")
+    logging.info(f"execute_plan_router: Dispatching to action '{action}' for step {current_plan_step_index}.")
+    details = current_step.get("details", "")
+    state["input"] = details
+    
+    if action == "sql":
+        # SQL取得用の要件をセットし、各状態を初期化
+        state["missing_data_requirements"] = [details] if isinstance(details, str) else details if isinstance(details, list) else []
+        if not isinstance(state.get("latest_df"), collections.OrderedDict):
+            state["latest_df"] = collections.OrderedDict()
+        state["SQL"] = None
+        state["error"] = None
+        return "sql"
+    elif action == "check_history":
+        return "check_history"
+    elif action == "clarify":
+        return "clarify"
+    elif action == "chart":
+        return "chart"
+    elif action == "interpret":
+        return "interpret"
     else:
-        return {**state, "analysis_options": parsed_options[:3], "condition": "paths_suggested"}
+        logging.error(f"プランに未対応のアクション '{action}' が含まれています。")
+        state["error"] = f"プランに未対応のアクションが指定されています: {action}"
+        return END
 
 def build_workflow():
     memory = MemorySaver()
@@ -978,18 +899,15 @@ def build_workflow():
     workflow.add_node("sql", sql_node)
     workflow.add_node("chart", chart_node)
     workflow.add_node("interpret", interpret_node)
-    workflow.add_node("suggest_analysis_paths", suggest_analysis_paths_node)
     workflow.add_node("metadata_retrieval", metadata_retrieval_node)
     workflow.add_node("clear_data", clear_data_node)
     
     # Define edges
     workflow.set_entry_point("classify")
     workflow.add_conditional_edges("classify", classify_next)
-
     workflow.add_edge("clear_data", END)
     workflow.add_edge("metadata_retrieval", END)
     workflow.add_edge("cancel_analysis_plan", END)
-
     workflow.add_conditional_edges("create_analysis_plan", create_analysis_plan_next)
 
     workflow.add_conditional_edges(
@@ -1002,7 +920,6 @@ def build_workflow():
             "sql": "sql",
             "chart": "chart",
             "interpret": "interpret",
-            "suggest_analysis_paths": "suggest_analysis_paths",
             "END": END
         }
     )
@@ -1012,8 +929,6 @@ def build_workflow():
         sql_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            "chart": "chart",
-            "interpret": "interpret",
             END: END  # Explicitly map END if it's a possible return
         }
     )
@@ -1022,8 +937,6 @@ def build_workflow():
         chart_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            "interpret": "interpret",
-            "suggest_analysis_paths": "suggest_analysis_paths",
             END: END # Explicitly map END if it's a possible return (though not in current chart_next)
         }
     )
@@ -1032,7 +945,6 @@ def build_workflow():
         interpret_next,
         {
             "dispatch_plan_step": "dispatch_plan_step",
-            "suggest_analysis_paths": "suggest_analysis_paths",
             END: END # Explicitly map END if it's a possible return (though not in current interpret_next)
         }
     )
@@ -1053,14 +965,7 @@ def build_workflow():
             # clarify_next always returns END or conditions that should lead to END.
         }
     )
-    workflow.add_conditional_edges(
-        "suggest_analysis_paths",
-        suggest_analysis_paths_next,
-        {
-            END: END
-            # suggest_analysis_paths_next always returns END
-        }
-    )
+
 
     return workflow.compile(checkpointer=memory)
 
