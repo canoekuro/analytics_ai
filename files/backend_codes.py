@@ -21,6 +21,8 @@ import japanize_matplotlib
 import seaborn as sns
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 import json # import jsonを先頭に移動しました
+import google.generativeai as genai # Gemini API のインポート
+from google.api_core import exceptions as google_exceptions # Google APIエラー処理用
 
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
@@ -34,7 +36,7 @@ vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerou
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
 
 # 環境変数からLLMモデル名を取得します（デフォルト値あり）
-llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-2.0-flash-lite")
+llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-pro") # デフォルトをgemini-1.5-proに変更
 
 llm = ChatGoogleGenerativeAI(
     model=llm_model_name,
@@ -152,92 +154,210 @@ def clear_data_node(state: MyState):
 def create_analysis_plan_node(state: MyState) -> MyState:
     user_query = state.get("input", "")
     user_clarification = state.get("user_clarification")
-
-    # モッキング戦略
-    mock_plan = []
-    plan_json_str = ""
     intent_list = state.get("intent_list", [])
-
-    if user_clarification:
-        original_query_for_llm = state.get("complex_analysis_original_query", user_query)
-        mock_plan = [
-            {"action": "check_history", "details": ["clarified sales data"]},
-            {"action": "sql", "details": "clarified sales data"},
-            {"action": "interpret", "details": "interpret clarified sales data"}
-        ]
-    elif "データ加工" in intent_list:
-        mock_plan = [{"action": "data_processing", "details": user_query}]
-    elif "ambiguous" in user_query.lower() or "vague" in user_query.lower():
-        mock_plan = [{"action": "clarify", "details": "Could you please specify the time period for the sales data?"}]
-    elif "show sales then chart it" in user_query.lower():
-        mock_plan = [
-            {"action": "check_history", "details": ["sales data"]},
-            {"action": "sql", "details": "sales data"},
-            {"action": "chart", "details": "chart sales data"}
-        ]
-    elif "show sales" in user_query.lower() or "interpret data" in user_query.lower():
-        data_req = "sales data" if "sales" in user_query.lower() else "general data"
-        mock_plan = [
-            {"action": "check_history", "details": [data_req]},
-            {"action": "sql", "details": data_req},
-            {"action": "interpret", "details": f"interpret {data_req}"}
-        ]
-    elif "hello" in user_query.lower() or "hi" in user_query.lower():
-        mock_plan = []
-    else:
-        mock_plan = [
-            {"action": "check_history", "details": ["general data from query"]},
-            {"action": "sql", "details": "general data from query"},
-            {"action": "interpret", "details": "interpret general data from query"}
-        ]
+    parsed_plan = None # 初期化
 
     try:
-        plan_json_str = json.dumps(mock_plan)
-    except Exception as e:
-        logging.error(f"mock_planのJSONへのシリアル化中にエラーが発生しました: {e}")
+        # Geminiモデルの初期化
+        model_name_for_genai = "gemini-1.5-pro"
+        model = genai.GenerativeModel(model_name_for_genai)
+        genai.configure(api_key=google_api_key)
+
+        # ツールのスキーマ定義
+        plan_generation_tool = genai.types.Tool(
+        function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="create_plan",
+                description="ユーザーの要求に基づいて分析計画を作成します。",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "plan_steps": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(
+                                type=genai.types.Type.OBJECT,
+                                properties={
+                                    "action": genai.types.Schema(
+                                        type=genai.types.Type.STRING,
+                                        description="実行するアクション（clarify, check_history, sql, chart, interpret, data_processing）"
+                                    ),
+                                    "details": genai.types.Schema(
+                                        type=genai.types.Type.ANY, # string or array of strings
+                                        description="アクションの詳細。clarifyとsqlは文字列、check_historyは文字列の配列。"
+                                    )
+                                },
+                                required=["action", "details"]
+                            )
+                        )
+                    },
+                    required=["plan_steps"]
+                )
+            )
+        ]
+        )
+
+        SYSTEM_PROMPT = """あなたはAIデータアナリストです。ユーザーの要求を分析し、ステップバイステップの分析計画を作成してください。
+利用可能なアクションは次のとおりです:
+- clarify: ユーザーに詳細を質問します。 (例: "期間の指定を求める")
+  - "details": (string) ユーザーへの質問文。
+- check_history: 過去に同様のデータが取得されているか確認します。 (例: "'月次売上データ'を確認")
+  - "details": (array of strings) 確認するデータ要件のリスト。
+- sql: データベースからデータを取得します。 (例: "'特定の製品の売上データを取得'")
+  - "details": (string) SQLで取得する具体的なデータの内容。
+- chart: 取得したデータからグラフを作成します。 (例: "'売上データを棒グラフで表示'")
+  - "details": (string) グラフ作成の指示 (例: "売上データを棒グラフで表示", "DF_KEY['売上データ'] を使用して時系列グラフを作成")。
+- interpret: データやグラフを解釈し、洞察を提供します。 (例: "'売上傾向を分析する'")
+  - "details": (string) 解釈の焦点や内容。
+- data_processing: 既存のデータを加工・変換します。 (例: "'売上データに利益率列を追加する'")
+  - "details": (string) データ加工の具体的な指示。処理対象のDataFrameを指定するには `DF_KEY['your_dataframe_key_in_latest_df']` を含めてください。
+
+以下は計画作成の例です:
+
+例1: 曖昧なリクエスト
+ユーザーのクエリ: "Show me sales data."
+生成されるプラン:
+```json
+[
+  {"action": "clarify", "details": "Could you please specify the time period for the sales data (e.g., last month, last quarter)?"}
+]
+```
+
+例2: 複数ステップのリクエスト
+ユーザーのクエリ: "Get the total sales for product X last month, then visualize it as a bar chart, and finally interpret the chart."
+生成されるプラン:
+```json
+[
+  {"action": "check_history", "details": ["total sales for product X last month"]},
+  {"action": "sql", "details": "total sales for product X last month"},
+  {"action": "chart", "details": "bar chart of total sales for product X last month"},
+  {"action": "interpret", "details": "interpret the bar chart of total sales for product X last month"}
+]
+```
+
+例3: データ加工を含むリクエスト
+ユーザーのクエリ: "Load the customer dataset, then add a new column 'age_group' based on the 'age' column (e.g., <18: Teen, 18-65: Adult, >65: Senior), and show the first 5 rows of the processed data."
+生成されるプラン:
+```json
+[
+  {"action": "check_history", "details": ["customer dataset"]},
+  {"action": "sql", "details": "customer dataset"},
+  {"action": "data_processing", "details": "Add a new column 'age_group' to DF_KEY['customer dataset'] based on the 'age' column (e.g., <18: Teen, 18-65: Adult, >65: Senior)"},
+  {"action": "interpret", "details": "Describe the first 5 rows of the processed customer dataset (DF_KEY['customer dataset']) including the new 'age_group' column."}
+]
+```
+
+必ずJSON形式で plan_steps を含む応答を生成してください。
+"""
+        prompt_parts = [SYSTEM_PROMPT]
+
+        # Add query history to prompt
+        query_history = state.get("query_history", [])
+        MAX_HISTORY_LEN = 5 # 最大履歴数
+        if query_history:
+            history_start_index = max(0, len(query_history) - MAX_HISTORY_LEN -1) # 現在のクエリは除くため-1
+            relevant_history = query_history[history_start_index:-1] if len(query_history) > 1 else []
+            if relevant_history:
+                formatted_history = "\n\n過去の関連する問い合わせ履歴 (新しいものが最後):\n"
+                for i, hist_item in enumerate(relevant_history):
+                    formatted_history += f"- {hist_item}\n"
+                prompt_parts.append(formatted_history)
+
+        prompt_parts.append("\nユーザーの現在のクエリ: ")
+        prompt_parts.append(user_query)
+
+        if user_clarification:
+            prompt_parts.append(f"\nユーザーからの追加情報: {user_clarification}")
+            original_query = state.get("complex_analysis_original_query", "")
+            if original_query and original_query != user_query :
+                 prompt_parts.append(f"\n(この追加情報は、以前のクエリ「{original_query}」に関連しています)")
+
+        final_prompt_string = "".join(prompt_parts)
+        logging.info(f"Geminiへの最終プロンプト:\n{final_prompt_string}")
+
+        # APIコールとレスポンス処理
+        try:
+            response = model.generate_content(
+                final_prompt_string,
+                tools=[plan_generation_tool],
+                generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
+            )
+            logging.info(f"Geminiからのレスポンス: {response}")
+
+            if not response.candidates or not response.candidates[0].content.parts:
+                raise ValueError("Geminiからのレスポンスに有効な候補またはパートがありません。")
+
+            function_call_part = next((part for part in response.candidates[0].content.parts if part.function_call), None)
+            
+            if not function_call_part:
+                raw_text_response = response.text if hasattr(response, 'text') else "利用可能なテキストレスポンスがありません。"
+                logging.warning(f"Geminiレスポンスにfunction_callが含まれていません。テキストレスポンスを試みます: {raw_text_response}")
+                try:
+                    parsed_plan_from_text = json.loads(raw_text_response)
+                    if not (isinstance(parsed_plan_from_text, list) and \
+                       all(isinstance(step, dict) and "action" in step and "details" in step for step in parsed_plan_from_text)):
+                        raise ValueError("テキストレスポンスは有効なプラン形式ではありません。")
+                    logging.info("Geminiがテキスト形式で有効なプランを返しました。これを採用します。")
+                    plan_steps = parsed_plan_from_text
+                except (json.JSONDecodeError, ValueError) as e_text_parse:
+                    logging.error(f"Geminiのテキストレスポンスのパースに失敗: {e_text_parse}")
+                    raise ValueError(f"モデル応答は期待されるfunction_call形式ではなく、テキスト応答の解析にも失敗しました。詳細: {e_text_parse}") from e_text_parse
+            else:
+                function_args = function_call_part.function_call.args
+                if not function_args or "plan_steps" not in function_args:
+                    raise ValueError("Geminiレスポンスのfunction_call.argsにplan_stepsが含まれていません。")
+                plan_steps = function_args["plan_steps"]
+
+            if isinstance(plan_steps, str): # plan_stepsが文字列でJSON配列としてエンコードされている場合
+                try:
+                    plan_steps = json.loads(plan_steps)
+                except json.JSONDecodeError as e_json_str:
+                    raise ValueError(f"plan_stepsのJSON文字列のデコードに失敗: {e_json_str}. 文字列: '{plan_steps}'")
+
+            if not isinstance(plan_steps, list):
+                raise ValueError(f"plan_stepsがリスト形式ではありません。型: {type(plan_steps)}")
+
+            for step in plan_steps: # 各ステップの検証
+                if not (isinstance(step, dict) and "action" in step and "details" in step):
+                    raise ValueError("分析プラン内の各ステップが正しい形式ではありません（'action'と'details'必須）。")
+                allowed_actions = {"clarify", "check_history", "sql", "chart", "interpret", "data_processing"}
+                if step["action"] not in allowed_actions:
+                    logging.warning(f"プランに未知のアクション '{step['action']}' が含まれています。")
+            
+            parsed_plan = plan_steps
+
+        except google_exceptions.GoogleAPICallError as e_api:
+            logging.error(f"Gemini API呼び出し中にエラーが発生しました: {e_api}", exc_info=True)
+            return {**state, "analysis_plan": None, "current_plan_step_index": None, "user_clarification": None,
+                    "condition": "plan_generation_failed", "error": f"分析計画の作成中にモデル呼び出しでエラーが発生しました。管理者にご連絡ください。(詳細: {e_api.message})"}
+        except (ValueError, AttributeError, json.JSONDecodeError) as e_parse:
+            logging.error(f"Geminiレスポンスの処理または検証中にエラーが発生しました: {e_parse}", exc_info=True)
+            return {**state, "analysis_plan": None, "current_plan_step_index": None, "user_clarification": None,
+                    "condition": "plan_generation_failed", "error": f"分析計画の生成中にモデル応答の解析に失敗しました。形式が正しくない可能性があります。(詳細: {str(e_parse)})"}
+
+    except Exception as e_outer: # モデル初期化やプロンプト構築など、APIコール以外の部分での予期せぬエラー
+        logging.error(f"分析計画作成ノードで予期せぬエラーが発生しました: {e_outer}", exc_info=True)
         return {
-            **state,
-            "analysis_plan": None,
-            "current_plan_step_index": None,
-            "user_clarification": None,
-            "condition": "plan_generation_failed",
-            "error": f"分析計画の保存中にエラーが発生しました。: {e}"
+            **state, "analysis_plan": None, "current_plan_step_index": None, "user_clarification": None,
+            "condition": "plan_generation_failed", "error": f"分析計画の作成中に予期せぬシステムエラーが発生しました。管理者にご連絡ください。(詳細: {str(e_outer)})"
         }
-
-    parsed_plan = None
-    try:
-        parsed_plan = json.loads(plan_json_str)
-        if not isinstance(parsed_plan, list):
-            raise ValueError("分析プランがリスト型になっていません。")
-        for step in parsed_plan:
-            if not isinstance(step, dict) or "action" not in step or "details" not in step:
-                raise ValueError("分析プラン内の各ステップが正しい形式ではありません（'action'と'details'必須）。")
-
-    except (json.JSONDecodeError, ValueError) as e:
-        logging.error(f"分析計画のパース・検証に失敗: {e}. Plan string: '{plan_json_str}'")
-        return {
-            **state,
-            "analysis_plan": None,
-            "current_plan_step_index": None,
-            "user_clarification": None,
-            "condition": "plan_generation_failed",
-            "error": f"分析計画の形式や内容に不備があります: {e}"
-        }
-
+        
+    # current_inputの取得とcomplex_analysis_original_queryのロジックは変更なし
     current_input = state.get("input", "")
-    original_query_for_complex = state.get("complex_analysis_original_query", current_input if parsed_plan else None)
-    if user_clarification and not state.get("complex_analysis_original_query"):
-        original_query_for_complex = current_input
-
+    original_query_for_complex = state.get("complex_analysis_original_query")
+    if parsed_plan and not original_query_for_complex and \
+       ("clarify" in [step.get("action") for step in parsed_plan if isinstance(step, dict)] or user_clarification) :
+        original_query_for_complex = user_query
+    
+    # user_clarification はここで消費されるのでNoneにする
     return {
         **state,
         "complex_analysis_original_query": original_query_for_complex,
-        "analysis_plan": parsed_plan,
+        "analysis_plan": parsed_plan, # parsed_planがNoneの場合もある（エラー時など）
         "current_plan_step_index": 0 if parsed_plan else None,
         "awaiting_step_confirmation": False,
-        "user_clarification": None,
-        "condition": "plan_generated" if parsed_plan else "empty_plan_generated",
-        "error": None
+        "user_clarification": None, 
+        "condition": "plan_generated" if parsed_plan else "empty_plan_generated", # エラー時はplan_generation_failedがセットされているはず
+        "error": state.get("error") # エラー時はここでセットされたエラーメッセージが維持される
     }
 
 #分析計画に基づいて、ユーザーに質問

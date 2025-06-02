@@ -173,57 +173,178 @@ class TestCreateAnalysisPlanNode(unittest.TestCase):
         self.assertEqual(result_state["analysis_plan"][0]["action"], "clarify")
         self.assertIn("Could you please specify", result_state["analysis_plan"][0]["details"])
         self.assertEqual(result_state["current_plan_step_index"], 0)
-        self.assertIsNone(result_state["user_clarification"]) # Should be cleared
+from google.api_core import exceptions as google_exceptions
+import json # For creating mock JSON strings
 
-    def test_plan_for_simple_data_query(self):
-        state = MyState(input="show sales data")
+class TestCreateAnalysisPlanNode(unittest.TestCase):
+
+    def setUp(self):
+        # Patch genai.GenerativeModel and genai.configure for all tests in this class
+        self.patcher_model = patch('files.backend_codes.genai.GenerativeModel')
+        self.patcher_configure = patch('files.backend_codes.genai.configure')
+
+        self.mock_generative_model_cls = self.patcher_model.start()
+        self.mock_configure = self.patcher_configure.start()
+
+        # Mock the instance of GenerativeModel
+        self.mock_model_instance = MagicMock()
+        self.mock_generative_model_cls.return_value = self.mock_model_instance
+        
+        # This will be configured per test
+        self.generate_content_mock = MagicMock()
+        self.mock_model_instance.generate_content = self.generate_content_mock
+
+    def tearDown(self):
+        self.patcher_model.stop()
+        self.patcher_configure.stop()
+
+    def _create_mock_gemini_response(self, plan_steps_dict_or_str, has_function_call=True, text_response=None):
+        response_mock = MagicMock()
+        part_mock = MagicMock()
+        
+        if has_function_call:
+            function_call_mock = MagicMock()
+            # plan_steps_dict_or_str could be a dict for args, or a string if testing string parsing
+            function_call_mock.args = plan_steps_dict_or_str if isinstance(plan_steps_dict_or_str, dict) else {"plan_steps": plan_steps_dict_or_str}
+            part_mock.function_call = function_call_mock
+            part_mock.text = None # Explicitly set text to None if function_call is present
+        else:
+            part_mock.function_call = None
+            part_mock.text = text_response
+            # If text_response is intended to be JSON, it should be a JSON string here.
+
+        response_mock.candidates = [MagicMock(content=MagicMock(parts=[part_mock]))]
+        # Also mock the .text attribute on the top-level response for fallback
+        response_mock.text = text_response if text_response else "" # Ensure .text exists
+        return response_mock
+
+    def test_successful_plan_simple_query(self):
+        expected_plan = [{"action": "sql", "details": "total sales"}]
+        mock_response_args = {"plan_steps": expected_plan}
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
+
+        state = MyState(input="show total sales")
         result_state = create_analysis_plan_node(state)
-        self.assertEqual(result_state["condition"], "plan_generated")
-        expected_plan = [
-            {"action": "check_history", "details": ["sales data"]},
-            {"action": "sql", "details": "sales data"},
-            {"action": "interpret", "details": "interpret sales data"}
-        ]
+
         self.assertEqual(result_state["analysis_plan"], expected_plan)
-        self.assertEqual(result_state["current_plan_step_index"], 0)
-        self.assertEqual(result_state["complex_analysis_original_query"], "show sales data")
+        self.assertEqual(result_state["condition"], "plan_generated")
+        self.assertIsNone(result_state["error"])
+        self.generate_content_mock.assert_called_once()
 
+    def test_successful_plan_ambiguous_query_clarify(self):
+        expected_plan = [{"action": "clarify", "details": "Please specify the period for sales data."}]
+        mock_response_args = {"plan_steps": expected_plan}
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
+        
+        state = MyState(input="sales data")
+        result_state = create_analysis_plan_node(state)
 
-    def test_plan_with_user_clarification(self):
-        original_query = "show ambiguous sales"
-        clarification = "for last month"
-        state = MyState(
-            input=original_query, # Original input that led to clarification
-            user_clarification=clarification,
-            complex_analysis_original_query=original_query # This would have been set in a previous turn
+        self.assertEqual(result_state["analysis_plan"], expected_plan)
+        self.assertEqual(result_state["condition"], "plan_generated")
+        self.generate_content_mock.assert_called_once()
+
+    def test_successful_plan_multistep_query(self):
+        expected_plan = [
+            {"action": "sql", "details": "sales"},
+            {"action": "chart", "details": "chart sales"}
+        ]
+        mock_response_args = {"plan_steps": expected_plan}
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
+
+        state = MyState(input="show sales, then chart it")
+        result_state = create_analysis_plan_node(state)
+
+        self.assertEqual(result_state["analysis_plan"], expected_plan)
+        self.assertEqual(result_state["condition"], "plan_generated")
+        self.generate_content_mock.assert_called_once()
+        
+    def test_prompt_includes_query_history(self):
+        history = ["past query 1", "past query 2"]
+        current_query = "current query based on history"
+        expected_plan = [{"action": "sql", "details": "current query data"}]
+        mock_response_args = {"plan_steps": expected_plan}
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
+
+        state = MyState(input=current_query, query_history=history + [current_query]) # History includes current for this setup
+        create_analysis_plan_node(state)
+
+        self.generate_content_mock.assert_called_once()
+        called_prompt_string = self.generate_content_mock.call_args[0][0]
+        self.assertIn("past query 1", called_prompt_string)
+        self.assertIn("past query 2", called_prompt_string)
+        self.assertIn(current_query, called_prompt_string)
+        self.assertNotIn("past query 1\n- past query 1", called_prompt_string) # Ensure no self-repetition from history logic
+
+    def test_error_handling_api_call_failure(self):
+        self.generate_content_mock.side_effect = google_exceptions.GoogleAPICallError("API error")
+
+        state = MyState(input="any query")
+        result_state = create_analysis_plan_node(state)
+
+        self.assertIsNone(result_state["analysis_plan"])
+        self.assertEqual(result_state["condition"], "plan_generation_failed")
+        self.assertIn("モデル呼び出しでエラーが発生しました", result_state["error"])
+        self.assertIn("API error", result_state["error"])
+
+    def test_error_handling_invalid_json_in_function_call_args(self):
+        # Simulate function_call.args["plan_steps"] being a string of malformed JSON
+        malformed_json_string = '[{"action": "sql", "details": "some data"}, {"action": "oops' # Invalid JSON
+        mock_response_args = {"plan_steps": malformed_json_string} # plan_steps itself is the string
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(mock_response_args)
+
+        state = MyState(input="any query")
+        result_state = create_analysis_plan_node(state)
+        
+        self.assertIsNone(result_state["analysis_plan"])
+        self.assertEqual(result_state["condition"], "plan_generation_failed")
+        self.assertIn("モデル応答の解析に失敗しました", result_state["error"])
+        self.assertIn("plan_stepsのJSON文字列のデコードに失敗", result_state["error"])
+
+    def test_error_handling_no_function_call_invalid_text_fallback(self):
+        # Simulate no function_call and text fallback is not valid JSON
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(
+            plan_steps_dict_or_str=None, # No function call args
+            has_function_call=False,
+            text_response="This is not a valid JSON plan."
         )
+        
+        state = MyState(input="any query")
         result_state = create_analysis_plan_node(state)
-        self.assertEqual(result_state["condition"], "plan_generated")
-        expected_plan = [
-            {"action": "check_history", "details": ["clarified sales data"]}, # Mock logic uses "clarified sales data"
-            {"action": "sql", "details": "clarified sales data"},
-            {"action": "interpret", "details": "interpret clarified sales data"}
-        ]
-        self.assertEqual(result_state["analysis_plan"], expected_plan)
-        self.assertEqual(result_state["current_plan_step_index"], 0)
-        self.assertIsNone(result_state["user_clarification"]) # Clarification should be consumed
-        # complex_analysis_original_query should be preserved if already set
-        self.assertEqual(result_state["complex_analysis_original_query"], original_query)
 
-    def test_plan_for_multi_step_query(self):
-        state = MyState(input="show sales then chart it")
+        self.assertIsNone(result_state["analysis_plan"])
+        self.assertEqual(result_state["condition"], "plan_generation_failed")
+        self.assertIn("モデル応答は期待されるfunction_call形式ではなく、テキスト応答の解析にも失敗しました", result_state["error"])
+
+    def test_successful_plan_from_text_fallback_if_no_function_call(self):
+        expected_plan = [{"action": "sql", "details": "data from text"}]
+        valid_json_text_response = json.dumps(expected_plan) # '[{"action": "sql", "details": "data from text"}]'
+        
+        self.generate_content_mock.return_value = self._create_mock_gemini_response(
+            plan_steps_dict_or_str=None,
+            has_function_call=False,
+            text_response=valid_json_text_response
+        )
+
+        state = MyState(input="query leading to text fallback")
         result_state = create_analysis_plan_node(state)
-        self.assertEqual(result_state["condition"], "plan_generated")
-        expected_plan = [
-            {"action": "check_history", "details": ["sales data"]},
-            {"action": "sql", "details": "sales data"},
-            {"action": "chart", "details": "chart sales data"}
-        ]
-        self.assertEqual(result_state["analysis_plan"], expected_plan)
 
-    # Test for JSON encoding/decoding errors (though hard with current mock structure)
-    # These would require deeper patching of json.dumps or json.loads if we wanted to simulate failure
-    # For now, the structure assumes json operations succeed with the mock plans.
+        self.assertEqual(result_state["analysis_plan"], expected_plan)
+        self.assertEqual(result_state["condition"], "plan_generated")
+        self.assertIsNone(result_state["error"])
+
+    def test_error_handling_model_initialization_failure(self):
+        # Make the class constructor raise an error
+        self.mock_generative_model_cls.side_effect = Exception("Model init failed")
+
+        state = MyState(input="any query")
+        result_state = create_analysis_plan_node(state)
+
+        self.assertIsNone(result_state["analysis_plan"])
+        self.assertEqual(result_state["condition"], "plan_generation_failed")
+        self.assertIn("分析計画の作成中に予期せぬシステムエラーが発生しました", result_state["error"])
+        self.assertIn("Model init failed", result_state["error"])
+        self.mock_configure.assert_not_called() # configure should not be called if model init fails
+        self.generate_content_mock.assert_not_called()
 
 
 class TestSqlNode(unittest.TestCase):
