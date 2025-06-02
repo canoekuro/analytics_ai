@@ -69,20 +69,24 @@ class MyState(TypedDict, total=False):
     awaiting_step_confirmation: Optional[bool] = None # ユーザーが次のステップに進むのを待機している場合はTrue
     original_query: Optional[str] = None # clarifyが発生したときに元のクエリを格納します
     user_action: Optional[str] = None # "proceed_analysis_step"や"cancel_analysis_plan"のようなフロントエンドアクション用の新しいフィールド
+    current_status_message: Optional[str] # 現在の処理状況を示すユーザーフレンドリーなメッセージ
 
 #ユーザーの入力に応じて意図を分類
 def classify_intent_node(state: MyState):
     user_input = state["input"]
+    # Set status message
+    updated_state = {**state, "current_status_message": "ユーザーの意図を分類中..."}
+
     if user_input == "SYSTEM_CLEAR_HISTORY":
-        current_history = state.get("query_history", [])
+        current_history = updated_state.get("query_history", [])
         return {
-            **state,
+            **updated_state,
             "intent_list": ["clear_data_intent"],
             "condition": "分類完了",
             "query_history": current_history
         }
 
-    current_history = state.get("query_history", [])
+    current_history = updated_state.get("query_history", [])
     if not current_history or current_history[-1] != user_input:
          current_history.append(user_input)
 
@@ -111,9 +115,11 @@ def classify_intent_node(state: MyState):
     result = llm.invoke(prompt).content.strip()
     steps = [x.strip() for x in result.split(",") if x.strip()]
 
-    return {**state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
+    return {**updated_state, "intent_list": steps, "condition": "分類完了", "query_history": current_history}
 
 def metadata_retrieval_node(state: MyState):
+    # Set status message
+    state = {**state, "current_status_message": "メタデータを検索中..."}
     user_query = state["input"]
     retrieved_docs = vectorstore_tables.similarity_search(user_query)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
@@ -135,8 +141,11 @@ def metadata_retrieval_node(state: MyState):
     return {**state, "metadata_answer": answer, "condition": "メタデータ検索完了"}
 
 def clear_data_node(state: MyState):
+    # Set status message
+    state = {**state, "current_status_message": "データをクリア中..."}
     return {
         "input": state.get("input"),
+        "current_status_message": state.get("current_status_message"), # Ensure message is carried over
         "intent_list": state.get("intent_list"),
         "latest_df": collections.OrderedDict(),
         "df_history": [],
@@ -151,6 +160,8 @@ def clear_data_node(state: MyState):
     
 # 新しい分析計画ノード (create_analysis_plan_node)
 def create_analysis_plan_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "分析プランを生成中..."}
     user_query = state.get("input", "")
     user_clarification = state.get("user_clarification")
     intent_list = state.get("intent_list", [])
@@ -347,7 +358,7 @@ def create_analysis_plan_node(state: MyState) -> MyState:
 
     # user_clarification はここで消費されるのでNoneにする
     return {
-        **state,
+        **state, # Includes current_status_message
         "original_query": original_query,
         "analysis_plan": parsed_plan, # parsed_planがNoneの場合もある（エラー時など）
         "current_plan_step_index": 0 if parsed_plan else None,
@@ -359,11 +370,13 @@ def create_analysis_plan_node(state: MyState) -> MyState:
 
 #分析計画に基づいて、ユーザーに質問
 def clarify_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "ユーザーへの質問を準備中..."}
     current_plan_step_index = state.get("current_plan_step_index")
     analysis_plan = state.get("analysis_plan", [])
     if current_plan_step_index is None or not analysis_plan or not (0 <= current_plan_step_index < len(analysis_plan)):
         logging.error("clarify_node:分析プランの状態が不正です。")
-        return {**state, "error": "分析プランの状態が不正です。", "condition": "clarify_error_invalid_plan"}
+        return {**state, "error": "分析プランの状態が不正です。", "condition": "clarify_error_invalid_plan"} # Includes current_status_message
 
     current_step = analysis_plan[current_plan_step_index]
     action = current_step.get("action")
@@ -375,7 +388,7 @@ def clarify_node(state: MyState) -> MyState:
             clarification_question_from_plan = "追加で確認したい内容がありますが、質問文がプランに見当たりません。"
 
         return {
-            **state,
+            **state, # Includes current_status_message
             "clarification_question": clarification_question_from_plan,
             "user_clarification": None,
             "condition": "awaiting_user_clarification"
@@ -383,16 +396,19 @@ def clarify_node(state: MyState) -> MyState:
     else:
         logging.error(f"clarify_node: 想定外のアクションが渡されました。アクションの内容はこちらです。'{action}'")
         return {
-            **state,
+            **state, # Includes current_status_message
             "error": f"想定外のアクションが渡されました。アクションの内容はこちらです。 {action}",
             "condition": "clarify_error_unexpected_action"
         }
 
 # 追加質問をした際に、実行をキャンセルした際のノード
+# This node is terminal and usually results in showing "interpretation", so a specific status message might not be as critical
+# or could be set if there's a specific message to show upon cancellation.
+# For now, I'm assuming it doesn't need a dedicated "cancelling..." message visible to the user during this very short step.
 def cancel_analysis_plan_node(state: MyState) -> MyState:
     original_query = state.get("original_query", "分析計画はキャンセルされました。")
     return {
-        **state,
+        **state, # Preserve current_status_message if any was set before, or set a new one if desired.
         "analysis_plan": None,
         "current_plan_step_index": None,
         "awaiting_step_confirmation": False,
@@ -405,13 +421,15 @@ def cancel_analysis_plan_node(state: MyState) -> MyState:
 
 # 過去取得したデータを参照するノード
 def check_history_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "過去のデータ履歴を確認中..."}
     analysis_plan = state.get("analysis_plan")
     current_plan_step_index = state.get("current_plan_step_index")
 
     if not analysis_plan or not isinstance(analysis_plan, list) or not analysis_plan:
         # プランがNone、リスト型でない、または空リストの場合はエラーとして返す
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": [],
             "condition": "history_checked_invalid_plan_or_index",
@@ -432,7 +450,7 @@ def check_history_node(state: MyState) -> MyState:
             safe_details_for_error_msg = analysis_plan[current_plan_step_index].get("details", [])
 
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": safe_details_for_error_msg,
             "condition": "history_checked_invalid_plan_or_index",
@@ -466,7 +484,7 @@ def check_history_node(state: MyState) -> MyState:
     if not data_requirements_for_step:
         # それでも要件が取得できない場合はmissing_requirementsは空で返却
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": [],
             "condition": "history_checked_no_requirements",
@@ -496,7 +514,7 @@ def check_history_node(state: MyState) -> MyState:
             missing_requirements.append(req)
 
     return {
-        **state,
+        **state, # Includes current_status_message
         "latest_df": found_data_map,
         "missing_data_requirements": missing_requirements,
         "condition": "history_checked",
@@ -591,13 +609,15 @@ def fix_sql_with_llm(original_sql, error_message, rag_tables, rag_queries, user_
 
 #SQLの生成と実行を行うノード
 def sql_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "SQLを生成・実行中..."}
     # check_historyやルータでセットされるstate.missing_data_requirementsをデータ取得要件とする。
     requirements_to_fetch = state.get("missing_data_requirements", [])
 
     if not requirements_to_fetch:
         logging.info("sql_node: 取得すべき要件が見つからなかったためSQLの作成・実行をスキップします。")
         return {
-            **state,
+            **state, # Includes current_status_message
             "condition": "sql_execution_skipped_no_reqs",
             "SQL": None,
             "error": "SQL実行のための要件が提供されていません。"
@@ -666,7 +686,7 @@ def sql_node(state: MyState) -> MyState:
                 user_friendly_error = transform_sql_error(sql_error)
                 # Return immediately if SQL execution fails after attempting to fix it
                 return {
-                    **state,
+                    **state, # Includes current_status_message
                     "latest_df": current_latest_df,
                     "df_history": current_df_history,
                     "SQL": last_sql_generated,
@@ -680,7 +700,7 @@ def sql_node(state: MyState) -> MyState:
                 logging.info(f"SQL for '{req_string}' は正常にSQL実行されましたが、データがありませんでした。")
                 # Return immediately if SQL execution returns no data
                 return {
-                    **state,
+                    **state, # Includes current_status_message
                     "latest_df": current_latest_df,
                     "df_history": current_df_history,
                     "SQL": last_sql_generated,
@@ -699,7 +719,7 @@ def sql_node(state: MyState) -> MyState:
             current_df_history.append(new_history_entry)
             
     return {
-        **state,
+        **state, # Includes current_status_message
         "latest_df": current_latest_df,
         "df_history": current_df_history,
         "SQL": last_sql_generated, # Stores the very last SQL executed in the loop
@@ -709,21 +729,23 @@ def sql_node(state: MyState) -> MyState:
     }
 
 def interpret_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "データを解釈中..."}
     latest_df_data = state.get("latest_df")
     # 解釈用の文脈は state.input（execute_plan_router が plan step details からセット）を利用
     plan_details_context = state.get("input", "全般的な傾向") # 特定の詳細がない場合のデフォルト
 
     if latest_df_data is None:
         logging.info("interpret_node: latest_dfがNoneのため、解釈できるデータがありません。")
-        return {**state, "interpretation": "解釈するデータがありません。", "condition": "interpretation_failed_no_data"}
+        return {**state, "interpretation": "解釈するデータがありません。", "condition": "interpretation_failed_no_data"} # Includes current_status_message
 
     if not isinstance(latest_df_data, collections.OrderedDict):
         logging.error(f"interpret_node: latest_dfの型がOrderedDictではありません (type: {type(latest_df_data)}).")
-        return {**state, "interpretation": "データの形式が不正です (OrderedDictではありません)。", "condition": "interpretation_failed_bad_format"}
+        return {**state, "interpretation": "データの形式が不正です (OrderedDictではありません)。", "condition": "interpretation_failed_bad_format"} # Includes current_status_message
 
     if not latest_df_data: # OrderedDictが空かどうかを確認
         logging.info("interpret_node: latest_dfが空（データ無し）です。")
-        return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"}
+        return {**state, "interpretation": "解釈するデータが空です。", "condition": "interpretation_failed_empty_data"} # Includes current_status_message
 
     full_data_string = ""
     
@@ -754,7 +776,7 @@ def interpret_node(state: MyState) -> MyState:
 
     if not full_data_string.strip() or (processed_parts and all_parts_indicate_no_data):
         logging.info("interpret_node: データ内容が全て空またはエラーのため、解釈対象がありません。")
-        return {**state, "interpretation": "解釈対象の有効なデータがありませんでした。", "condition": "interpretation_failed_empty_data"}
+        return {**state, "interpretation": "解釈対象の有効なデータがありませんでした。", "condition": "interpretation_failed_empty_data"} # Includes current_status_message
 
     system_prompt = "あなたは優秀なデータ分析の専門家です。"
     user_prompt = f"""
@@ -780,16 +802,18 @@ def interpret_node(state: MyState) -> MyState:
         logging.error(f"interpret_node: LLM呼び出し中に例外が発生しました: {e}")
         interpretation_text = "解釈中にエラーが発生しました。"
         final_condition = "interpretation_failed"
-    return {**state, "interpretation": interpretation_text, "condition": final_condition}
+    return {**state, "interpretation": interpretation_text, "condition": final_condition} # Includes current_status_message
 
 
 def chart_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "グラフを生成中..."}
     latest_df_data = state.get("latest_df")
     # 計画ステップ詳細からのグラフ作成指示（現在はstate.input内）
     chart_instructions = state.get("input", "Generate a suitable chart for the available data.")
 
     if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v): # 少なくとも1つのdfにデータがあることを確認
-        return {**state, "chart_result": None, "condition": "chart_generation_failed_no_data"}
+        return {**state, "chart_result": None, "condition": "chart_generation_failed_no_data"} # Includes current_status_message
 
     df_to_plot = None
     selected_key_for_chart = None
@@ -832,7 +856,7 @@ def chart_node(state: MyState) -> MyState:
                     continue
 
     if df_to_plot is None or df_to_plot.empty:
-        return {**state, "chart_result": None, "condition": "chart_generation_failed_empty_selected_data", "error": "チャート作成に適したデータが見つかりませんでした。"}
+        return {**state, "chart_result": None, "condition": "chart_generation_failed_empty_selected_data", "error": "チャート作成に適したデータが見つかりませんでした。"} # Includes current_status_message
 
     python_tool = PythonAstREPLTool(
         locals={"df": df_to_plot, "sns": sns, "pd": pd, "japanize_matplotlib": japanize_matplotlib},
@@ -866,24 +890,26 @@ def chart_node(state: MyState) -> MyState:
 
         if os.path.exists("output.png"):
             fig = base64.b64encode(open("output.png", "rb").read()).decode('utf-8')
-            return {**state, "chart_result": fig, "condition": "chart_generation_done"}
+            return {**state, "chart_result": fig, "condition": "chart_generation_done"} # Includes current_status_message
         else:
             logging.error("chart_node: エージェントは実行されましたが、output.pngが見つかりませんでした。エージェントの出力に理由が示されている可能性があります。")
             error_message = "グラフファイルの生成に失敗しました。"
             if isinstance(agent_response, dict) and "output" in agent_response:
                 error_message += f" (エージェント: {agent_response['output']})"
-            return {**state, "chart_result": None, "condition": "chart_generation_failed_no_output_file", "error": error_message}
+            return {**state, "chart_result": None, "condition": "chart_generation_failed_no_output_file", "error": error_message} # Includes current_status_message
     except Exception as e:
         logging.error(f"chart_node: エージェント実行中にエラーが発生しました: {e}", exc_info=True)
-        return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)}
+        return {**state, "chart_result": None, "condition": "chart_generation_failed_agent_error", "error": str(e)} # Includes current_status_message
 
 def data_processing_node(state: MyState) -> MyState:
+    # Set status message
+    state = {**state, "current_status_message": "データを処理中..."}
     latest_df_data = state.get("latest_df")
     processing_instructions = state.get("input", "データフレームに対して指示された処理を実行してください。") # Plan step details
 
     if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v):
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": latest_df_data, # Keep existing data even if empty
             "condition": "data_processing_failed_no_data",
             "error": "データ処理のための有効なデータがありません。"
@@ -953,7 +979,7 @@ def data_processing_node(state: MyState) -> MyState:
 
     if df_to_process is None or df_to_process.empty:
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": latest_df_data,
             "condition": "data_processing_failed_empty_selected_data",
             "error": "データ処理に適したデータが見つかりませんでした。"
@@ -1010,7 +1036,7 @@ def data_processing_node(state: MyState) -> MyState:
             # エージェントの出力（思考プロセスや最終的なテキスト応答）をエラーメッセージに含める
             agent_output_for_error = agent_response.get('output', 'エージェントからの具体的な出力なし') if isinstance(agent_response, dict) else str(agent_response)
             return {
-                **state,
+                **state, # Includes current_status_message
                 "latest_df": latest_df_data, # Keep original data
                 "condition": "data_processing_failed_bad_output",
                 "error": f"データ処理後、期待されるDataFrame形式ではありませんでした。エージェントの出力: {agent_output_for_error}"
@@ -1027,7 +1053,7 @@ def data_processing_node(state: MyState) -> MyState:
         updated_latest_df[selected_key] = processed_df.to_dict(orient="records")
 
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": updated_latest_df,
             "condition": "data_processing_done",
             "error": None
@@ -1036,7 +1062,7 @@ def data_processing_node(state: MyState) -> MyState:
     except Exception as e:
         logging.error(f"data_processing_node: エージェント実行または結果処理中にエラー: {e}", exc_info=True)
         return {
-            **state,
+            **state, # Includes current_status_message
             "latest_df": latest_df_data, # Keep original data on error
             "condition": "data_processing_failed_agent_error",
             "error": f"データ処理エージェントの実行中にエラーが発生しました: {str(e)}"
