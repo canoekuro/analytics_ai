@@ -430,7 +430,7 @@ def check_history_node(state: MyState) -> MyState:
     if not analysis_plan or not isinstance(analysis_plan, list) or not analysis_plan:
         # プランがNone、リスト型でない、または空リストの場合はエラーとして返す
         return {
-            **state, # Includes current_status_message
+            **state,
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": [],
             "condition": "history_checked_invalid_plan_or_index",
@@ -451,7 +451,7 @@ def check_history_node(state: MyState) -> MyState:
             safe_details_for_error_msg = analysis_plan[current_plan_step_index].get("details", [])
 
         return {
-            **state, # Includes current_status_message
+            **state,
             "latest_df": collections.OrderedDict(),
             "missing_data_requirements": safe_details_for_error_msg,
             "condition": "history_checked_invalid_plan_or_index",
@@ -814,7 +814,11 @@ def chart_node(state: MyState) -> MyState:
     chart_instructions = state.get("input", "Generate a suitable chart for the available data.")
 
     if not latest_df_data or not isinstance(latest_df_data, collections.OrderedDict) or not any(v for v in latest_df_data.values() if v): # 少なくとも1つのdfにデータがあることを確認
-        return {**state, "chart_result": None, "condition": "chart_generation_failed_no_data"} # Includes current_status_message
+        return {
+            **state, 
+            "chart_result": None, 
+            "condition": "グラフの作成に必要なデータがありませんでした。"
+        }
 
     df_to_plot = None
     selected_key_for_chart = None
@@ -879,7 +883,8 @@ def chart_node(state: MyState) -> MyState:
 
     chart_prompt = f"""
     あなたはPythonプログラミングとデータ可視化の専門家です。
-    {chart_context_message}最適なインタラクティブグラフを `plotly.express` (例: `px`) を使用して生成してください。
+    {chart_context_message}
+    最適なインタラクティブグラフを `plotly.express` (例: `px`) を使用して生成してください。
     生成したFigureオブジェクトを `fig` という変数に格納し、その後 `fig.to_json()` を呼び出してJSON文字列に変換し、そのJSON文字列を `print` してください。
     dfの列情報: {df_info_str}
     dfの最初の5行:
