@@ -932,15 +932,15 @@ def suggest_analysis_paths_node(state: MyState) -> MyState:
                 data_summary_parts.append(f"Data for '{req}': Empty or not available")
     data_summary = "\n".join(data_summary_parts) if data_summary_parts else "No data retrieved or all data was empty."
     recent_query_history_summary = "\n".join(query_history[-3:]) if query_history else "No query history."
-    prompt_for_suggestions = f """
+    prompt_for_suggestions = f"""
         You are an intelligent data analysis assistant. Based on the user's recent activity and the data obtained, suggest 2-3 relevant follow-up questions or analysis actions the user might be interested in.
         Format your response as a Python-style list of strings. For example: ["Show sales by region", "Analyze customer churn"]
         If no specific suggestions come to mind or if the data is insufficient for further meaningful analysis, return an empty list: [].
         
-        User's original request: "{original_user_input}"　
+        User's original request: {original_user_input}
         Summary of current data:
         {data_summary}
-        Current interpretation/summary of findings: "{current_interpretation if current_interpretation else 'Not yet available.'}"
+        Current interpretation/summary of findings: {current_interpretation if current_interpretation else 'Not yet available.'}
         Recent query history:
         {recent_query_history_summary}
         
