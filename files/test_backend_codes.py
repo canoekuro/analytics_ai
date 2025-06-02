@@ -2086,22 +2086,42 @@ class TestWorkflow(unittest.TestCase):
         # Build a new workflow for each test to ensure isolation
         self.workflow = build_workflow()
 
-    @patch('files.backend_codes.llm') # Mock for classify and extract_data_requirements, interpret
-    @patch('files.backend_codes.vectorstore_tables.similarity_search') # Mock for RAG in sql_node (if reached)
-    @patch('files.backend_codes.vectorstore_queries.similarity_search') # Mock for RAG in sql_node (if reached)
-    @patch('files.backend_codes.try_sql_execute') # Mock for DB in sql_node (if reached)
-    @patch('files.backend_codes.PythonAstREPLTool') # Mock for chart_node's tool
+    @patch('files.backend_codes.create_analysis_plan_node') # ADDED
+    @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.vectorstore_tables.similarity_search')
+    @patch('files.backend_codes.vectorstore_queries.similarity_search')
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.PythonAstREPLTool')
     def test_workflow_all_data_found_then_interpret(
-        self, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
+        self, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm, mock_create_plan # ADDED mock_create_plan
     ):
         user_input = "A商品の売上と顧客属性について教えて"
         config = {"configurable": {"thread_id": "test_thread_all_found"}}
 
+        # --- Mocking for create_analysis_plan_node ---
+        def create_plan_side_effect_all_found(state):
+            plan = [
+                {"action": "check_history", "details": ["A商品の売上", "顧客属性"]},
+                {"action": "sql", "details": ["A商品の売上", "顧客属性"]}, # Assuming sql_node handles list of details
+                {"action": "interpret", "details": user_input} # Original user input for interpretation context
+            ]
+            return {
+                **state,
+                "analysis_plan": plan,
+                "current_plan_step_index": 0,
+                "condition": "plan_generated",
+                "user_clarification": None,
+                "complex_analysis_original_query": state.get("input"),
+                "error": None
+            }
+        mock_create_plan.side_effect = create_plan_side_effect_all_found
+
         # --- Mocking sequence for LLM calls ---
         # 1. classify_intent_node
+        # 2. interpret_node result
+        # extract_data_requirements_node was removed, and create_analysis_plan is now mocked.
         mock_llm.invoke.side_effect = [
             MagicMock(content="データ取得,データ解釈"),  # classify_intent_node result
-            MagicMock(content="A商品の売上,顧客属性"), # extract_data_requirements_node result
             MagicMock(content="Interpreted results about A sales and customer attributes.") # interpret_node result
         ]
 
@@ -2164,19 +2184,15 @@ class TestWorkflow(unittest.TestCase):
 
         # Check LLM calls
         # Call 1 (classify): "データ取得,データ解釈"
-        # Call 2 (extract_data_req): "A商品の売上,顧客属性"
-        # Call 3 (interpret): "Interpreted results..."
-        self.assertEqual(mock_llm.invoke.call_count, 3)
+        # Call 2 (interpret): "Interpreted results..."
+        self.assertEqual(mock_llm.invoke.call_count, 2) # Adjusted due to removed extract_data_requirements
 
         llm_calls = mock_llm.invoke.call_args_list
         # Call 1: Classify intent
-        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0])) # Prompt for classify_intent
+        self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
         self.assertIn(user_input, str(llm_calls[0].args[0]))
-        # Call 2: Extract data requirements
-        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0])) # Prompt for extract_data_requirements
-        self.assertIn(user_input, str(llm_calls[1].args[0]))
-        # Call 3: Interpret node
-        self.assertIn("以下のSQLクエリ実行結果群について", str(llm_calls[2].args[0])) # Prompt for interpret_node
+        # Call 2: Interpret node
+        self.assertIn("以下のデータセット群について", str(llm_calls[1].args[0])) # Prompt for interpret_node
         self.assertIn("A商品の売上", str(llm_calls[2].args[0])) # Check if data is in prompt
         self.assertIn("顧客属性", str(llm_calls[2].args[0]))
 
@@ -2250,28 +2266,52 @@ class TestWorkflow(unittest.TestCase):
         # were not called as they would have made additional LLM calls with different prompts.
 
     @patch('files.backend_codes.llm')
+    @patch('files.backend_codes.create_analysis_plan_node') # ADDED
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
-    @patch('files.backend_codes.try_sql_execute') # Keep for sql_node
-    @patch('files.backend_codes.PythonAstREPLTool') # For chart_node
-    @patch('files.backend_codes.uuid.uuid4') # For sql_node history
+    @patch('files.backend_codes.try_sql_execute')
+    @patch('files.backend_codes.PythonAstREPLTool')
+    @patch('files.backend_codes.uuid.uuid4')
     def test_workflow_missing_data_then_sql_then_chart(
-        self, mock_uuid, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm
+        self, mock_uuid4, mock_repl_tool, mock_try_sql, mock_vs_queries, mock_vs_tables, mock_llm_invoker, mock_create_plan # ADDED mock_create_plan, renamed mock_llm to mock_llm_invoker
     ):
         user_input = "A商品の売上とB商品の在庫をグラフにして"
         config = {"configurable": {"thread_id": "test_thread_missing_sql_chart"}}
-        mock_uuid.return_value = MagicMock(hex=MagicMock(return_value="wf_sql_".ljust(8, '0')))
+
+        mock_uuid_obj = MagicMock()
+        mock_uuid_obj.hex = "wf_sql_fixeduuid" # ensure it's long enough for [:8]
+        mock_uuid4.return_value = mock_uuid_obj
+
+        # --- Mocking for create_analysis_plan_node ---
+        def create_plan_side_effect_chart(state):
+            plan = [
+                {"action": "check_history", "details": ["A商品の売上", "B商品の在庫"]},
+                {"action": "sql", "details": ["A商品の売上", "B商品の在庫"]}, # sql_node iterates
+                {"action": "chart", "details": user_input}
+            ]
+            return {
+                **state,
+                "analysis_plan": plan,
+                "current_plan_step_index": 0,
+                "condition": "plan_generated",
+                "user_clarification": None,
+                "complex_analysis_original_query": state.get("input"),
+                "error": None
+            }
+        mock_create_plan.side_effect = create_plan_side_effect_chart
 
         # --- Mocking sequence for LLM calls ---
-        # 1. classify_intent_node: "データ取得,グラフ作成"
-        # 2. extract_data_requirements_node: "A商品の売上,B商品の在庫"
-        # 3. sql_node (for B商品の在庫): generates SQL "SELECT * FROM B_inventory;"
-        # 4. chart_node: Python code for charting
-        mock_llm.invoke.side_effect = [
-            MagicMock(content="データ取得,グラフ作成"),           # Call 1: classify_intent
-            MagicMock(content="A商品の売上,B商品の在庫"),       # Call 2: extract_data_requirements
-            MagicMock(content="SELECT * FROM B_inventory;"), # Call 3: sql_node (SQL gen for B商品の在庫)
-            MagicMock(content="print('Chart generated')")    # Call 4: chart_node (agent prompt)
+        # 1. classify_intent_node
+        # 2. sql_node (for B商品の在庫 - assuming A is found by check_history)
+        # 3. chart_node agent
+        mock_llm_invoker.side_effect = [
+            MagicMock(content="データ取得,グラフ作成"),      # Call 1: classify_intent
+            # extract_data_requirements_node is removed
+            MagicMock(content="SELECT * FROM B_inventory;"), # Call 2: sql_node (SQL gen for B商品の在庫)
+            # Call 3: chart_node's agent - this is handled by mocking the agent's invoke directly if needed,
+            # or by mocking the PythonAstREPLTool's execution if we test chart_node's internals.
+            # For this workflow test, if chart_node is not fully mocked, its agent will call LLM.
+            MagicMock(content="import matplotlib.pyplot as plt\nplt.figure()\nplt.plot(df['A'], df['B'])\nplt.savefig('output.png')") # Call 3: chart_node agent
         ]
 
         # --- Data for find_similar_query_node ---
@@ -2349,33 +2389,18 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(len(final_state["df_history"]), 2)
         self.assertTrue(any(h["query"] == "B商品の在庫" for h in final_state["df_history"]))
 
-        # LLM Calls: classify, extract_req, sql_gen_B, chart_agent_prompt
-        self.assertEqual(mock_llm.invoke.call_count, 4)
-        llm_calls = mock_llm.invoke.call_args_list
+        # LLM Calls: classify, sql_gen_B, chart_agent_prompt
+        self.assertEqual(mock_llm_invoker.call_count, 3) # Adjusted
+        llm_calls = mock_llm_invoker.call_args_list
         # Call 1: Classify intent
         self.assertIn("ユーザーの質問の意図を判定してください。", str(llm_calls[0].args[0]))
         self.assertIn(user_input, str(llm_calls[0].args[0]))
-        # Call 2: Extract data requirements
-        self.assertIn("必要となる具体的なデータの要件を抽出してください。", str(llm_calls[1].args[0]))
-        self.assertIn(user_input, str(llm_calls[1].args[0]))
-        # Call 3: SQL node (for B商品の在庫)
-        self.assertIn("【現在の具体的なデータ取得要件】", str(llm_calls[2].args[0])) # Prompt for sql_node
-        self.assertIn("B商品の在庫", str(llm_calls[2].args[0]))
-        # Call 4: Chart node (agent prompt)
-        # The chart_node's agent is initialized with PythonAstREPLTool, and agent.invoke is called.
-        # The prompt to this agent.invoke is what we check here.
-        agent_chart_prompt = final_state.get("_chart_agent_prompt_for_test", "") # Assuming we store it for test
-                                                                                # Or, get from mock_repl_tool_instance.invoke.call_args
+        # Call 2: SQL node (for B商品の在庫)
+        self.assertIn("【現在の具体的なデータ取得要件】", str(llm_calls[1].args[0]))
+        self.assertIn("B商品の在庫", str(llm_calls[1].args[0])) # This assumes B is the one fetched
+        # Call 3: Chart node (agent prompt)
+        self.assertIn("最適なグラフを生成し、'output.png'というファイル名で保存してください。", str(llm_calls[2].args[0]))
 
-        # The PythonAstREPLTool's .invoke method is called by the agent framework.
-        # The mock_repl_tool is the class, mock_repl_tool_instance is the instance.
-        # The agent's invoke (which is different from the tool's invoke) gets the chart_prompt.
-        # The PythonAstREPLTool itself is not directly invoked with the chart_prompt.
-        # The chart_prompt is for the LLM part of the agent.
-        # So, checking mock_llm.invoke.call_args_list[3] is correct for the agent's LLM call.
-        self.assertIn("最適なグラフをsns(seaborn)で作成して", str(llm_calls[3].args[0]))
-        self.assertIn(user_input, str(llm_calls[3].args[0]))
-        self.assertIn("A商品の売上", str(llm_calls[3].args[0]))
 
 
         # RAG calls for B商品の在庫 in sql_node
@@ -2518,25 +2543,44 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(mock_vs_queries.call_count, 2)
 
 
+    @patch('files.backend_codes.create_analysis_plan_node') # ADDED
     @patch('files.backend_codes.llm')
     @patch('files.backend_codes.check_history_node')
     @patch('files.backend_codes.vectorstore_tables.similarity_search')
     @patch('files.backend_codes.vectorstore_queries.similarity_search')
     @patch('files.backend_codes.try_sql_execute')
     @patch('files.backend_codes.extract_sql', side_effect=lambda x: x.replace("```sql", "").replace("```", "").strip())
-    @patch('files.backend_codes.suggest_analysis_paths_node') # To verify it's reached on failure
+    @patch('files.backend_codes.suggest_analysis_paths_node')
     def test_workflow_sql_error_recovery_failure(
         self, mock_suggest_node, mock_extract_sql, mock_try_sql,
-        mock_vs_queries, mock_vs_tables, mock_check_history, mock_llm_invoker
+        mock_vs_queries, mock_vs_tables, mock_check_history, mock_llm_invoker, mock_create_plan # ADDED mock_create_plan
     ):
-        user_input = "Show Problematic Data" # Plan: CH, SQL, Interpret
+        user_input = "Show Problematic Data"
         config = {"configurable": {"thread_id": f"test_sql_rec_fail_{self.id()}"}}
+
+        # --- Mocking for create_analysis_plan_node ---
+        def create_plan_side_effect_problematic(state):
+            plan = [
+                {"action": "check_history", "details": ["Problematic Data"]},
+                {"action": "sql", "details": ["Problematic Data"]},
+                {"action": "interpret", "details": user_input}
+            ]
+            return {
+                **state,
+                "analysis_plan": plan,
+                "current_plan_step_index": 0,
+                "condition": "plan_generated",
+                "user_clarification": None,
+                "complex_analysis_original_query": state.get("input"),
+                "error": None
+            }
+        mock_create_plan.side_effect = create_plan_side_effect_problematic
 
         # LLM Mocks: classify, sql_initial, sql_fix
         mock_llm_invoker.side_effect = [
             MagicMock(content="データ取得"), # classify_intent
-            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # Initial SQL
-            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```")  # "Fixed" SQL (still faulty)
+            MagicMock(content="```sql\nSELECT * FRMO problematic_sales;\n```"), # Initial SQL for "Problematic Data"
+            MagicMock(content="```sql\nSELECT * FRRMO problematic_sales;\n```")  # "Fixed" SQL for "Problematic Data"
         ]
 
         # Mock check_history for a miss
