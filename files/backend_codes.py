@@ -530,7 +530,6 @@ tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processi
 
 
 def supervisor_node(state: MyState):
-    try:
         supervisor_llm = llm.bind_tools(tools)
         logging.info("supervisor: Thinking...")
         response = supervisor_llm.invoke(state['messages'])
@@ -570,26 +569,30 @@ def supervisor_node(state: MyState):
         plan_status_text = f"こちらの計画が進行中です。計画リスト: {plan}"
     else:
         plan_status_text = "現在、進行中の分析計画はありません。"
+    try:
 
-    # Supervisorのエージェントを準備
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", supervisor_prompt_template),
-        ("placeholder", "{messages}"),
-    ])
-    
-    # supervisor_llmのtool_choiceを動的に変更することで、次のタスクを強制する
-    # これはより高度な制御ですが、今回はプロンプトの指示に従わせるアプローチを採用します。
-    supervisor_llm = llm.bind_tools(tools)
-    
-    # エージェントを実行
-    logging.info("スーパーバイザ: 次の行動を考えています...")
-    response = supervisor_llm.invoke({
-        "messages": state['messages'],
-        "plan_status": plan_status_text,
-    })
-    
-    logging.info(f"スーパーバイザの判断: {response.tool_calls or response.content}")
-    return {"messages": [response]}    
+        # Supervisorのエージェントを準備
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", supervisor_prompt_template),
+            ("placeholder", "{messages}"),
+        ])
+        
+        # supervisor_llmのtool_choiceを動的に変更することで、次のタスクを強制する
+        # これはより高度な制御ですが、今回はプロンプトの指示に従わせるアプローチを採用します。
+        supervisor_llm = llm.bind_tools(tools)
+        
+        # エージェントを実行
+        logging.info("スーパーバイザ: 次の行動を考えています...")
+        response = supervisor_llm.invoke({
+            "messages": state['messages'],
+            "plan_status": plan_status_text,
+        })
+        
+        logging.info(f"スーパーバイザの判断: {response.tool_calls or response.content}")
+        return {"messages": [response]}    
+    except Exception as e:
+        state["error"] = f"処理中にエラーが発生しました: {e}"
+        return state
 
 def build_workflow():
     graph_builder = StateGraph(MyState)
