@@ -470,7 +470,6 @@ def processing_node(task_description: str, state: MyState):
 
         state.setdefault("task_description_history", []).append(task_description)
         processed_df = python_tool.globals.get("result")
-        processed_df = python_tool.globals.get("result")
         if not isinstance(processed_df, pd.DataFrame):
         # エラー処理または警告をログに出力
             logging.error("Processing node did not return a DataFrame in 'result'.")
