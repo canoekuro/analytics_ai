@@ -479,7 +479,7 @@ def processing_node(task_description: str, state: MyState):
 tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analyze_step_node]
 def supervisor_node(state: MyState):
     supervisor_llm = llm.bind_tools(tools)
-    print(" supervisor: Thinking...")
+    logging.info("supervisor: Thinking...")
     response = supervisor_llm.invoke(state['messages'])
     return {"messages": [response]}
 
