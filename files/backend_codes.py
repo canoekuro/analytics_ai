@@ -20,7 +20,7 @@ from langchain_openai import AzureChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 import operator
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage, ChatPromptTemplate
 from functions import extract_sql, try_sql_execute, fix_sql_with_llm
 import os
 
@@ -58,12 +58,19 @@ vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_danger
 class MyState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], operator.add] # 基本的な会話履歴
     task_description_history: Optional[List[str]]             # 各エージェントへの指示
-    metadata_answer: Optional[List[dict[str, str]]]    # メタデータ検索結果の回答
+    metadata_answer_history: Optional[List[dict[str, str]]]    # メタデータ検索結果の回答
     df_history: Optional[List[dict[str, Any]]]   # SQL実行結果のDataFrameの履歴
     sql_history: Optional[List[dict[str, Any]]]   # SQLの履歴
     interpretation_history: Optional[List[dict[str, str]]]     # データ解釈（分析コメント）
     chart_history: Optional[List[dict[str, str]]]      # Plotlyによって生成されたグラフのJSON文字列
-    analyze_step: Optional[List[dict[str, str]]] 
+    analysis_plan_history: Optional[List[dict[str, str]]] #分析プラン
+    metadata_answer_latest: Optional[List[dict[str, str]]]    # メタデータ検索結果の回答
+    df_latest: Optional[List[dict[str, Any]]]   # SQL実行結果のDataFrameの履歴
+    sql_latest: Optional[List[dict[str, Any]]]   # SQLの履歴
+    interpretation_latest: Optional[List[dict[str, str]]]     # データ解釈（分析コメント）
+    chart_latest: Optional[List[dict[str, str]]]      # Plotlyによって生成されたグラフのJSON文字列
+    analysis_plan_latest: Optional[List[dict[str, str]]] #分析プラン
+
     error: Optional[str]
 
 
@@ -105,11 +112,13 @@ def metadata_retrieval_node(task_description: str, state: MyState):
     response = llm.invoke(llm_prompt)
     metadata_answer = response.content.strip()
     state.setdefault("task_description_history", []).append(task_description)
-    state.setdefault("metadata_answer", []).append({task_description: metadata_answer})
+    state.setdefault("metadata_answer_history", []).append({task_description: metadata_answer})
+    state.setdefault("metadata_answer_latest", []).append({task_description: metadata_answer})
+
     return state
 
 @tool
-def analyze_step_node(task_description: str, state: MyState):
+def analysis_plan_node(task_description: str, state: MyState):
     """
     自然言語のタスク記述とstate内の会話履歴を受け取り、文脈を理解した上で必要な分析ステップを考えます。
     ユーザーから分析依頼があり、分析要件を具体化したい際に使います。
@@ -123,7 +132,7 @@ def analyze_step_node(task_description: str, state: MyState):
     context = "\n".join([f"{msg.role}: {msg.content}" for msg in recent_history])
 
     # Rag情報
-    logging.info(f"analyze_step_node: RAG情報を読み込み中 '{task_description}'")
+    logging.info(f"analysis_plan_node: RAG情報を読み込み中 '{task_description}'")
     retrieved_docs = vectorstore_tables.similarity_search(task_description)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
     
@@ -141,12 +150,14 @@ def analyze_step_node(task_description: str, state: MyState):
 
     【回答】
     """
-    logging.info(f"analyze_step_node: 生成AIが考えています・・・ '{task_description}'")
+    logging.info(f"analysis_plan_node: 生成AIが考えています・・・ '{task_description}'")
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     step_answer = response.content.strip()
     state.setdefault("task_description_history", []).append(task_description)
-    state.setdefault("analyze_step", []).append({task_description:step_answer})
+    state.setdefault("analysis_plan_history", []).append({task_description: step_answer})
+    state.setdefault("analysis_plan_latest", []).append({task_description: step_answer})
+
     return state
 
 @tool
@@ -217,8 +228,11 @@ def sql_node(task_description: str, state: MyState):
     result_df_dict = result_df.to_dict(orient="records") 
     result_dict = {task_description: result_df_dict}
     state.setdefault("df_history", []).append(result_dict)
+    state.setdefault("df_latest", []).append(result_dict)
+
     sql_dict = {task_description: last_sql_generated}
     state.setdefault("sql_history", []).append(sql_dict)
+    state.setdefault("sql_latest", []).append(sql_dict)
 
     return state
 
@@ -300,6 +314,7 @@ def interpret_node(task_description: str, state: MyState):
     state.setdefault("task_description_history", []).append(task_description)
     interpretation_dict = {task_description: interpretation_text}
     state.setdefault("interpretation_history", []).append(interpretation_dict)
+    state.setdefault("interpretation_latest", []).append(interpretation_dict)
     return state
 
 @tool
@@ -402,6 +417,8 @@ def chart_node(task_description: str, state: MyState):
             state.setdefault("task_description_history", []).append(task_description)
             chart_dict = {task_description: plotly_json_string}
             state.setdefault("chart_history", []).append(chart_dict)
+            state.setdefault("chart_latest", []).append(chart_dict)
+
             return state
         
         except (json.JSONDecodeError, TypeError) as e:
@@ -502,13 +519,16 @@ def processing_node(task_description: str, state: MyState):
             logging.error("Processing node did not return a DataFrame in 'result'.")
             raise RuntimeError("Data processing agentは有効なデータフレームを返しませんでした。")
         state.setdefault("df_history", []).append({task_description: processed_df.to_dict(orient="records") if isinstance(processed_df, pd.DataFrame) else [] })
+        state.setdefault("df_latest", []).append({task_description: processed_df.to_dict(orient="records") if isinstance(processed_df, pd.DataFrame) else [] })
 
         return state
 
     except Exception as e:
         raise
 
-tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analyze_step_node]
+tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analysis_plan_node]
+
+
 def supervisor_node(state: MyState):
     try:
         supervisor_llm = llm.bind_tools(tools)
@@ -518,7 +538,58 @@ def supervisor_node(state: MyState):
     except Exception as e:
         state["error"] = f"処理中にエラーが発生しました: {e}"
         return state
+
+def supervisor_node(state: MyState):
+    """
+    State全体を監視し、分析計画に基づいて次に実行すべきツールを決定する、
+    インテリジェントなプロジェクトマネージャー。
+    """
+    logging.info("--- スーパーバイザのターン ---")
+
+    # Supervisorの思考回路となるプロンプトを定義
+    supervisor_prompt_template = """
+    あなたはデータ分析チームを率いる有能なプロジェクトマネージャーAIです。
+    以下の状況を正確に把握し、次に何をすべきか判断し、最適な専門家（ツール）を一人だけ選んで指示を出してください。
+
+    -----------------
+    [最優先タスク：進行中の分析計画]
+    {plan_status}
+    -----------------
+
+    上記の情報を踏まえ、ユーザーとの会話履歴全体を考慮して、次に行うべきことを判断してください。
+
+    - もし【進行中の分析計画】が存在し、まだ完了していない場合、その計画に厳密に従ってください。計画の「次のステップ」の指示内容を実行するために、最も適切な専門家（ツール）を一人選択してください。
+    - もし【進行中の分析計画】が存在しない場合、ユーザーの最新の指示に応答してください。指示が複雑な分析を要すると判断した場合は、まず 'analyze_step_node' を呼び出して計画を立てることを強く推奨します。
+    - 全ての計画が完了した、あるいはユーザーの質問に完全に答えることができたと判断した場合は、ツールを呼ばずに、ユーザーへの最終回答を生成してください。
+    """
     
+    # Stateに応じてプロンプトに埋め込むテキストを動的に生成
+    plan = state.get('analysis_plan')
+    
+    if plan:
+        plan_status_text = f"こちらの計画が進行中です。計画リスト: {plan}"
+    else:
+        plan_status_text = "現在、進行中の分析計画はありません。"
+
+    # Supervisorのエージェントを準備
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", supervisor_prompt_template),
+        ("placeholder", "{messages}"),
+    ])
+    
+    # supervisor_llmのtool_choiceを動的に変更することで、次のタスクを強制する
+    # これはより高度な制御ですが、今回はプロンプトの指示に従わせるアプローチを採用します。
+    supervisor_llm = llm.bind_tools(tools)
+    
+    # エージェントを実行
+    logging.info("スーパーバイザ: 次の行動を考えています...")
+    response = supervisor_llm.invoke({
+        "messages": state['messages'],
+        "plan_status": plan_status_text,
+    })
+    
+    logging.info(f"スーパーバイザの判断: {response.tool_calls or response.content}")
+    return {"messages": [response]}    
 
 def build_workflow():
     graph_builder = StateGraph(MyState)
