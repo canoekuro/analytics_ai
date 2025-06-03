@@ -516,3 +516,6 @@ def build_workflow():
     )
     # ツールを実行し終わったら、その結果を持って再びスーパーバイザーに戻り、次の指示を仰ぐ
     graph_builder.add_edge("tools", "supervisor")
+    
+    memory = MemorySaver()
+    return graph_builder.compile(checkpointer=memory)
