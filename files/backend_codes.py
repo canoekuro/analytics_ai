@@ -1,26 +1,19 @@
 # 【重要！！】コメントアウトやエラーメッセージはできる限り日本語で残すこと。
 
 from langchain_community.vectorstores import FAISS
-import difflib # このインポートがファイルの先頭に追加されていることを確認してください
-import sqlite3
+from langchain_core.tools import tool
 import pandas as pd
 import logging
 from langgraph.graph import StateGraph, END
-from langchain.agents import Tool, initialize_agent
+from langchain.agents import initialize_agent
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
-import os
-import base64
 import io
-import re
-from typing import TypedDict, List, Optional, Any
+from typing import TypedDict, List, Optional, Dict, Any
 import ast # literal_evalのため
 from langgraph.checkpoint.memory import MemorySaver
 import uuid
 from datetime import datetime
-import japanize_matplotlib
-import seaborn as sns
 import plotly.express as px
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 import json # import jsonを先頭に移動しました
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_openai import AzureChatOpenAI
@@ -28,25 +21,39 @@ from langgraph.prebuilt import ToolNode, tools_condition
 import operator
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage
-from files.functions import extract_sql, try_sql_execute, fix_sql_with_llm
+from functions import extract_sql, try_sql_execute, fix_sql_with_llm
+import os
+
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
-# 環境変数からLLMモデル名を取得します（デフォルト値あり）
-llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-pro") # デフォルトをgemini-1.5-proに変更
-google_api_key = os.getenv("GOOGLE_API_KEY")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) # または他の適切なGemini埋め込みモデル
-SIMILARITY_THRESHOLD = 0.8
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+endpoint = os.getenv("AZURE_OPENAI_API_BASE")
+version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
+deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
+version = os.getenv("AZURE_OPENAI_API_VERSION")
+deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
+
+# Chatモデル（SQL生成用）
+llm = AzureChatOpenAI(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version,
+    deployment_name=deployment,
+    temperature=0,
+    streaming=False
+)
+
+embeddings = AzureOpenAIEmbeddings(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version4emb,
+    azure_deployment=deployment4emb
+)
 # ベクトルストア
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=llm_model_name,
-    temperature=0,
-    google_api_key=google_api_key
-) # または、より高性能な "gemini-1.5-flash"、"gemini-1.5-pro"
 
 class MyState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], operator.add] # 基本的な会話履歴
@@ -57,6 +64,7 @@ class MyState(TypedDict, total=False):
     interpretation_history: Optional[List[dict[str, str]]]     # データ解釈（分析コメント）
     chart_history: Optional[List[dict[str, str]]]      # Plotlyによって生成されたグラフのJSON文字列
     analyze_step: Optional[List[dict[str, str]]] 
+    error: Optional[str]
 
 
 history_back_number = 5
@@ -225,21 +233,33 @@ def interpret_node(task_description: str, state: MyState):
     df_history = state.get("df_history", None)
     if df_history is None:
         raise RuntimeError("interpret_node: df_historyが空です。利用可能なデータがありません。")
-    try:
-        full_data_list = []
-        for entry in df_history:
-            for question, data in entry.items():
+    full_data_list = []
+    for entry in df_history:
+        for question, data in entry.items():
+            try:
                 # DataFrame化
                 df = pd.DataFrame(data)
                 if not df.empty:
                     full_data_list.append(f"■「{question}」に関するデータ:\n{df.to_string(index=False)}\n\n")
                 else:
-                    raise RuntimeError("interpret_node: df_history中に空のデータがありました。")
-        full_data_string = "".join(full_data_list)
-    except Exception as e:
-        logging.error(f"interpret_node: 'df_historyをDataFrameに変換中にエラーが発生しました: {e}")
-        raise
+                    full_data_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
+        
+            except Exception as e:
+                logging.error(f"interpret_node: 'df_historyをDataFrameに変換中にエラーが発生しました: {e}")
+                full_data_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
+    full_data_string = "".join(full_data_list)
 
+    # 全て空・エラーだった場合に備えたチェック
+    processed_parts = [part for part in full_data_string.split("■")[1:] if part]
+    all_parts_indicate_no_data = all(
+        "(この要件に対するデータはありませんでした)" in part or \
+        "(データ形式エラーのため表示できません)" in part or \
+        "(この要件に対するデータは空でした)" in part \
+        for part in processed_parts
+    )
+    if all_parts_indicate_no_data:
+        raise RuntimeError("interpret_node: 利用可能なデータがありませんでした。")
+    
     # 直近の会話履歴
     conversation_history = state.get("messages", [])
     # システムメッセージ以外を抽出
@@ -294,13 +314,14 @@ def chart_node(task_description: str, state: MyState):
     if df_history is None:
         raise RuntimeError("chart_node: df_historyが空です。利用可能なデータがありません。")
 
-    try:
-        # 直近N件だけ取り出し
-        recent_items = df_history[-history_back_number:]
-        df_explain_list = []
-        df_locals = {}
-        for idx, entry in enumerate(recent_items):
-            for question, data in entry.items():
+
+    # 直近N件だけ取り出し
+    recent_items = df_history[-history_back_number:]
+    df_explain_list = []
+    df_locals = {}
+    for idx, entry in enumerate(recent_items):
+        for question, data in entry.items():
+            try:
                 df = pd.DataFrame(data)
                 df_name = f"df{idx}"  # 例: df0, df1, ...
                 if not df.empty:
@@ -313,13 +334,16 @@ def chart_node(task_description: str, state: MyState):
                     """
                     df_explain_list.append(explain)
                 else:
-                    raise RuntimeError(f"chart_node: df_history中の「{question}」が空データです。")
+                    df_explain_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
+            except Exception as e:
+                logging.error(f"chart_node: df_historyをDataFrameに変換中にエラーが発生しました: {e}")
+                df_explain_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
 
-        full_explain_string = "\n".join(df_explain_list)
-
-    except Exception as e:
-        logging.error(f"chart_node: df_historyをDataFrameに変換中にエラーが発生しました: {e}")
-        raise
+    # 有効なDataFrameが1つもなければ終了
+    if not df_locals:
+        raise RuntimeError("chart_node: 利用可能なデータが0でした。")
+    
+    full_explain_string = "\n".join(df_explain_list)
 
     python_tool = PythonAstREPLTool(
         locals={**df_locals, "px": px, "pd": pd}, 
@@ -396,13 +420,13 @@ def processing_node(task_description: str, state: MyState):
     if df_history is None:
         raise RuntimeError("chart_node: df_historyが空です。利用可能なデータがありません。")
 
-    try:
-        # 直近N件だけ取り出し
-        recent_items = df_history[-history_back_number:]
-        df_explain_list = []
-        df_locals = {}
-        for idx, entry in enumerate(recent_items):
-            for question, data in entry.items():
+    # 直近N件だけ取り出し
+    recent_items = df_history[-history_back_number:]
+    df_explain_list = []
+    df_locals = {}
+    for idx, entry in enumerate(recent_items):
+        for question, data in entry.items():
+            try:
                 df = pd.DataFrame(data)
                 df_name = f"df{idx}"  # 例: df0, df1, ...
                 if not df.empty:
@@ -415,14 +439,16 @@ def processing_node(task_description: str, state: MyState):
                     """
                     df_explain_list.append(explain)
                 else:
-                    raise RuntimeError(f"processing_node: df_history中の「{question}」が空データです。")
+                    df_explain_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
+            except Exception as e:
+                logging.error(f"processing_node: df_historyをDataFrameに変換中にエラーが発生しました: {e}")
+                df_explain_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
 
-        full_explain_string = "\n".join(df_explain_list)
-
-    except Exception as e:
-        logging.error(f"processing_node: df_historyをDataFrameに変換中にエラーが発生しました: {e}")
-        raise
-
+    # 有効なDataFrameが1つもなければ終了
+    if not df_locals:
+        raise RuntimeError("chart_node: 利用可能なデータが0でした。")
+    
+    full_explain_string = "\n".join(df_explain_list)
     python_tool = PythonAstREPLTool(
         locals={**df_locals, "pd": pd}, 
         description=(
@@ -470,10 +496,11 @@ def processing_node(task_description: str, state: MyState):
 
         state.setdefault("task_description_history", []).append(task_description)
         processed_df = python_tool.globals.get("result")
+
         if not isinstance(processed_df, pd.DataFrame):
         # エラー処理または警告をログに出力
             logging.error("Processing node did not return a DataFrame in 'result'.")
-            raise RuntimeError("Data processing agent did not produce a valid DataFrame.")
+            raise RuntimeError("Data processing agentは有効なデータフレームを返しませんでした。")
         state.setdefault("df_history", []).append({task_description: processed_df.to_dict(orient="records") if isinstance(processed_df, pd.DataFrame) else [] })
 
         return state
@@ -483,10 +510,15 @@ def processing_node(task_description: str, state: MyState):
 
 tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analyze_step_node]
 def supervisor_node(state: MyState):
-    supervisor_llm = llm.bind_tools(tools)
-    logging.info("supervisor: Thinking...")
-    response = supervisor_llm.invoke(state['messages'])
-    return {"messages": [response]}
+    try:
+        supervisor_llm = llm.bind_tools(tools)
+        logging.info("supervisor: Thinking...")
+        response = supervisor_llm.invoke(state['messages'])
+        return {"messages": [response]}
+    except Exception as e:
+        state["error"] = f"処理中にエラーが発生しました: {e}"
+        return state
+    
 
 def build_workflow():
     graph_builder = StateGraph(MyState)
@@ -514,8 +546,9 @@ def build_workflow():
             END: END           # Falseなら終了
         }
     )
+
     # ツールを実行し終わったら、その結果を持って再びスーパーバイザーに戻り、次の指示を仰ぐ
     graph_builder.add_edge("tools", "supervisor")
-    
+
     memory = MemorySaver()
     return graph_builder.compile(checkpointer=memory)
