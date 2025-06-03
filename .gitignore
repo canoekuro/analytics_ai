@@ -30,7 +30,6 @@ env/
 .env/
 
 # データベース
-*.db
 *.sqlite3
 
 # IDE
