@@ -28,7 +28,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 import operator
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage
-from files.functions import *
+from files.functions import extract_sql, try_sql_execute, fix_sql_with_llm
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
@@ -50,7 +50,7 @@ llm = ChatGoogleGenerativeAI(
 
 class MyState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], operator.add] # 基本的な会話履歴
-    task_descrption_history: Optional[List[str]]             # 各エージェントへの指示
+    task_description_history: Optional[List[str]]             # 各エージェントへの指示
     metadata_answer: Optional[List[dict[str, str]]]    # メタデータ検索結果の回答
     df_history: Optional[List[dict[str, Any]]]   # SQL実行結果のDataFrameの履歴
     sql_history: Optional[List[dict[str, Any]]]   # SQLの履歴
@@ -96,7 +96,7 @@ def metadata_retrieval_node(task_description: str, state: MyState):
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     metadata_answer = response.content.strip()
-    state.setdefault("task_desciption_history", []).append(task_description)
+    state.setdefault("task_description_history", []).append(task_description)
     state.setdefault("metadata_answer", []).append({task_description: metadata_answer})
     return state
 
@@ -137,8 +137,8 @@ def analyze_step_node(task_description: str, state: MyState):
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     step_answer = response.content.strip()
-    state.setdefault("task_desciption_history", []).append(task_description)
-    state.setdefault("analyze_step", [].append({task_description:step_answer})
+    state.setdefault("task_description_history", []).append(task_description)
+    state.setdefault("analyze_step", []).append({task_description:step_answer})
     return state
 
 @tool
@@ -205,12 +205,12 @@ def sql_node(task_description: str, state: MyState):
             logging.error(f"'修正SQLも失敗しました: {sql_error}。")
             raise RuntimeError(f"SQLの実行に失敗しました (要件: '{task_description}'): {sql_error}")
 
-    state.setdefault("task_desciption_history", []).append(task_description)
+    state.setdefault("task_description_history", []).append(task_description)
     result_df_dict = result_df.to_dict(orient="records") 
     result_dict = {task_description: result_df_dict}
     state.setdefault("df_history", []).append(result_dict)
     sql_dict = {task_description: last_sql_generated}
-    state.setdfault("sql_history", []).append(sql_dict)
+    state.setdefault("sql_history", []).append(sql_dict)
 
     return state
 
@@ -277,7 +277,7 @@ def interpret_node(task_description: str, state: MyState):
     except Exception as e:
         raise
 
-    state.setdefault("task_desciption_history", []).append(task_description)
+    state.setdefault("task_description_history", []).append(task_description)
     interpretation_dict = {task_description: interpretation_text}
     state.setdefault("interpretation_history", []).append(interpretation_dict)
     return state
@@ -375,7 +375,7 @@ def chart_node(task_description: str, state: MyState):
         plotly_json_string = agent_response['output']
         try:
             json.loads(plotly_json_string)
-            state.setdefault("task_desciption_history", []).append(task_description)
+            state.setdefault("task_description_history", []).append(task_description)
             chart_dict = {task_description: plotly_json_string}
             state.setdefault("chart_history", []).append(chart_dict)
             return state
@@ -468,9 +468,15 @@ def processing_node(task_description: str, state: MyState):
             )
         logging.info(f"processed_node: Agent response: {agent_response}")
 
-        state.setdefault("task_desciption_history", []).append(task_description)
+        state.setdefault("task_description_history", []).append(task_description)
         processed_df = python_tool.globals.get("result")
-        state.setdefault("df_history", []).append({task_description: processed_df})
+        processed_df = python_tool.globals.get("result")
+        if not isinstance(processed_df, pd.DataFrame):
+        # エラー処理または警告をログに出力
+            logging.error("Processing node did not return a DataFrame in 'result'.")
+            raise RuntimeError("Data processing agent did not produce a valid DataFrame.")
+        state.setdefault("df_history", []).append({task_description: processed_df.to_dict(orient="records") if isinstance(processed_df, pd.DataFrame) else [] })
+
         return state
 
     except Exception as e:
@@ -509,10 +515,5 @@ def build_workflow():
             END: END           # Falseなら終了
         }
     )
-
     # ツールを実行し終わったら、その結果を持って再びスーパーバイザーに戻り、次の指示を仰ぐ
     graph_builder.add_edge("tools", "supervisor")
-
-    # グラフをコンパイルして実行可能にする
-    memory = MemorySaver()
-    return graph_builder.compile(checkpointer=memory)
