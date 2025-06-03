@@ -418,7 +418,7 @@ def processing_node(task_description: str, state: MyState):
     
     df_history = state.get("df_history", None)
     if df_history is None:
-        raise RuntimeError("chart_node: df_historyが空です。利用可能なデータがありません。")
+        raise RuntimeError("processing_node: df_historyが空です。利用可能なデータがありません。")
 
     # 直近N件だけ取り出し
     recent_items = df_history[-history_back_number:]
@@ -446,7 +446,7 @@ def processing_node(task_description: str, state: MyState):
 
     # 有効なDataFrameが1つもなければ終了
     if not df_locals:
-        raise RuntimeError("chart_node: 利用可能なデータが0でした。")
+        raise RuntimeError("processing_node: 利用可能なデータが0でした。")
     
     full_explain_string = "\n".join(df_explain_list)
     python_tool = PythonAstREPLTool(
