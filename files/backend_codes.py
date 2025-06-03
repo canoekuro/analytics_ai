@@ -50,13 +50,13 @@ llm = ChatGoogleGenerativeAI(
 
 class MyState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], operator.add] # 基本的な会話履歴
-    task_discrption: Optional[List[str]]             # 各エージェントへの指示
+    task_descrption_history: Optional[List[str]]             # 各エージェントへの指示
     metadata_answer: Optional[List[dict[str, str]]]    # メタデータ検索結果の回答
     df_history: Optional[List[dict[str, Any]]]   # SQL実行結果のDataFrameの履歴
     sql_history: Optional[List[dict[str, Any]]]   # SQLの履歴
     interpretation_history: Optional[List[dict[str, str]]]     # データ解釈（分析コメント）
     chart_history: Optional[List[dict[str, str]]]      # Plotlyによって生成されたグラフのJSON文字列
-    analize_step: Optional[List[dict[str, str]]] 
+    analyze_step: Optional[List[dict[str, str]]] 
 
 
 history_back_number = 5
@@ -96,12 +96,12 @@ def metadata_retrieval_node(task_description: str, state: MyState):
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     metadata_answer = response.content.strip()
-    state["task_description"].append(task_description)
-    state["metadata_answer"].append({task_description:metadata_answer})
+    state.setdefault("task_desciption_history", []).append(task_description)
+    state.setdefault("metadata_answer", []).append({task_description: metadata_answer})
     return state
 
 @tool
-def analize_step_node(task_description: str, state: MyState):
+def analyze_step_node(task_description: str, state: MyState):
     """
     自然言語のタスク記述とstate内の会話履歴を受け取り、文脈を理解した上で必要な分析ステップを考えます。
     ユーザーから分析依頼があり、分析要件を具体化したい際に使います。
@@ -115,7 +115,7 @@ def analize_step_node(task_description: str, state: MyState):
     context = "\n".join([f"{msg.role}: {msg.content}" for msg in recent_history])
 
     # Rag情報
-    logging.info(f"analize_step_node: RAG情報を読み込み中 '{task_description}'")
+    logging.info(f"analyze_step_node: RAG情報を読み込み中 '{task_description}'")
     retrieved_docs = vectorstore_tables.similarity_search(task_description)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
     
@@ -133,12 +133,12 @@ def analize_step_node(task_description: str, state: MyState):
 
     【回答】
     """
-    logging.info(f"analize_step_node: 生成AIが考えています・・・ '{task_description}'")
+    logging.info(f"analyze_step_node: 生成AIが考えています・・・ '{task_description}'")
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     step_answer = response.content.strip()
-    state["task_description"].append(task_description)
-    state["analize_step"].append({task_description:step_answer})
+    state.setdefault("task_desciption_history", []).append(task_description)
+    state.setdefault("analyze_step", [].append({task_description:step_answer})
     return state
 
 @tool
@@ -205,12 +205,12 @@ def sql_node(task_description: str, state: MyState):
             logging.error(f"'修正SQLも失敗しました: {sql_error}。")
             raise RuntimeError(f"SQLの実行に失敗しました (要件: '{task_description}'): {sql_error}")
 
-    state["task_description"].append(task_description)
+    state.setdefault("task_desciption_history", []).append(task_description)
     result_df_dict = result_df.to_dict(orient="records") 
     result_dict = {task_description: result_df_dict}
-    state["df_history"].append(result_dict)
+    state.setdefault("df_history", []).append(result_dict)
     sql_dict = {task_description: last_sql_generated}
-    state["sql_history"].append(sql_dict)
+    state.setdfault("sql_history", []).append(sql_dict)
 
     return state
 
@@ -277,9 +277,9 @@ def interpret_node(task_description: str, state: MyState):
     except Exception as e:
         raise
 
-    state["task_description"].append(task_description)
+    state.setdefault("task_desciption_history", []).append(task_description)
     interpretation_dict = {task_description: interpretation_text}
-    state["interpretation_history"].append(interpretation_dict)
+    state.setdefault("interpretation_history", []).append(interpretation_dict)
     return state
 
 @tool
@@ -375,9 +375,9 @@ def chart_node(task_description: str, state: MyState):
         plotly_json_string = agent_response['output']
         try:
             json.loads(plotly_json_string)
-            state["task_description"].append(task_description)
+            state.setdefault("task_desciption_history", []).append(task_description)
             chart_dict = {task_description: plotly_json_string}
-            state["chart_history"].append(chart_dict)
+            state.setdefault("chart_history", []).append(chart_dict)
             return state
         
         except (json.JSONDecodeError, TypeError) as e:
@@ -468,15 +468,15 @@ def processing_node(task_description: str, state: MyState):
             )
         logging.info(f"processed_node: Agent response: {agent_response}")
 
-        state["task_description"].append(task_description)
+        state.setdefault("task_desciption_history", []).append(task_description)
         processed_df = python_tool.globals.get("result")
-        state["df_history"].append({task_description: processed_df})
+        state.setdefault("df_history", []).append({task_description: processed_df})
         return state
 
     except Exception as e:
         raise
 
-tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analize_step_node]
+tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analyze_step_node]
 def supervisor_node(state: MyState):
     supervisor_llm = llm.bind_tools(tools)
     print(" supervisor: Thinking...")
