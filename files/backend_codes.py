@@ -152,14 +152,20 @@ def sql_node(state: AgentState):
     分析のためにデータを取得する必要がある際に使用します。
     """
     try:
-        task_description = state["messages"][-1].content
-        tool_call_id = state["messages"][-2].tool_calls[0]['id']
-    except (IndexError, KeyError):
+        # messagesの最後にあるのが、スーパーバイザーからのツールコール指示
+        # AIMessageが想定される
+        last_message = state["messages"][-1]
+        # AIMessageからtool_callsを取り出す（supervisorからのToolMessageとは形式が異なる）
+        tool_call = last_message.tool_calls[0]
+        tool_call_id = tool_call['id']
+        # tool_callのargumentsはJSON文字列なのでパースする
+        task_args = json.loads(tool_call['function']['arguments'])
+        task_description = task_args['task_description']
+    except (IndexError, KeyError, json.JSONDecodeError):
         # スーパーバイザーからの呼び出し形式が正しくない場合のエラーハンドリング
         error_message = {"status": "error", "error_message": "不正な呼び出し形式です。"}
         # tool_call_idが不明なため、Noneを指定
         return {"messages": [ToolMessage(content=json.dumps(error_message), tool_call_id=None)]}
-
 
     #システムプロンプト
     system_prompt_sql_generation = """
@@ -268,12 +274,20 @@ def interpret_node(state: AgentState):
     分析のためにデータを解釈する必要がある際に使用します。
     """
     try:
-        task_description = state["messages"][-1].content
-        tool_call_id = state["messages"][-2].tool_calls[0]['id']
-    except (IndexError, KeyError):
-        error_message = "不正な呼び出し形式です。スーパーバイザーからの指示が正しくありません。"
+        # messagesの最後にあるのが、スーパーバイザーからのツールコール指示
+        # AIMessageが想定される
+        last_message = state["messages"][-1]
+        # AIMessageからtool_callsを取り出す
+        tool_call = last_message.tool_calls[0]
+        tool_call_id = tool_call['id']
+        # tool_callのargumentsはJSON文字列なのでパースする
+        task_args = json.loads(tool_call['function']['arguments'])
+        task_description = task_args['task_description'] # processing_nodeに合わせてtask_descriptionを採用
+    except (IndexError, KeyError, json.JSONDecodeError):
+        # スーパーバイザーからの呼び出し形式が正しくない場合のエラーハンドリング
+        error_message = {"status": "error", "error_message": "不正な呼び出し形式です。"}
         # tool_call_idが不明なため、Noneを指定
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+        return {"messages": [ToolMessage(content=json.dumps(error_message), tool_call_id=None)]}
 
     logging.info(f"interpret_node: df_historyの読み込み開始・・・ '{task_description}'")
     df_history = state.get("df_history", [])
@@ -371,11 +385,21 @@ def processing_node(state: AgentState):
     自然言語のタスク記述とstate内のデータを受け取り、文脈を理解した上でデータの加工やグラフの作成を行います。
     分析のためにデータの加工やグラフ作成をする必要がある際に使用します。
     """
-    # messagesの最後にあるのが、スーパーバイザーからのツールコール指示 or 専門家へのディスパッチ指示
-    # その指示内容(content)を現在のタスクとして扱う
-    task_description = state["messages"][-1].content
-    # どの指示に対する応答なのかを紐付けるために、tool_call_idを取得しておく
-    tool_call_id = state["messages"][-2].tool_calls[0]['id']
+    try:
+        # messagesの最後にあるのが、スーパーバイザーからのツールコール指示
+        # AIMessageが想定される
+        last_message = state["messages"][-1]
+        # AIMessageからtool_callsを取り出す
+        tool_call = last_message.tool_calls[0]
+        tool_call_id = tool_call['id']
+        # tool_callのargumentsはJSON文字列なのでパースする
+        task_args = json.loads(tool_call['function']['arguments'])
+        task_description = task_args['task_description']
+    except (IndexError, KeyError, json.JSONDecodeError):
+        # スーパーバイザーからの呼び出し形式が正しくない場合のエラーハンドリング
+        error_message = {"status": "error", "error_message": "不正な呼び出し形式です。"}
+        # tool_call_idが不明なため、Noneを指定
+        return {"messages": [ToolMessage(content=json.dumps(error_message), tool_call_id=None)]}
     
     logging.info(f"processing_node: df_historyの読み込み開始・・・ '{task_description}'")
     df_history = state.get("df_history", None)
@@ -622,19 +646,14 @@ def supervisor_node(state: AgentState):
         # response.tool_calls[0]['args']にDispatchDecisionの引数が入ってくる
         else:
             # Pydanticモデルにパースして扱いやすくする
-            dispatch_decision = DispatchDecision(**response.tool_calls[0]['args'])
+            dispatch_decision = DispatchDecision(**args) # Use args directly
             print(f"判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
             print(f"判断理由: {dispatch_decision.rationale}")
             print(f"具体的な指示: {dispatch_decision.task_description}")
             
-            # 次のノード（専門家）に渡すためのメッセージを作成
-            # これにより、専門家は「スーパーバイザーからこの指示が来た」と認識できる
-            dispatch_message = ToolMessage(
-                content=f"以下の指示を実行してください：\n\n{dispatch_decision.task_description}",
-                tool_call_id=response.tool_calls[0]['id'] # どの判断に対応するかを紐付け
-            )
+            # dispatch_messageの作成を削除
             return {
-                "messages": [*state["messages"], response, dispatch_message], # 必要に応じてHumanMessage/AIMessage
+                "messages": [*state["messages"], response], # dispatch_messageを削除
                 "next": dispatch_decision.next_agent
             }
 
