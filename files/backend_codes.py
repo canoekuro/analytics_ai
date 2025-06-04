@@ -20,7 +20,7 @@ from langchain_openai import AzureChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 import operator
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage, ChatPromptTemplate
+from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage, SystemMessage, ChatPromptTemplate
 from functions import extract_sql, try_sql_execute, fix_sql_with_llm
 import os
 
@@ -528,16 +528,7 @@ def processing_node(task_description: str, state: MyState):
 
 tools = [metadata_retrieval_node, sql_node, interpret_node, chart_node, processing_node, analysis_plan_node]
 
-
-def supervisor_node(state: MyState):
-        supervisor_llm = llm.bind_tools(tools)
-        logging.info("supervisor: Thinking...")
-        response = supervisor_llm.invoke(state['messages'])
-        return {"messages": [response]}
-    except Exception as e:
-        state["error"] = f"処理中にエラーが発生しました: {e}"
-        return state
-
+# (This entire block will replace the existing supervisor_node function(s))
 def supervisor_node(state: MyState):
     """
     State全体を監視し、分析計画に基づいて次に実行すべきツールを決定する、
@@ -545,54 +536,91 @@ def supervisor_node(state: MyState):
     """
     logging.info("--- スーパーバイザのターン ---")
 
-    # Supervisorの思考回路となるプロンプトを定義
-    supervisor_prompt_template = """
-    あなたはデータ分析チームを率いる有能なプロジェクトマネージャーAIです。
-    以下の状況を正確に把握し、次に何をすべきか判断し、最適な専門家（ツール）を一人だけ選んで指示を出してください。
+    # Stateから最新の分析計画を取得
+    current_plan_list = state.get('analysis_plan_latest')
+    plan_string = None
+    plan_description_for_log = "なし" # ログ表示用
 
-    -----------------
-    [最優先タスク：進行中の分析計画]
-    {plan_status}
-    -----------------
+    if current_plan_list and isinstance(current_plan_list, list) and len(current_plan_list) > 0:
+        latest_plan_entry = current_plan_list[-1]
+        if isinstance(latest_plan_entry, dict) and len(latest_plan_entry) > 0:
+            try:
+                plan_string = list(latest_plan_entry.values())[0]
+                plan_description_for_log = list(latest_plan_entry.keys())[0]
+            except IndexError:
+                logging.warning("最新の計画エントリの辞書が空か、予期しない形式です。") # 日本語でコメント
+                plan_string = None
+                plan_description_for_log = "エラー：空または不正な計画エントリ" # 日本語でコメント
 
-    上記の情報を踏まえ、ユーザーとの会話履歴全体を考慮して、次に行うべきことを判断してください。
+    if plan_string:
+        system_message_content = f"""あなたはデータ分析チームを率いる有能なプロジェクトマネージャーAIです。
+以下の状況を正確に把握し、次に何をすべきか判断し、最適な専門家（ツール）を一人だけ選んで指示を出してください。
 
-    - もし【進行中の分析計画】が存在し、まだ完了していない場合、その計画に厳密に従ってください。計画の「次のステップ」の指示内容を実行するために、最も適切な専門家（ツール）を一人選択してください。
-    - もし【進行中の分析計画】が存在しない場合、ユーザーの最新の指示に応答してください。指示が複雑な分析を要すると判断した場合は、まず 'analyze_step_node' を呼び出して計画を立てることを強く推奨します。
-    - 全ての計画が完了した、あるいはユーザーの質問に完全に答えることができたと判断した場合は、ツールを呼ばずに、ユーザーへの最終回答を生成してください。
-    """
-    
-    # Stateに応じてプロンプトに埋め込むテキストを動的に生成
-    plan = state.get('analysis_plan')
-    
-    if plan:
-        plan_status_text = f"こちらの計画が進行中です。計画リスト: {plan}"
+-----------------
+[最優先タスク：進行中の分析計画]
+こちらの計画が進行中です。計画名：「{plan_description_for_log}」
+計画内容：
+{plan_string}
+
+この計画に厳密に従い、計画の「次のステップ」を実行するために最も適切な専門家（ツール）を一人選択してください。
+もし全ての計画ステップが完了したと判断される場合、または現在の計画ステップではこれ以上進められないと判断した場合は、ツールを呼ばずにユーザーへの最終回答または状況説明を生成してください。
+-----------------
+
+上記の計画情報と、以下のユーザーとの会話履歴全体を考慮して、判断を下してください。
+"""
+        log_plan_status = f"進行中 (計画名: {plan_description_for_log})"
     else:
-        plan_status_text = "現在、進行中の分析計画はありません。"
-    try:
+        system_message_content = f"""あなたはデータ分析チームを率いる有能なプロジェクトマネージャーAIです。
+以下の状況を正確に把握し、次に何をすべきか判断し、最適な専門家（ツール）を一人だけ選んで指示を出してください。
 
-        # Supervisorのエージェントを準備
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", supervisor_prompt_template),
-            ("placeholder", "{messages}"),
-        ])
+-----------------
+[最優先タスク：進行中の分析計画]
+現在、進行中の明確な分析計画はありません。
+-----------------
+
+上記の状況と、以下のユーザーとの会話履歴全体を考慮して、判断を下してください。
+ユーザーの最新の指示に応答してください。
+指示が曖昧であったり、複雑な分析や複数ステップの処理を要すると判断した場合は、まず 'analysis_plan_node' を呼び出して分析計画を立てることを強く推奨します。
+ユーザーの質問に完全に答えることができたと判断した場合は、ツールを呼ばずに、ユーザーへの最終回答を生成してください。
+"""
+        log_plan_status = "なし"
+
+    try:
+        messages_for_llm = [SystemMessage(content=system_message_content)] + state.get('messages', [])
         
-        # supervisor_llmのtool_choiceを動的に変更することで、次のタスクを強制する
-        # これはより高度な制御ですが、今回はプロンプトの指示に従わせるアプローチを採用します。
         supervisor_llm = llm.bind_tools(tools)
         
-        # エージェントを実行
-        logging.info("スーパーバイザ: 次の行動を考えています...")
-        response = supervisor_llm.invoke({
-            "messages": state['messages'],
-            "plan_status": plan_status_text,
-        })
+        logging.info(f"スーパーバイザ: 次の行動を考えています... (現在の計画ステータス: {log_plan_status})")
         
-        logging.info(f"スーパーバイザの判断: {response.tool_calls or response.content}")
-        return {"messages": [response]}    
+        response = supervisor_llm.invoke(messages_for_llm)
+
+        if response.tool_calls:
+            tool_calls_info = []
+            if isinstance(response.tool_calls, list):
+                for tc in response.tool_calls:
+                    # ToolCall Pydanticモデルの属性を確認 (例: tc.name, tc.args)
+                    # LangChainのバージョンによってtcがdictの場合もある
+                    if hasattr(tc, 'name') and hasattr(tc, 'args'):
+                         tool_calls_info.append(f"ツール: {tc.name}, 引数: {tc.args}")
+                    elif isinstance(tc, dict) and 'name' in tc and 'args' in tc:
+                         tool_calls_info.append(f"ツール: {tc['name']}, 引数: {tc['args']}")
+                    else:
+                         tool_calls_info.append(f"不明なツール呼び出し形式: {str(tc)}")
+            logging.info(f"スーパーバイザの判断: ツール呼び出し {', '.join(tool_calls_info)}")
+        else:
+            logging.info(f"スーパーバイザの判断: 直接応答 '{response.content[:100]}...'")
+
+        return {"messages": [response]}
+
     except Exception as e:
-        state["error"] = f"処理中にエラーが発生しました: {e}"
-        return state
+        error_message = f"スーパーバイザ処理中に予期せぬエラーが発生しました: {e}" # 日本語でコメント
+        logging.exception(error_message)
+
+        if 'error' in MyState.__annotations__:
+            state['error'] = error_message
+
+        error_ai_message = AIMessage(content=f"申し訳ありません、内部処理中にエラーが発生しました。しばらくしてから再試行してください。(エラータイプ: {type(e).__name__})")
+        return {"messages": [error_ai_message]}
 
 def build_workflow():
     graph_builder = StateGraph(MyState)
