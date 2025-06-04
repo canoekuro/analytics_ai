@@ -1,69 +1,65 @@
 # 【重要！！】コメントアウトやエラーメッセージはできる限り日本語で残すこと。
 
 import os
-from langchain_community.vectorstores import FAISS
-from langchain_core.tools import tool
 import pandas as pd
 import logging
-from langgraph.graph import StateGraph, END
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_experimental.tools.python.tool import PythonAstREPLTool
-import io
-from typing import TypedDict, List, Optional, Dict, Any
+from typing import TypedDict, List, Optional, Dict, Any, Annotated
 import ast # literal_evalのため
-from langgraph.checkpoint.memory import MemorySaver
-import uuid
-from datetime import datetime
 import plotly.express as px
 import json # import jsonを先頭に移動しました
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_openai import AzureChatOpenAI
-from langgraph.prebuilt import ToolNode, tools_condition
-import operator
-from typing import TypedDict, Annotated, List
+
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_community.vectorstores import FAISS
+from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from typing import TypedDict, Annotated, List
 from langchain_core.pydantic_v1 import BaseModel, Field
+from langgraph.checkpoint.memory import MemorySaver
+from langchain.callbacks.base import BaseCallbackHandler
+from langchain_experimental.tools.python.tool import PythonAstREPLTool
+from langgraph.graph import StateGraph, END
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from files.functions import extract_sql, try_sql_execute, fix_sql_with_llm
+from functions import extract_sql, try_sql_execute, fix_sql_with_llm
+
 
 
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
-# api_key = os.getenv("AZURE_OPENAI_API_KEY")
-# endpoint = os.getenv("AZURE_OPENAI_API_BASE")
-# version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
-# deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
-# version = os.getenv("AZURE_OPENAI_API_VERSION")
-# deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+endpoint = os.getenv("AZURE_OPENAI_API_BASE")
+version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
+deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
+version = os.getenv("AZURE_OPENAI_API_VERSION")
+deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
-llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
-google_api_key = os.getenv("GOOGLE_API_KEY")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) 
-llm = ChatGoogleGenerativeAI(
-    model=llm_model_name,
-    temperature=0,
-    google_api_key=google_api_key
-) # または、より高性能な "gemini-1.5-flash"、"gemini-1.5-pro"
-
-# Chatモデル（SQL生成用）
-# llm = AzureChatOpenAI(
-#     openai_api_key=api_key,
-#     azure_endpoint=endpoint,
-#     openai_api_version=version,
-#     deployment_name=deployment,
+# llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
+# google_api_key = os.getenv("GOOGLE_API_KEY")
+# embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key) 
+# llm = ChatGoogleGenerativeAI(
+#     model=llm_model_name,
 #     temperature=0,
-#     streaming=False
-# )
+#     google_api_key=google_api_key
+# ) # または、より高性能な "gemini-1.5-flash"、"gemini-1.5-pro"
 
-# embeddings = AzureOpenAIEmbeddings(
-#     openai_api_key=api_key,
-#     azure_endpoint=endpoint,
-#     openai_api_version=version4emb,
-#     azure_deployment=deployment4emb
-# )
+#Chatモデル（SQL生成用）
+llm = AzureChatOpenAI(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version,
+    deployment_name=deployment,
+    temperature=0,
+    streaming=False
+)
+
+embeddings = AzureOpenAIEmbeddings(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version4emb,
+    azure_deployment=deployment4emb
+)
 # ベクトルストア
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
@@ -149,98 +145,6 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     step_answer = response.content.strip()
 
     return step_answer
-
-def interpret_node(state: AgentState):
-    """
-    自然言語のタスク記述と直近の会話、そしてデータを受け取り、文脈を理解した上でデータを解釈します。
-    分析のためにデータを解釈する必要がある際に使用します。
-    """
-    try:
-        task_description = state["messages"][-1].content
-        tool_call_id = state["messages"][-2].tool_calls[0]['id']
-    except (IndexError, KeyError):
-        error_message = "不正な呼び出し形式です。スーパーバイザーからの指示が正しくありません。"
-        # tool_call_idが不明なため、Noneを指定
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
-
-    logging.info(f"interpret_node: df_historyの読み込み開始・・・ '{task_description}'")
-    df_history = state.get("df_history", [])
-    if df_history is None:
-        raise RuntimeError("interpret_node: df_historyが空です。利用可能なデータがありません。")
-    full_data_list = []
-    for entry in df_history:
-        for question, data in entry.items():
-            try:
-                # DataFrame化
-                df = pd.DataFrame(data)
-                if not df.empty:
-                    full_data_list.append(f"■「{question}」に関するデータ:\n{df.to_string(index=False)}\n\n")
-                else:
-                    full_data_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
-        
-            except Exception as e:
-                logging.error(f"interpret_node: 'df_historyをDataFrameに変換中にエラーが発生しました: {e}")
-                full_data_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
-    full_data_string = "".join(full_data_list)
-
-    # 全て空・エラーだった場合に備えたチェック
-    processed_parts = [part for part in full_data_string.split("■")[1:] if part]
-    all_parts_indicate_no_data = all(
-        "(この要件に対するデータはありませんでした)" in part or \
-        "(データ形式エラーのため表示できません)" in part or \
-        "(この要件に対するデータは空でした)" in part \
-        for part in processed_parts
-    )
-    if all_parts_indicate_no_data:
-        raise RuntimeError("interpret_node: 利用可能なデータがありませんでした。")
-    
-    # システムメッセージ以外を抽出
-    conversation_history = state.get("messages", [])
-    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
-    # 直近N件だけ取り出し
-    recent_history = non_system_history[-history_back_number:]
-    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
-
-    system_prompt = "あなたは優秀なデータ分析の専門家です。"
-
-    user_prompt = f"""
-    現在のタスクと文脈を踏まえて、データから読み取れる特徴や傾向を簡潔な日本語で解説してください。
-    
-    【現在のタスク】
-    {task_description}
-    
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【データの内容】
-    {full_data_string}
-    """
-    try:
-        logging.info(f"interpret_node: 生成AIが考えています・・・ '{task_description}'")
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        interpretation_text = response.content.strip() if response.content else ""
-
-        if not interpretation_text:
-            raise RuntimeError("interpret_node: LLMが空の解釈を返しました。")
-
-    except Exception as e:
-        error_message = f"データの解釈中にエラーが発生しました: {e}"
-        logging.error(error_message)
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
-
-    # --- 3. 出口: 結果をToolMessageで報告する ---
-    return {
-        "messages": [
-            ToolMessage(
-                content=interpretation_text,
-                tool_call_id=tool_call_id
-            )
-        ]
-    }
-
 
 def sql_node(state: AgentState):
     """
@@ -357,10 +261,115 @@ def sql_node(state: AgentState):
         "df_history": state.get("df_history", []) + [new_history_item]
     }
 
-def chart_node(state: AgentState):
+# 解釈ノード
+def interpret_node(state: AgentState):
     """
-    自然言語のタスク記述とstate内のデータを受け取り、文脈を理解した上でグラフを作成します。
-    分析のためにグラフを作成する必要がある際に使用します。
+    自然言語のタスク記述と直近の会話、そしてデータを受け取り、文脈を理解した上でデータを解釈します。
+    分析のためにデータを解釈する必要がある際に使用します。
+    """
+    try:
+        task_description = state["messages"][-1].content
+        tool_call_id = state["messages"][-2].tool_calls[0]['id']
+    except (IndexError, KeyError):
+        error_message = "不正な呼び出し形式です。スーパーバイザーからの指示が正しくありません。"
+        # tool_call_idが不明なため、Noneを指定
+        return {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+
+    logging.info(f"interpret_node: df_historyの読み込み開始・・・ '{task_description}'")
+    df_history = state.get("df_history", [])
+    if df_history is None:
+        raise RuntimeError("interpret_node: df_historyが空です。利用可能なデータがありません。")
+    full_data_list = []
+    for entry in df_history:
+        for question, data in entry.items():
+            try:
+                # DataFrame化
+                df = pd.DataFrame(data)
+                if not df.empty:
+                    full_data_list.append(f"■「{question}」に関するデータ:\n{df.to_string(index=False)}\n\n")
+                else:
+                    full_data_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
+        
+            except Exception as e:
+                logging.error(f"interpret_node: 'df_historyをDataFrameに変換中にエラーが発生しました: {e}")
+                full_data_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
+    full_data_string = "".join(full_data_list)
+
+    # 全て空・エラーだった場合に備えたチェック
+    processed_parts = [part for part in full_data_string.split("■")[1:] if part]
+    all_parts_indicate_no_data = all(
+        "(この要件に対するデータはありませんでした)" in part or \
+        "(データ形式エラーのため表示できません)" in part or \
+        "(この要件に対するデータは空でした)" in part \
+        for part in processed_parts
+    )
+    if all_parts_indicate_no_data:
+        raise RuntimeError("interpret_node: 利用可能なデータがありませんでした。")
+    
+    # システムメッセージ以外を抽出
+    conversation_history = state.get("messages", [])
+    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
+    # 直近N件だけ取り出し
+    recent_history = non_system_history[-history_back_number:]
+    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
+
+    system_prompt = "あなたは優秀なデータ分析の専門家です。"
+
+    user_prompt = f"""
+    現在のタスクと文脈を踏まえて、データから読み取れる特徴や傾向を簡潔な日本語で解説してください。
+    
+    【現在のタスク】
+    {task_description}
+    
+    【ユーザーの全体的な質問の文脈】
+    {context}
+
+    【データの内容】
+    {full_data_string}
+    """
+    try:
+        logging.info(f"interpret_node: 生成AIが考えています・・・ '{task_description}'")
+        response = llm.invoke([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
+        interpretation_text = response.content.strip() if response.content else ""
+
+        if not interpretation_text:
+            raise RuntimeError("interpret_node: LLMが空の解釈を返しました。")
+
+    except Exception as e:
+        error_message = f"データの解釈中にエラーが発生しました: {e}"
+        logging.error(error_message)
+        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+
+    # --- 3. 出口: 結果をToolMessageで報告する ---
+    return {
+        "messages": [
+            ToolMessage(
+                content=interpretation_text,
+                tool_call_id=tool_call_id
+            )
+        ]
+    }
+
+# python用のCallback
+class CodeCollectorCallback(BaseCallbackHandler):
+    def __init__(self):
+        self.codes = []
+    
+    # ★★★ on_agent_action から on_tool_start に変更 ★★★
+    def on_tool_start(self, serialized: dict, input_str: str, **kwargs: Any) -> Any:
+        """ツールが実行を開始する直前に呼び出される"""
+        # 実行されるツールの名前が "python_ast_repl" かどうかをチェック
+        if serialized.get("name") == "python_ast_repl":
+            # ツールの入力（Pythonコード）をリストに追加
+            self.codes.append(input_str)
+
+def processing_node(state: AgentState):
+    """
+    自然言語のタスク記述とstate内のデータを受け取り、文脈を理解した上でデータの加工やグラフの作成を行います。
+    分析のためにデータの加工やグラフ作成をする必要がある際に使用します。
     """
     # messagesの最後にあるのが、スーパーバイザーからのツールコール指示 or 専門家へのディスパッチ指示
     # その指示内容(content)を現在のタスクとして扱う
@@ -368,144 +377,12 @@ def chart_node(state: AgentState):
     # どの指示に対する応答なのかを紐付けるために、tool_call_idを取得しておく
     tool_call_id = state["messages"][-2].tool_calls[0]['id']
     
-    logging.info(f"chart_node: df_historyの読み込み開始・・・ '{task_description}'")
-    df_history = state.get("df_history", None)
-    if df_history is None:
-        raise RuntimeError("chart_node: df_historyが空です。利用可能なデータがありません。")
-
-
-    # 直近N件だけ取り出し
-    recent_items = df_history[-history_back_number:]
-    df_explain_list = []
-    df_locals = {}
-    for idx, entry in enumerate(recent_items):
-        for question, data in entry.items():
-            try:
-                df = pd.DataFrame(data)
-                df_name = f"df{idx}"  # 例: df0, df1, ...
-                if not df.empty:
-                    df_locals[df_name] = df  # python_tool用
-                    explain = f"""
-                    # {df_name}
-                    ## 内容:【{question}】に関するデータ    
-                    ## dfの列情報: {list(df.columns)}
-                    ## dfの最初の5行:\n{df.head().to_string(index=False)}
-                    """
-                    df_explain_list.append(explain)
-                else:
-                    df_explain_list.append(f"■「{question}」に関するデータ:\n(この要件に対するデータは空でした)\n\n")
-            except Exception as e:
-                logging.error(f"chart_node: df_historyをDataFrameに変換中にエラーが発生しました: {e}")
-                df_explain_list.append(f"■「{question}」に関するデータ:\n(データ形式エラーのため表示できません)\n\n")
-
-    # 有効なDataFrameが1つもなければ終了
-    if not df_locals:
-        raise RuntimeError("chart_node: 利用可能なデータが0でした。")
-    
-    full_explain_string = "\n".join(df_explain_list)
-
-    python_tool = PythonAstREPLTool(
-        locals={**df_locals, "px": px, "pd": pd}, 
-        description=(
-            f"""Pythonコードを実行してデータを分析・グラフ化できます。プロット対象のDataFrameとして、{",".join(df_locals.keys())}が使用可能です。
-            plotly.express (px) を使用してインタラクティブなグラフを生成し、fig.to_json() でJSON文字列として出力してください。"""
-        )
-    )
-    class ChartOutput(BaseModel):
-        """グラフのJSONを格納するためのデータスキーマ"""
-        plotly_json: str = Field(description="Plotlyで生成されたグラフのJSON文字列")
-
-    tools = [python_tool, ChartOutput]
-    system_prompt = """
-    最適なインタラクティブグラフを `plotly.express` (例: `px`) を使用して生成してください。
-    生成したFigureオブジェクトを `fig` という変数に格納し、その後 `fig.to_json()` を呼び出してJSON文字列に変換し、そのJSON文字列を `print` してください。
-    余計な説明は不要です。最終的な出力はJSON文字列だけにしてください
-    """
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-    llm_with_chart_tool = llm.bind_tools(tools)
-    chart_agent = create_openai_tools_agent(llm_with_chart_tool, tools, prompt)
-    agent_executor = AgentExecutor(
-        agent=chart_agent, 
-        tools=[python_tool], # ChartOutputクラスは実行ツールではないので含めない
-        verbose=True,
-        handle_parsing_errors=True # 解析エラー時の処理を追加するとより堅牢
-    )
-
-    # 直近の会話履歴
-    conversation_history = state.get("messages", [])
-    # システムメッセージ以外を抽出
-    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
-    # 直近N件だけ取り出し
-    recent_history = non_system_history[-history_back_number:]
-    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
-
-    user_prompt = f"""
-    あなたはPythonプログラミングとデータ可視化の専門家です。
-    現在のタスクと文脈を踏まえて、最適なデータを選択し、最適なグラフを作成してください。
-
-    【現在のタスク】
-    {task_description}
-    
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【利用可能なデータの内容】
-    {full_explain_string}
-
-    最適なインタラクティブグラフを `plotly.express` (例: `px`) を使用して生成してください。
-    生成したFigureオブジェクトを `fig` という変数に格納し、その後 `fig.to_json()` を呼び出してJSON文字列に変換し、そのJSON文字列を `print` してください。
-
-    実行例:
-    import plotly.express as px
-    fig = px.line(df, x='your_x_column', y='your_y_column')
-    print(fig.to_json())
-    """
-
-    logging.info(f"chart_node: 生成AIが考えています・・・ '{task_description}'")
-    agent_response = agent_executor.invoke(
-        {"input":user_prompt}
-        )
-    logging.info(f"chart_node: Agent response: {agent_response}")
-
-    # The agent's output should be the Plotly JSON string
-    plotly_json_string = agent_response['tool_calls'][0]['args']['plotly_json']
-    try:
-        json.loads(plotly_json_string)
-
-    except (json.JSONDecodeError, TypeError) as e:
-        error_message = f"生成されたグラフのJSONが無効です: {e}"
-        logging.info(f"chart_node: {error_message}")
-        # エラーが発生した場合も、ToolMessageで結果を返す
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
-
-    # stateを直接いじるのではなく、結果をメッセージとして返す
-    return {
-        "messages": [
-            ToolMessage(
-                content=plotly_json_string,
-                tool_call_id=tool_call_id
-            )
-        ]
-    }
-
-
-def processing_node(state: AgentState):
-    """
-    自然言語のタスク記述とstate内のデータを受け取り、文脈を理解した上でデータを加工します。
-    分析のためにデータを加工する必要がある際に使用します。
-    """
-    task_description = state["messages"][-1].content
-    tool_call_id = state["messages"][-2].tool_calls[0]['id']
-
+    logging.info(f"processing_node: df_historyの読み込み開始・・・ '{task_description}'")
     df_history = state.get("df_history", None)
     if df_history is None:
         raise RuntimeError("processing_node: df_historyが空です。利用可能なデータがありません。")
 
-    # 直近N件だけ取り出し
+    # 会話履歴の直近N件だけ取り出し
     recent_items = df_history[-history_back_number:]
     df_explain_list = []
     df_locals = {}
@@ -534,39 +411,33 @@ def processing_node(state: AgentState):
         raise RuntimeError("processing_node: 利用可能なデータが0でした。")
     
     full_explain_string = "\n".join(df_explain_list)
+
+    #pythonツールの定義
+    locals = {**df_locals, "px": px, "pd": pd}
     python_tool = PythonAstREPLTool(
-        locals={**df_locals, "pd": pd}, 
+        name="python_ast_repl",
+        locals=locals, 
         description=(
-            f"""Pythonコードを実行してデータを加工できます。DataFrameとして、{",".join(df_locals.keys())}が使用可能です。"""
+            f"""Pythonコードを実行してデータの加工とグラフ化ができます。対象のDataFrameとして、{",".join(df_locals.keys())}が使用可能です。
+            グラフを作成するときにはplotly.express (px) を使用してインタラクティブなグラフを生成し、最終的なグラフオブジェクトは必ず `fig` という変数に格納してください。
+            データフレームを成果物とする場合は、データフレームは `final_df` という変数に格納してください。"""
         )
     )
-    # 加工後のDataFrame(JSON文字列)を受け取るためのダミーのツール
-    class ProcessedDataFrame(BaseModel):
-        """データ加工後のDataFrameを格納するためのデータスキーマ"""
-        dataframe_as_json_string: str = Field(
-            description="データ加工後のPandas DataFrameを to_json(orient='records') で変換したJSON文字列。"
-        )
-    tools = [python_tool, ProcessedDataFrame]
-    # LLMにツールをバインド
-    processing_llm = llm.bind_tools(tools)
+    tools = [python_tool]
+
+    #system_prompt
     system_prompt = """
-    あなたはPythonとPandasを使ったデータ加工の専門家です。
-    与えられたデータと指示に基づき、データ加工を行うPythonコードを作成・実行してください。
+    あなたはデータ分析のエキスパートです。ユーザーの指示に従い、ツールを使って分析し、結果を返してください。
+
+    - 渡された`df`というDataFrameを操作・分析してください。
+    - 可視化を行う場合、最適なインタラクティブグラフを`plotly.express` (例: `px`) を使用して生成してください。最終的なグラフオブジェクトは必ず `fig` という変数に格納してください。
+    - データフレームを最終成果物とする場合、そのデータフレームは `final_df` という変数に格納してください。
+
+    思考の過程:
+    {agent_scratchpad}
     """
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-    processing_agent = create_openai_tools_agent(processing_llm, tools, prompt)
-    processing_agent_executor = AgentExecutor(
-        agent=processing_agent,
-        tools=[python_tool], # ProcessedDataFrameクラスは実行ツールではないので含めない
-        verbose=True,
-        handle_parsing_errors=True # 解析エラー時の処理を追加するとより堅牢
-    )
 
-
+    # user_prompt準備
     # 直近の会話履歴
     conversation_history = state.get("messages", [])
     # システムメッセージ以外を抽出
@@ -576,9 +447,8 @@ def processing_node(state: AgentState):
     context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
 
     user_prompt = f"""
-    あなたはPythonプログラミングの専門家です。
-    現在のタスクと文脈を踏まえて、最適なデータを選択し、求められたデータ加工を行ってください。
-    データ加工後の結果は必ず DataFrameとし、'result'という名前の変数に代入して返却してください。
+    あなたはPythonプログラミングとデータ可視化の専門家です。
+    現在のタスクと文脈を踏まえて、最適なデータを選択して、最適なPythonコードを書いてください。
 
     【現在のタスク】
     {task_description}
@@ -589,41 +459,93 @@ def processing_node(state: AgentState):
     【利用可能なデータの内容】
     {full_explain_string}
 
-    実行すべきPythonコードのみを考えてください。
-    最終的な結果は'result'という名称のDataFrameに格納する必要があります。
-    これは絶対に守ってください。
+     - 可視化を行う場合、最適なインタラクティブグラフを`plotly.express` (例: `px`) を使用して生成してください。最終的なグラフオブジェクトは必ず `fig` という変数に格納してください。
+    実行例:
+    import plotly.express as px
+    fig = px.line(df, x='your_x_column', y='your_y_column')
+
+    - 最終成果物のデータフレームは `final_df` という変数に格納してください。
+    実行例:
+    import pandas as pd
+    final_df = df.groupby('date')['sales'].sum().reset_index()
+
     """
+
+    #promptをまとめてAgentを準備
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+
+    logging.info(f"processing_node: 分析開始・・・ '{task_description}'")
+    llm_with_tool = llm.bind_tools(tools)
+    agent = create_openai_tools_agent(llm_with_tool, tools, prompt)
+    agent_executor = AgentExecutor(
+        agent=agent, 
+        tools=[python_tool],
+        verbose=True,
+        handle_parsing_errors=True # 解析エラー時の処理を追加するとより堅牢
+    )
+
+    #agentの実行開始
+    code_collector = CodeCollectorCallback()
+    logging.info(f"processing_node: 生成AIが考えています・・・ '{task_description}'")
+    agent_response = agent_executor.invoke(
+        {"input":user_prompt},
+        {"callbacks": [code_collector]} 
+        )
+    logging.info(f"processing_node: Agent response: {agent_response}")
+    logging.info(f"processing_node: Agent response: {code_collector.codes}")
+
     try:
-        # 内部エージェントを実行
-        response = processing_agent_executor.invoke({"input": user_prompt})
+        logging.info(f"processing_node: コード検証中・・・ '{task_description}'")
+        # 実行環境のスコープはPythonAstREPLを使いまわす
+        execution_scope = locals
+        for i in code_collector.codes:
+            code_dict = ast.literal_eval(i)
+            code_str = code_dict["query"]   
+            exec(code_str, execution_scope)
         
-        # エージェントが ProcessedDataFrame ツールを呼び出したことを確認
-        processed_df_json = None
-        for tool_call in response.get('tool_calls', []):
-            if tool_call['name'] == ProcessedDataFrame.__name__:
-                processed_df_json = tool_call['args']['dataframe_as_json_string']
-                break
-        
-        if processed_df_json is None:
-            raise RuntimeError("エージェントは加工後のDataFrameを返しませんでした。")
-        
-        processed_df = pd.read_json(io.StringIO(processed_df_json), orient="records")
-        new_history_item = {task_description: processed_df.to_dict(orient="records")}
+        # 最終的なオブジェクトをスコープから取得して利用
+        fig = execution_scope.get('fig')
+        result_df = execution_scope.get('final_df')
+    
+        if fig is not None:
+            fig_json = fig.to_json()
+        else:
+            fig_json = None
+
+        if result_df is not None:
+            result_df_json = result_df.to_json(orient="records", force_ascii=False)
+            new_history_item = {task_description: result_df.to_dict(orient="records")}
+        else:
+            result_df_json = None
+            new_history_item = None
+
+        if (fig_json is None) and (result_df_json is None):
+            content = "データも、グラフも生成されませんでした"
+        else:
+            content = json.dumps({
+                "result_df_json": result_df_json,
+                "fig_json": fig_json
+            }, ensure_ascii=False)
 
     except Exception as e:
-        error_message = f"データ加工中にエラーが発生しました: {e}"
-        print(error_message)
+        error_message = f"生成AIがデータ加工・グラフ作成に失敗しました。: {e}"
+        logging.info(f"processing_node: {error_message}")
+        # エラーが発生した場合も、ToolMessageで結果を返す
         return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
 
-    # --- 6. 出口の変更: 結果をToolMessageで報告する ---
+    # stateを直接いじるのではなく、結果をメッセージとして返す
     return {
         "messages": [
             ToolMessage(
-                content=processed_df_json,
+                content=content,
                 tool_call_id=tool_call_id
             )
         ],
-        "df_history": state.get("df_history", []) + [new_history_item]
+        "df_history": state.get("df_history", []) + [new_history_item],
     }
 
 # --- 2. スーパーバイザーの出力スキーマ定義 (Pydantic) ---
@@ -637,7 +559,7 @@ class DispatchDecision(BaseModel):
                            
 # スーパーバイザーのLLMチェーン定義 ---
 # 利用可能な専門家（ノード）のリスト
-members = ["sql_node", "chart_node", "processing_node", "interpret_node"]
+members = ["sql_node", "processing_node", "interpret_node"]
 tools = [metadata_retrieval_node, analysis_plan_node]
 
 # スーパーバイザーに与えるシステムプロンプト
@@ -652,8 +574,7 @@ system_prompt_supervisor = (
 
     "== 専門家メンバーリスト ==\n"
     "- sql_node: 依頼に従ってSQLを生成し、データを取得する\n\n"
-    "- chart_node: 依頼に従ってデータからグラフを作成する\n\n"
-    "- processing_node: 依頼に従ってデータを加工する\n\n"
+    "- processing_node: 依頼に従ってデータの加工やグラフ作成をする\n\n"
     "- interpret_node: 依頼に従ってデータの解釈を行う\n\n"
     "== 判断ルール ==\n"
     "まずツールで解決できるか検討し、できなければ専門家への割り振りを考えてください。\n"
@@ -680,32 +601,43 @@ def supervisor_node(state: AgentState):
     print("--- スーパーバイザー ノード実行 ---")
     
     response = supervisor_chain.invoke({"messages": state["messages"]})
-    
-    # CASE 1: LLMがツールを使うと判断した場合
-    if response.tool_calls:
-        print("判断: ツールを直接実行します。")
-        # 新しいメッセージとしてツールコールを追加し、'next'を'tools'に設定
-        return {"messages": [response], "next": "tools"}
-        
-    # CASE 2: LLMが専門家に割り振ると判断した場合
-    # response.tool_calls[0]['args']にDispatchDecisionの引数が入ってくる
-    else:
-        # Pydanticモデルにパースして扱いやすくする
-        dispatch_decision = DispatchDecision(**response.tool_calls[0]['args'])
-        print(f"判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
-        print(f"判断理由: {dispatch_decision.rationale}")
-        print(f"具体的な指示: {dispatch_decision.task_description}")
-        
-        # 次のノード（専門家）に渡すためのメッセージを作成
-        # これにより、専門家は「スーパーバイザーからこの指示が来た」と認識できる
-        dispatch_message = ToolMessage(
-            content=f"以下の指示を実行してください：\n\n{dispatch_decision.task_description}",
-            tool_call_id=response.tool_calls[0]['id'] # どの判断に対応するかを紐付け
-        )
-        return {
-            "messages": [response, dispatch_message],
-            "next": dispatch_decision.next_agent
-        }
+    print(response)
+
+    tool_calls = response.additional_kwargs.get("tool_calls", [])
+    # 2. tool_callsがあるかどうかで分岐
+    if tool_calls:
+        first_call = tool_calls[0]
+        args_json = first_call["function"]["arguments"]
+        try:
+            args = json.loads(args_json)
+        except Exception as e:
+            raise (f"argumentsのJSONデコードに失敗:{e}")
+
+        if "next_agent" not in args:            
+            print("判断: ツールを直接実行します。")
+            # 新しいメッセージとしてツールコールを追加し、'next'を'tools'に設定
+            return {"messages": [*state["messages"], response], "next": "tools"}
+            
+        # CASE 2: LLMが専門家に割り振ると判断した場合
+        # response.tool_calls[0]['args']にDispatchDecisionの引数が入ってくる
+        else:
+            # Pydanticモデルにパースして扱いやすくする
+            dispatch_decision = DispatchDecision(**response.tool_calls[0]['args'])
+            print(f"判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
+            print(f"判断理由: {dispatch_decision.rationale}")
+            print(f"具体的な指示: {dispatch_decision.task_description}")
+            
+            # 次のノード（専門家）に渡すためのメッセージを作成
+            # これにより、専門家は「スーパーバイザーからこの指示が来た」と認識できる
+            dispatch_message = ToolMessage(
+                content=f"以下の指示を実行してください：\n\n{dispatch_decision.task_description}",
+                tool_call_id=response.tool_calls[0]['id'] # どの判断に対応するかを紐付け
+            )
+            return {
+                "messages": [*state["messages"], response, dispatch_message], # 必要に応じてHumanMessage/AIMessage
+                "next": dispatch_decision.next_agent
+            }
+
 
 def build_workflow():
     graph_builder = StateGraph(AgentState)
@@ -716,10 +648,9 @@ def build_workflow():
     # 2. ツール実行ノードを追加
     # ToolNodeは、スーパーバイザーが呼び出しを決めたツールを自動で実行してくれる便利なノード
     # スーパーバイザーと各専門家をノードとして追加
-    graph_builder.add_node("sql", sql_node) 
-    graph_builder.add_node("chart", chart_node)
-    graph_builder.add_node("processing", processing_node)
-    graph_builder.add_node("interpret", interpret_node)
+    graph_builder.add_node("sql_node", sql_node) 
+    graph_builder.add_node("processing_node", processing_node)
+    graph_builder.add_node("interpret_node", interpret_node)
     tool_node = ToolNode(tools)
     graph_builder.add_node("tools", tool_node)
 
@@ -731,9 +662,8 @@ def build_workflow():
         "supervisor",
         lambda state: state["next"],
         {
-            "sql": "sql",
-            "chart": "chart",
-            "processing": "processing",
+            "sql_node": "sql_node",
+            "processing_node": "processing_node",
             "tools":"tools",
             "FINISH": END
         }
@@ -741,9 +671,8 @@ def build_workflow():
 
 
     # 各専門家の作業が終わったら、必ずスーパーバイザーに報告に戻る
-    graph_builder.add_edge("sql", "supervisor")
-    graph_builder.add_edge("chart", "supervisor")
-    graph_builder.add_edge("processing", "supervisor")
+    graph_builder.add_edge("sql_node", "supervisor")
+    graph_builder.add_edge("processing_node", "supervisor")
     graph_builder.add_edge("tools", "supervisor")
     
     memory = MemorySaver()
