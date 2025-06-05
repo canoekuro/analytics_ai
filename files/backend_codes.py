@@ -26,12 +26,6 @@ from functions import extract_sql, try_sql_execute, fix_sql_with_llm, get_table_
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
 
-api_key = os.getenv("AZURE_OPENAI_API_KEY")
-endpoint = os.getenv("AZURE_OPENAI_API_BASE")
-version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
-deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
-version = os.getenv("AZURE_OPENAI_API_VERSION")
-deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
 # llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
 # google_api_key = os.getenv("GOOGLE_API_KEY")
@@ -43,6 +37,13 @@ deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 # ) # または、より高性能な "gemini-1.5-flash"、"gemini-1.5-pro"
 
 #Chatモデル（SQL生成用）
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+endpoint = os.getenv("AZURE_OPENAI_API_BASE")
+version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
+deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
+version = os.getenv("AZURE_OPENAI_API_VERSION")
+deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
 llm = AzureChatOpenAI(
     openai_api_key=api_key,
     azure_endpoint=endpoint,
