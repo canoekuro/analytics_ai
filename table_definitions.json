@@ -1,110 +1,87 @@
 [
   {
-    "table_name": "sales_data",
-    "table_description": "売上データを格納するテーブル。商品カテゴリ、商品名、販売金額、日付を持つ。",
+    "table_name": "products",
+    "table_explanation": "商品マスタのテーブルです。このテーブルのデータは直接集計（SUMなど）の対象とせず、主に商品情報の参照に用います。商品名はユーザーが特に指定しない限り、関連情報として表示することが望ましいです。",
     "columns": [
       {
-        "name": "id",
-        "type": "INTEGER",
-        "description": "レコードID（主キー）"
-      },
-      {
-        "name": "category",
-        "type": "TEXT",
-        "description": "商品カテゴリ名"
+        "name": "product_id",
+        "explanation": "商品の一意な識別子（主キー）。通常、ユーザーへの表示には不要です。"
       },
       {
         "name": "product_name",
-        "type": "TEXT",
-        "description": "商品名"
+        "explanation": "商品名。ユーザーが商品を特定するために重要な情報です。特別な指示がない限り、SELECT句に含めてください。"
       },
       {
-        "name": "sales",
-        "type": "INTEGER",
-        "description": "販売金額"
+        "name": "category",
+        "explanation": "商品のカテゴリ（例: 'エレクトロニクス', '書籍', 'アパレル', '食品'）。フィルタリング条件としてよく使用されます。'All'というカテゴリ名は存在しません。"
       },
       {
-        "name": "date",
-        "type": "TEXT",
-        "description": "販売日（YYYY-MM-DD）"
+        "name": "unit_price",
+        "explanation": "商品の単価（税抜）。価格に関する問い合わせの場合に参照します。"
+      },
+      {
+        "name": "stock_quantity",
+        "explanation": "現在の在庫数。在庫確認の際に参照します。"
       }
     ]
   },
   {
-    "table_name": "users",
-    "table_description": "ユーザー情報を格納するテーブル。ユーザー名、年齢、都道府県が格納される。",
+    "table_name": "sales",
+    "table_explanation": "売上実績のテーブルです。このテーブルは既に「集計済みの売上データ」を格納しており、`sales_amount`カラムが売上金額そのものです。そのため、このテーブルの`sales_amount`に対してSUM()などの集計関数を再度使用することは原則として不要です。期間の指定がない売上に関する問い合わせの場合、デフォルトで過去1ヶ月分（例：2025-05-06以降など、実行日に応じて調整）のデータを対象としてください。",
     "columns": [
       {
-        "name": "user_id",
-        "type": "INTEGER",
-        "description": "ユーザーID（主キー）"
+        "name": "sale_id",
+        "explanation": "売上の一意な識別子（主キー）。"
       },
       {
-        "name": "user_name",
-        "type": "TEXT",
-        "description": "ユーザー名"
+        "name": "sale_date",
+        "explanation": "売上が発生した日付 (YYYY-MM-DD形式)。日付範囲のフィルタリングによく使用されます。"
       },
       {
-        "name": "age",
-        "type": "INTEGER",
-        "description": "年齢"
+        "name": "product_id",
+        "explanation": "売れた商品のID。`products`テーブルの`product_id`と関連します。"
+      },
+      {
+        "name": "customer_id",
+        "explanation": "購入した顧客のID。`customers`テーブルの`customer_id`と関連します。"
+      },
+      {
+        "name": "quantity",
+        "explanation": "販売数量。集計済みの`sales_amount`があるため、通常このカラムで金額計算は行いません。"
+      },
+      {
+        "name": "sales_amount",
+        "explanation": "この売上の合計金額（集計済）。ユーザーが「売上」について尋ねた場合、基本的にはこのカラムを参照します。"
+      }
+    ]
+  },
+  {
+    "table_name": "customers",
+    "table_explanation": "顧客マスタのテーブルです。個人情報を含むため、特に`email`カラムの扱いは慎重に。顧客名とメールアドレスを同時に表示するようなクエリは避けてください。顧客に関する問い合わせでステータスの指定がない場合は、デフォルトで 'active' の顧客を対象としてください。",
+    "columns": [
+      {
+        "name": "customer_id",
+        "explanation": "顧客の一意な識別子（主キー）。"
+      },
+      {
+        "name": "customer_name",
+        "explanation": "顧客の氏名。"
       },
       {
         "name": "prefecture",
-        "type": "TEXT",
-        "description": "都道府県"
-      }
-    ]
-  },
-  {
-    "table_name": "products",
-    "table_description": "商品マスタテーブル。商品名、カテゴリ、価格が格納される。",
-    "columns": [
-      {
-        "name": "product_id",
-        "type": "INTEGER",
-        "description": "商品ID（主キー）"
+        "explanation": "顧客の居住都道府県（例: '東京都', '大阪府'）。地域別の分析に使用されます。"
       },
       {
-        "name": "product_name",
-        "type": "TEXT",
-        "description": "商品名"
+        "name": "email",
+        "explanation": "顧客のメールアドレス。このカラムは原則としてSELECT句に含めないでください。業務上必要な場合でも、その旨をユーザーに確認するか、注意喚起をしてください。"
       },
       {
-        "name": "category",
-        "type": "TEXT",
-        "description": "商品カテゴリ"
+        "name": "status",
+        "explanation": "顧客のステータス（'active', 'inactive', 'pending'）。特に指定がない限り、WHERE句で`status = 'active'`としてアクティブな顧客のみを対象にしてください。"
       },
       {
-        "name": "price",
-        "type": "INTEGER",
-        "description": "価格"
-      }
-    ]
-  },
-  {
-    "table_name": "reviews",
-    "table_description": "商品レビューを格納するテーブル。商品ID、評価（rating）、コメントが格納される。",
-    "columns": [
-      {
-        "name": "review_id",
-        "type": "INTEGER",
-        "description": "レビューID（主キー）"
-      },
-      {
-        "name": "product_id",
-        "type": "INTEGER",
-        "description": "商品ID"
-      },
-      {
-        "name": "rating",
-        "type": "INTEGER",
-        "description": "5段階評価（1-5）"
-      },
-      {
-        "name": "comment",
-        "type": "TEXT",
-        "description": "レビューコメント"
+        "name": "registration_date",
+        "explanation": "顧客の登録日 (YYYY-MM-DD形式)。"
       }
     ]
   }
