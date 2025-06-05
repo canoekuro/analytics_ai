@@ -37,6 +37,41 @@ if table_definitions_data is None or query_examples_data is None:
     print("データファイルの読み込みに失敗したため、処理を終了します。")
     exit()
 
+def format_table_schema_for_llm(table_json_string: str) -> str:
+    """
+    テーブル定義のJSON文字列を、LLMがルールを認識しやすい
+    構造化されたテキスト形式に変換します。
+    """
+    try:
+        data = json.loads(table_json_string)
+    except json.JSONDecodeError:
+        # JSONとしてパースできない場合は、元の文字列をそのまま返すかエラー処理
+        return table_json_string 
+
+    text_parts = []
+    text_parts.append(f"<schema>")
+    text_parts.append(f"  <table_name>{data['table_name']}</table_name>")
+    
+    if data.get("table_explanation"):
+        text_parts.append(f"  <table_rules_header>【テーブル全体に関するルール】</table_rules_header>")
+        text_parts.append(f"  <table_explanation>{data['table_explanation']}</table_explanation>")
+    
+    if data.get("columns"):
+        text_parts.append(f"  <columns_header>【カラム定義と個別ルール】</columns_header>")
+        text_parts.append(f"  <columns>")
+        for col in data["columns"]:
+            text_parts.append(f"    <column>")
+            text_parts.append(f"      <name>{col['name']}</name>")
+            if col.get("explanation"):
+                text_parts.append(f"      <explanation>{col['explanation']}</explanation>")
+            # 必要であれば型情報などもここに含める
+            # text_parts.append(f"      <type>{col.get('type', '不明')}</type>")
+            text_parts.append(f"    </column>")
+        text_parts.append(f"  </columns>")
+    text_parts.append(f"</schema>")
+    
+    return "\n".join(text_parts)
+
 # --- 4. ドキュメントの準備 ---
 
 # テーブル定義のドキュメントを作成
