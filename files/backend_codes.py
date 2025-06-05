@@ -21,9 +21,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from functions import extract_sql, try_sql_execute, fix_sql_with_llm
-
-
+from functions import extract_sql, try_sql_execute, fix_sql_with_llm, get_table_name_from_formatted_doc
 
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
@@ -166,16 +164,7 @@ def sql_node(state: AgentState):
     # ★ --- 1. 候補となるテーブルを多めに取得（Re-rankingステップ） ---
     logging.info(f"sql_node(Re-rank): 候補テーブルを広く検索中 (k=RERANK_CANDIDATE_COUNT)...")
     # vectorstore_tablesには、format_table_schema_for_llmで変換済みのテキストが格納されている想定
-    candidate_docs = vectorstore_tables.similarity_search(task_description, k=5)
-    
-    def get_table_name_from_formatted_doc(doc_content: str) -> Optional[str]:
-        # format_table_schema_for_llm で <table_name> タグが使われることを想定
-        for line in doc_content.split('\n'):
-            line = line.strip()
-            if line.startswith("<table_name>") and line.endswith("</table_name>"):
-                            return line[len("<table_name>"):-len("</table_name>")].strip()
-        return None
-        
+    candidate_docs = vectorstore_tables.similarity_search(task_description, k=RERANK_CANDIDATE_COUNT)        
     candidate_table_names = [get_table_name_from_formatted_doc(doc.page_content) for doc in candidate_docs]
     candidate_tables_info_for_prompt = "\n\n".join(
         # 選別用プロンプトでは、ルールも見えるようにそのままのテキストを渡す
