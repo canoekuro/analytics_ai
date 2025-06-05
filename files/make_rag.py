@@ -2,17 +2,31 @@ import os
 import json
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings # Assuming you intend to use this
+from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.documents import Document
 from dotenv import load_dotenv
 load_dotenv() # .env ファイルから環境変数を読み込む
 
 # --- 1. 環境変数の設定 ---
-google_api_key = os.getenv("GOOGLE_API_KEY")
-if not google_api_key:
-    raise ValueError("GOOGLE_API_KEY 環境変数が設定されていません。")
+# google_api_key = os.getenv("GOOGLE_API_KEY")
+# if not google_api_key:
+#     raise ValueError("GOOGLE_API_KEY 環境変数が設定されていません。")
 
-# --- 2. 埋め込みモデルの初期化 ---
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+# # --- 2. 埋め込みモデルの初期化 ---
+# embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+
+#Chatモデル（SQL生成用）
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+endpoint = os.getenv("AZURE_OPENAI_API_BASE")
+version4emb = os.getenv("AZURE_OPENAI_API_VERSION4EMB")
+deployment4emb = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME4EMB")
+
+embeddings = AzureOpenAIEmbeddings(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version4emb,
+    azure_deployment=deployment4emb
+)
 
 # --- 3. JSONデータの読み込み ---
 def load_json_data(file_path):
