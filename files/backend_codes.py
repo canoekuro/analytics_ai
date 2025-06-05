@@ -21,9 +21,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from functions import extract_sql, try_sql_execute, fix_sql_with_llm
-
-
+from functions import extract_sql, try_sql_execute, fix_sql_with_llm, get_table_name_from_formatted_doc
 
 # 基本的なロギングを設定
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +68,7 @@ class AgentState(TypedDict):
     df_history: List[dict] 
 
 history_back_number = 5
+RERANK_CANDIDATE_COUNT = 5
 
 @tool
 def metadata_retrieval_node(task_description: str, conversation_history: list[str]):
@@ -145,46 +144,114 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     step_answer = response.content.strip()
 
     return step_answer
-
+    
 def sql_node(state: AgentState):
     """
-    自然言語のタスク記述とstate内の会話履歴を受け取り、、文脈を理解した上でSQLを生成・実行します。
-    分析のためにデータを取得する必要がある際に使用します。
+    自然言語のタスク記述とstate内の会話履歴を受け取り、ルールを強く意識した上でSQLを生成・実行します。
+    （二段階選抜とルール遵守CoTを実装）
     """
     try:
         task_description = state["messages"][-1].content
         tool_call_id = state["messages"][-2].tool_calls[0]['id']
+        conversation_history = state.get("messages", [])
+        non_system_history = [msg for msg in conversation_history if msg.type != "system"]
+        recent_history = non_system_history[-history_back_number:]
+        context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
     except (IndexError, KeyError):
-        # スーパーバイザーからの呼び出し形式が正しくない場合のエラーハンドリング
         error_message = {"status": "error", "error_message": "不正な呼び出し形式です。"}
-        # tool_call_idが不明なため、Noneを指定
         return {"messages": [ToolMessage(content=json.dumps(error_message), tool_call_id=None)]}
 
+    # ★ --- 1. 候補となるテーブルを多めに取得（Re-rankingステップ） ---
+    logging.info(f"sql_node(Re-rank): 候補テーブルを広く検索中 (k=RERANK_CANDIDATE_COUNT)...")
+    # vectorstore_tablesには、format_table_schema_for_llmで変換済みのテキストが格納されている想定
+    candidate_docs = vectorstore_tables.similarity_search(task_description, k=RERANK_CANDIDATE_COUNT)        
+    candidate_table_names = [get_table_name_from_formatted_doc(doc.page_content) for doc in candidate_docs]
+    candidate_tables_info_for_prompt = "\n\n".join(
+        # 選別用プロンプトでは、ルールも見えるようにそのままのテキストを渡す
+        [doc.page_content for name, doc in zip(candidate_table_names, candidate_docs) if name] 
+    )
 
-    #システムプロンプト
+    # ★ --- 2. LLMにテーブルを選別させる（1回目の問いかけ） ---
+    if candidate_tables_info_for_prompt: # 候補がある場合のみ選別
+        logging.info(f"sql_node(Re-rank): LLMにテーブル選別を依頼中...")
+        rerank_prompt = f"""
+        ユーザーの最終的な要求は「{task_description}」です。
+        この要求に答えるために、以下のテーブル定義リストの中から、SQLクエリの生成に本当に必要だと思われるテーブル名をすべて選び出し、カンマ区切りで出力してください。
+        余計な説明は不要です。テーブル名のみをカンマ区切りで出力してください。
+
+        【テーブル定義リスト】
+        {candidate_tables_info_for_prompt}
+
+        【必要なテーブル名リスト（カンマ区切り）】
+        """
+        rerank_response = llm.invoke(rerank_prompt)
+        required_table_names_str = rerank_response.content.strip()
+        if required_table_names_str: # LLMが何かしらテーブル名を返した場合
+             required_table_names = [name.strip() for name in required_table_names_str.split(',')]
+        else: # LLMがテーブル名を選べなかった場合、元の候補を全て使うか、エラーにするか検討。ここでは全て使う。
+            logging.warning("LLMが選別するテーブル名を返さなかったため、検索候補を全て使用します。")
+            required_table_names = [name for name in candidate_table_names if name] # Noneを除外
+
+        logging.info(f"sql_node(Re-rank): LLMが選別したテーブル: {required_table_names}")
+    else: # RAG検索で候補が一つもなかった場合
+        logging.warning("RAG検索でテーブル候補が見つかりませんでした。")
+        required_table_names = []
+
+
+    # ★ --- 3. LLMの選別結果を基に、使用するテーブル定義を絞り込む ---
+    final_docs = [doc for doc in candidate_docs if get_table_name_from_formatted_doc(doc.page_content) in required_table_names]
+    final_rag_tables_text = "\n\n".join([doc.page_content for doc in final_docs])
+
+    if not final_rag_tables_text: # 最終的に使用するテーブル情報がない場合はエラー
+        logging.error("sql_node: 最終的に使用するテーブル情報が見つかりませんでした。")
+        result_payload = {"status": "error", "error_message": "関連するテーブル情報が見つかりませんでした。"}
+        return {"messages": [ToolMessage(content=json.dumps(result_payload), tool_call_id=tool_call_id)]}
+
+    # ★ --- 4. ルール遵守CoTを組み込んだシステムプロンプトを作成 ---
     system_prompt = """
-    あなたはSQL生成AIです。この後の質問に対し、SQLiteの標準的なSQL文のみを出力してください。
-    - 使用できるSQL構文は「SELECT」「WHERE」「GROUP BY」「ORDER BY」「LIMIT」のみです。
-    - 日付関数や高度な型変換、サブクエリやウィンドウ関数、JOINは使わないでください。
-    - 必ず1つのテーブルだけを使い、簡単な集計・フィルタ・並べ替えまでにしてください。
-    - SQLの前後にコメントや説明文は出力しないでください。出力された内容をそのまま実行するため、SQL文のみをそのまま出力してください。
-    """
-    # 直近の会話履歴
-    conversation_history = state.get("messages", [])
-    # システムメッセージ以外を抽出
-    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
-    # 直近N件だけ取り出し
-    recent_history = non_system_history[-history_back_number:]
-    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
+    あなたは非常に優秀なSQL生成AIです。ユーザーの要求、提供されたテーブル定義、
+    そして最も重要な【テーブル全体に関するルール】（<table_explanation>タグ内）と
+    各【カラム定義と個別ルール】（<column>タグ内の<explanation>タグ）を基に、SQLiteのSQLを生成します。
     
-    # Rag情報
-    logging.info(f"sql_node: 要件を処理中: '{task_description}'")
-    retrieved_tables_docs = vectorstore_tables.similarity_search(task_description, k=3)
-    rag_tables = "\n".join([doc.page_content for doc in retrieved_tables_docs])
+    SQLを生成する前に、必ず以下の思考プロセスに従って、ステップバイステップで考察を行ってください。
+    あなたの最終的な出力は、思考プロセスを含まない、実行可能なSQLite SQLクエリ文のみにしてください。
+    ---
+    ### 思考プロセス (Chain-of-Thought)
+    
+    1.  **ユーザー要求の理解**: ユーザーが最終的に何を知りたいのかを明確にする。
+    
+    2.  **使用テーブルの確認とルール遵守**:
+        * 今回使用するテーブルは、提供された【使用するテーブル定義】の中から最も適切なものを1つだけ選択する。
+        * 選択したテーブルの【テーブル全体に関するルール】（<table_explanation>の内容）を特定し、このルールをSQL生成時にどのように考慮するか記述する。
+    
+    3.  **使用カラムの特定とルールチェック**:
+        テーブル内のカラムについて【カラム定義と個別ルール】（<column>タグ内の<explanation>の内容）を確認します。以下のチェックリスト形式で思考を整理してください。ルールがない場合は「特になし」と記載する。
+    
+        | 使用するカラム名 | カラムの個別ルール                                     | ルールをSQLにどう反映させるか（SELECT句、WHERE句など） |
+        | :--------------- | :----------------------------------------------------- | :----------------------------------------------------- |
+        | (例) カテゴリ    | 必ず出力に含めてください。指定がない場合はWhere句で’All’ | SELECT句に「カテゴリ」を含める。WHERE句の条件を確認。 |
+        | ...              | ...                                                    | ...                                                    |
+    
+    4.  **SQL組み立て方針の決定**:
+        * `SELECT`句: 上記のルールチェックに基づき、どのカラムを含めるか。
+        * `FROM`句: ステップ2で確認したテーブル名。
+        * `WHERE`句: 上記のルールチェックとユーザー要求に基づき、どのような条件が必要か。
+        * その他（`GROUP BY`, `ORDER BY`, `LIMIT`）: 必要に応じて。ただし、テーブル全体のルール（例：集計関数禁止など）やSQLiteの制約（JOIN禁止、単一テーブル使用）を厳守する。
+    
+    5.  **最終SQLの生成**: 上記の方針に基づき、最終的なSQLite SQLクエリを生成する。ルール違反がないか最終確認する。
+    ---
+    
+    上記の思考プロセスを頭の中で実行し、完成したSQLクエリのみを出力してください。
+    SQLの前後にコメントや説明文は出力しないでください。
+    使用できるSQL構文は「SELECT」「WHERE」「GROUP BY」「ORDER BY」「LIMIT」のみです。
+    日付関数や高度な型変換、サブクエリやウィンドウ関数、JOINは使わないでください。
+    必ず1つのテーブルだけを使い、簡単な集計・フィルタ・並べ替えまでにしてください。
+    """
+    
+    # --- 5. 本番のSQL生成用ユーザープロンプトを組み立てる ---
     retrieved_queries_docs = vectorstore_queries.similarity_search(task_description, k=3)
-    rag_queries = "\n".join([doc.page_content for doc in retrieved_queries_docs])
+    rag_queries = "\n\n".join([doc.page_content for doc in retrieved_queries_docs])
 
-    #ユーザープロンプト
     user_prompt = f"""
     【現在のタスク】
     {task_description}
@@ -192,64 +259,48 @@ def sql_node(state: AgentState):
     【ユーザーの全体的な質問の文脈】
     {context}
     
-    【テーブル定義に関する情報】
-    {rag_tables}
+    【使用するテーブル定義】
+    {final_rag_tables_text}
     
     【類似する問い合わせ例とそのSQL】
     {rag_queries}
     
-    この要件を満たすためのSQLを生成してください。
+    この要件を満たし、かつ提示された全てのルールを厳守するSQLite SQLクエリを生成してください。
     """
+
+    # --- 6. SQL生成の実行と後続処理（2回目の問いかけ & 実行） ---
     try:
-        logging.info(f"sql_node: 生成AIが考えています・・・ '{task_description}'")
+        logging.info(f"sql_node(CoT): 生成AIが考えています・・・ '{task_description}'")
         response = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
         ])
         sql_generated_clean = extract_sql(response.content.strip())
-        last_sql_generated = sql_generated_clean # Store the latest SQL attempt for this requirement
+        last_sql_generated = sql_generated_clean
         result_df, sql_error = try_sql_execute(sql_generated_clean)
 
-        #1回目は失敗した場合
         if sql_error:
-            logging.warning(f"'最初のSQLが失敗しました: {sql_error}。修正して再試行します。")
-            fixed_sql = fix_sql_with_llm(llm, sql_generated_clean, sql_error, rag_tables, rag_queries, task_description, context)
-            last_sql_generated = fixed_sql # この要件に対する最新のSQL試行を保存
+            logging.warning(f"最初のSQLが失敗しました: {sql_error}。修正して再試行します。")
+            fixed_sql = fix_sql_with_llm(llm, sql_generated_clean, sql_error, final_rag_tables_text, rag_queries, task_description, context)
+            last_sql_generated = fixed_sql
             result_df, sql_error = try_sql_execute(fixed_sql)
 
-            #2回目も失敗した場合
             if sql_error:
                 logging.error(f"修正SQLも失敗: {sql_error}")
-                # エラーの場合も、その情報をメッセージとして返す
-                result_payload = {
-                    "status": "error",
-                    "error_message": str(sql_error),
-                    "last_attempted_sql": last_sql_generated
-                    }
+                result_payload = {"status": "error", "error_message": str(sql_error), "last_attempted_sql": last_sql_generated}
             else:
-                # 2回目は成功した場合
-                result_payload = {
-                    "status": "success",
-                    "executed_sql": last_sql_generated,
-                    "dataframe_as_json": result_df.to_json(orient="records")
-                }
-                new_history_item = {task_description: result_df.to_dict(orient="records")}
+                result_payload = {"status": "success", "executed_sql": last_sql_generated, "dataframe_as_json": result_df.to_json(orient="records")}
+                new_history_item = {task_description: result_df.to_dict(orient="records")} if not result_df.empty else {}
         else:
-            # 1回で成功した場合
-            result_payload = {
-                "status": "success",
-                "executed_sql": last_sql_generated,
-                "dataframe_as_json": result_df.to_json(orient="records")
-            }
-            new_history_item = {task_description: result_df.to_dict(orient="records")}
+            result_payload = {"status": "success", "executed_sql": last_sql_generated, "dataframe_as_json": result_df.to_json(orient="records")}
+            new_history_item = {task_description: result_df.to_dict(orient="records")} if not result_df.empty else {}
     except Exception as e:
-        # このノード全体で予期せぬエラーが起きた場合
         logging.error(f"sql_nodeで予期せぬエラー: {e}")
-        result_payload = {
-            "status": "error",
-            "error_message": f"SQLノードの実行中に予期せぬエラーが発生しました: {e}",
-            "last_attempted_sql": locals().get("last_sql_generated", "N/A")
-        }
+        result_payload = {"status": "error", "error_message": f"SQLノードの実行中に予期せぬエラーが発生しました: {e}", "last_attempted_sql": locals().get("last_sql_generated", "N/A")}
+    
+    current_df_history = state.get("df_history", [])
+    if new_history_item: # 成功した場合のみ履歴に追加
+        current_df_history.append(new_history_item)
     # 状態を直接いじる代わりに、結果をメッセージとして返す
     return {
         "messages": [
