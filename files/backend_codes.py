@@ -11,9 +11,9 @@ import json # import jsonを先頭に移動しました
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_community.vectorstores import FAISS
 from langchain_core.tools import tool
-from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage
+from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from langgraph.checkpoint.memory import MemorySaver
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain_experimental.tools.python.tool import PythonAstREPLTool
@@ -162,7 +162,7 @@ def sql_node(state: AgentState):
 
 
     #システムプロンプト
-    system_prompt_sql_generation = """
+    system_prompt = """
     あなたはSQL生成AIです。この後の質問に対し、SQLiteの標準的なSQL文のみを出力してください。
     - 使用できるSQL構文は「SELECT」「WHERE」「GROUP BY」「ORDER BY」「LIMIT」のみです。
     - 日付関数や高度な型変換、サブクエリやウィンドウ関数、JOINは使わないでください。
@@ -185,7 +185,7 @@ def sql_node(state: AgentState):
     rag_queries = "\n".join([doc.page_content for doc in retrieved_queries_docs])
 
     #ユーザープロンプト
-    user_prompt_for_req = f"""
+    user_prompt = f"""
     【現在のタスク】
     {task_description}
     
@@ -203,8 +203,8 @@ def sql_node(state: AgentState):
     try:
         logging.info(f"sql_node: 生成AIが考えています・・・ '{task_description}'")
         response = llm.invoke([
-            {"role": "system", "content": system_prompt_sql_generation},
-            {"role": "user", "content": user_prompt_for_req}
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
         ])
         sql_generated_clean = extract_sql(response.content.strip())
         last_sql_generated = sql_generated_clean # Store the latest SQL attempt for this requirement
@@ -330,8 +330,8 @@ def interpret_node(state: AgentState):
     try:
         logging.info(f"interpret_node: 生成AIが考えています・・・ '{task_description}'")
         response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
         ])
         interpretation_text = response.content.strip() if response.content else ""
 
@@ -598,14 +598,20 @@ supervisor_chain = supervisor_prompt | llm_with_tools
 # --- 4. スーパーバイザーノード本体 ---
 def supervisor_node(state: AgentState):
     """スーパーバイザーとして次にどのアクションをとるべきか判断する"""
-    print("--- スーパーバイザー ノード実行 ---")
+    logging.info("--- スーパーバイザー ノード実行 ---")
     
     response = supervisor_chain.invoke({"messages": state["messages"]})
-    print(response)
+    logging.info(response)
 
     tool_calls = response.additional_kwargs.get("tool_calls", [])
     # 2. tool_callsがあるかどうかで分岐
-    if tool_calls:
+    if not tool_calls:
+        logging.info("supervisor_node: 判断:応答完了")
+        return{
+            "messages":[*state["messages"], response],
+            "next":"FINISH"
+            }
+    else:
         first_call = tool_calls[0]
         args_json = first_call["function"]["arguments"]
         try:
@@ -614,7 +620,7 @@ def supervisor_node(state: AgentState):
             raise (f"argumentsのJSONデコードに失敗:{e}")
 
         if "next_agent" not in args:            
-            print("判断: ツールを直接実行します。")
+            logging.info("判断: ツールを直接実行します。")
             # 新しいメッセージとしてツールコールを追加し、'next'を'tools'に設定
             return {"messages": [*state["messages"], response], "next": "tools"}
             
@@ -623,9 +629,9 @@ def supervisor_node(state: AgentState):
         else:
             # Pydanticモデルにパースして扱いやすくする
             dispatch_decision = DispatchDecision(**response.tool_calls[0]['args'])
-            print(f"判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
-            print(f"判断理由: {dispatch_decision.rationale}")
-            print(f"具体的な指示: {dispatch_decision.task_description}")
+            logging.info(f"判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
+            logging.info(f"判断理由: {dispatch_decision.rationale}")
+            logging.info(f"具体的な指示: {dispatch_decision.task_description}")
             
             # 次のノード（専門家）に渡すためのメッセージを作成
             # これにより、専門家は「スーパーバイザーからこの指示が来た」と認識できる
