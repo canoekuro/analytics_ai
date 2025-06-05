@@ -70,6 +70,7 @@ class AgentState(TypedDict):
     df_history: List[dict] 
 
 history_back_number = 5
+RERANK_CANDIDATE_COUNT = 5
 
 @tool
 def metadata_retrieval_node(task_description: str, conversation_history: list[str]):
@@ -145,7 +146,8 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     step_answer = response.content.strip()
 
     return step_answer
-
+    
+def sql_node(state: AgentState):
     """
     自然言語のタスク記述とstate内の会話履歴を受け取り、ルールを強く意識した上でSQLを生成・実行します。
     （二段階選抜とルール遵守CoTを実装）
@@ -162,7 +164,7 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
         return {"messages": [ToolMessage(content=json.dumps(error_message), tool_call_id=None)]}
 
     # ★ --- 1. 候補となるテーブルを多めに取得（Re-rankingステップ） ---
-    logging.info(f"sql_node(Re-rank): 候補テーブルを広く検索中 (k=5)...")
+    logging.info(f"sql_node(Re-rank): 候補テーブルを広く検索中 (k=RERANK_CANDIDATE_COUNT)...")
     # vectorstore_tablesには、format_table_schema_for_llmで変換済みのテキストが格納されている想定
     candidate_docs = vectorstore_tables.similarity_search(task_description, k=5)
     
@@ -171,7 +173,7 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
         for line in doc_content.split('\n'):
             line = line.strip()
             if line.startswith("<table_name>") and line.endswith("</table_name>"):
-                return line.replace("<table_name>", "").replace("</table_name>", "").strip()
+                            return line[len("<table_name>"):-len("</table_name>")].strip()
         return None
         
     candidate_table_names = [get_table_name_from_formatted_doc(doc.page_content) for doc in candidate_docs]
