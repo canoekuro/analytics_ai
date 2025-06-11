@@ -100,3 +100,52 @@ def get_table_name_from_formatted_doc(doc_content: str) -> Optional[str]:
         if line.startswith("<table_name>") and line.endswith("</table_name>"):
             return line[len("<table_name>"):-len("</table_name>")].strip()
     return None  # for全部回して見つからなかったらNone
+
+# helpers.py
+import json, logging
+from langchain.schema.messages import AIMessage, ToolMessage
+
+# superVisorのAIMessegeからTool_callを取り出して、エラーがないかを確認したうえでtask_descriptionとcontextを抽出する。
+def fetch_tool_args(
+        state: dict,
+        required_keys: list[str],
+        history_back_number: int = 6
+    ) -> tuple[dict, str] | tuple[None, dict]:
+    """
+    supervisor の AIMessage → tool_call → args を取り出す。
+    正常なら (args, tool_call_id) を返す。
+    異常なら (None, error_dict) を返す。
+    """
+    try:
+        supervisor_msg = state["messages"][-1]
+        if not isinstance(supervisor_msg, AIMessage) or not supervisor_msg.tool_calls:
+            raise ValueError("スーパーバイザーからの AIMessage(tool_calls 付き) が見つかりません。")
+
+        call = supervisor_msg.tool_calls[0]
+        tool_call_id = call["id"]
+        args = call.get("args", {})
+        if not isinstance(args, dict):
+            raise ValueError("arguments の形式が dict ではありません。")
+
+        # 必須キーチェック
+        for k in required_keys:
+            if k not in args:
+                raise ValueError(f"{k} が arguments に含まれていません。")
+
+        conversation = state.get("messages", [])
+        context = "\n".join([
+            f"{m.type}: {m.content}"
+            for m in [msg for msg in conversation if msg.type != "system"][-history_back_number:]
+        ])
+        args["_history_context"] = context
+        args["_tool_call_id"] = tool_call_id
+
+        return args, None
+
+    except Exception as e:
+        return None, {
+            "messages": [ToolMessage(
+                content=json.dumps({"status": "error", "error_message": str(e)}),
+                tool_call_id=locals().get("tool_call_id", None)
+            )]
+        }
