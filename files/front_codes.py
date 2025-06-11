@@ -4,6 +4,10 @@ import json
 import uuid
 from backend_codes import build_workflow
 from langchain_core.messages import HumanMessage, AIMessage
+import logging
+
+logger = logging.getLogger("langgraph")
+logger.setLevel(logging.DEBUG)
 
 # --- 1. ワークフローの準備（初回実行時のみ） ---
 # @st.cache_resourceを使うことで、アプリの再実行時にワークフローを再構築するのを防ぎ、高速化します。
@@ -25,7 +29,6 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 
 # --- 4. 過去のメッセージをすべて表示 ---
-# st.session_state.messagesには、{"role": "user", "content": ...} や {"role": "assistant", "content": ...} の形式で保存
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         # contentが文字列の場合（通常の会話）
@@ -64,12 +67,14 @@ if user_input:
                 input_data = {"messages": [HumanMessage(content=user_input)]}
                 
                 # .invoke()の代わりに.stream()を使い、リアルタイムでチャンクを処理
-                for chunk in compiled_workflow.stream(input_data, config):
+                for chunk in compiled_workflow.stream(input_data, config, stream_mode="updates"):
                     
                     # --- chunkを解析して、実行状況をリアルタイムで表示 ---
                     if "supervisor" in chunk:
                         # スーパーバイザーが思考中
-                        status.update(label="どの専門家に依頼するか思考中...")
+                        status.update(label=f"どの専門家に依頼するか思考中...")
+                    elif "tools" in chunk:
+                        status.update(label=f"ツールを使用中...")
                     elif "sql_node" in chunk:
                         # SQLノードが実行中
                         status.update(label="データベースにアクセスし、SQLを実行中...")
@@ -79,66 +84,25 @@ if user_input:
                     elif "interpret_node" in chunk:
                         # 解釈ノードが実行中
                         status.update(label="結果を解釈し、説明を生成中...")
-                    
-                    # ストリームの最後には、最終状態が'__end__'キーで含まれる
-                    if "__end__" in chunk:
-                        final_state = chunk["__end__"]
+                    else:
+                        status.update(label="少々お待ちください...")
 
-                    status.update(label="分析完了！", state="complete", expanded=False)
-                    response_messages = final_state["messages"]
-                    ai_response_to_display = None
+                status.update(label="分析完了！", state="complete", expanded=False)
+                ai_response = chunk["supervisor"]["messages"][0]
+                response_content = None
 
-                    # メッセージを末尾から遡って、ユーザーに表示すべき「本当の応答」を探す
-                    for i in range(len(response_messages) - 1, -1, -1):
-                        msg = response_messages[i]
-                        
-                        # スーパーバイザーの最終判断（DispatchDecision）に関連するメッセージはスキップ
-                        if isinstance(msg, AIMessage) and msg.tool_calls:
-                            if msg.tool_calls[0]['name'] == 'DispatchDecision':
-                                continue
-                        if isinstance(msg, HumanMessage):
-                            # 人間のメッセージまで遡ったら探索終了
-                            break
+                # 返答の形式に応じて内容を解析
+                if isinstance(ai_response, AIMessage):
+                    # 通常のテキスト応答
+                    response_content = ai_response.content
 
-                        # スキップされなかった最初のAIまたはToolメッセージが、表示すべき応答
-                        ai_response = msg
-                        break
-                    
-                    # もし見つからなければ、念のため最後のメッセージを使う
-                    if ai_response_to_display is None:
-                        ai_response_to_display = response_messages[-1]
+                else:
+                    response_content = "AI応答の最終状態が取得できませんでした。"
 
-                    
-                    response_content = None
-                    
-                    # 返答の形式に応じて内容を解析
-                    if isinstance(ai_response, AIMessage):
-                        # 通常のテキスト応答
-                        response_content = {"interpretation": ai_response.content}
-
-                    elif hasattr(ai_response, 'content') and isinstance(ai_response.content, str):
-                        try:
-                            # JSON形式の文字列（データフレームやグラフ）
-                            parsed_content = json.loads(ai_response.content)
-                            
-                            # ToolMessageから返ってくるデータはさらにネストしていることがあるため、中身を取り出す
-                            df_json = parsed_content.get("result_df_json")
-                            fig_json = parsed_content.get("fig_json")
-                            
-                            response_content = {
-                                "result_df_json": df_json,
-                                "fig_json": fig_json
-                            }
-
-                        except json.JSONDecodeError:
-                            # JSONではないただのテキスト応答
-                            response_content = {"interpretation": ai_response.content}
-
-                    # 解析したAIの応答を履歴に追加
-                    st.session_state.messages.append({"role": "assistant", "content": response_content})
-                    
-                    # 画面を再読み込みして、最新のチャット履歴を表示
-                    st.rerun()
+                # 解析したAIの応答を履歴に追加
+                st.session_state.messages.append({"role": "assistant", "content": response_content})             
+                # 画面を再読み込みして、最新のチャット履歴を表示
+                st.rerun()
 
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
