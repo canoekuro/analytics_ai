@@ -60,10 +60,12 @@ embeddings = AzureOpenAIEmbeddings(
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
     next: str  # 次に実行すべきノード名
     df_history: List[dict]
+    plan: List[Dict[str, str]]  # planning_nodeが生成したプラン
+    plan_step: int  # 現在のステップ番号
 
 history_back_number = 5
 RERANK_CANDIDATE_COUNT = 5
@@ -145,6 +147,64 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     logging.info(f"analysis_plan_node: 回答完了{step_answer}")
 
     return step_answer
+
+
+def planning_node(state: AgentState):
+    """ユーザーの最初の要望から分析プランをJSON形式で生成する"""
+    logging.info("planning_node: 開始")
+
+    conversation_history = state.get("messages", [])
+    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
+    recent_history = non_system_history[-history_back_number:]
+    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
+
+    user_request = ""
+    for msg in reversed(conversation_history):
+        if isinstance(msg, HumanMessage):
+            user_request = msg.content
+            break
+
+    prompt_template = """
+    あなたはデータ分析のプロジェクトマネージャーです。ユーザーの要望を実現するための
+    具体的な分析手順を考え、次のJSON形式で出力してください。
+
+    フォーマット例:
+    {
+      "plan": [
+        {"agent": "sql_node", "task": "必要なデータをSQLで取得する"},
+        {"agent": "processing_node", "task": "取得したデータを加工・可視化する"},
+        {"agent": "interpret_node", "task": "結果を解釈して結論をまとめる"}
+      ]
+    }
+
+    【ユーザー要望】
+    {user_request}
+
+    【文脈】
+    {context}
+    """
+
+    llm_prompt = prompt_template.format(user_request=user_request, context=context)
+    response = llm.invoke(llm_prompt)
+    plan_text = response.content.strip()
+
+    try:
+        plan_dict = json.loads(plan_text)
+        plan = plan_dict.get("plan", [])
+    except Exception as e:
+        logging.error(f"planning_node: JSON解析に失敗しました: {e}")
+        plan = []
+
+    ai_message = AIMessage(content=plan_text)
+
+    logging.info(f"planning_node: プラン生成完了 {plan}")
+
+    return {
+        "messages": [ai_message],
+        "plan": plan,
+        "plan_step": 0,
+        "next": "supervisor",
+    }
 
 def sql_node(state: AgentState):
     """
@@ -715,82 +775,47 @@ supervisor_prompt = ChatPromptTemplate.from_messages([
     ("system", system_prompt_supervisor),
     MessagesPlaceholder(variable_name="messages"),
 ])
-llm_with_supervisor_tools = llm.bind_tools(supervisor_tools + [DispatchDecision]) # 修正: supervisor_tools を使用
-supervisor_chain = supervisor_prompt | llm_with_supervisor_tools # 修正: llm_with_supervisor_tools を使用
+llm_with_supervisor_tools = llm.bind_tools(supervisor_tools + [DispatchDecision])
+supervisor_chain = supervisor_prompt | llm_with_supervisor_tools
 
 def supervisor_node(state: AgentState):
-    """スーパーバイザーとして次にどのアクションをとるべきか判断する"""
+    """planning_nodeで作成したプランに従って次のノードを決定する"""
     logging.info("--- スーパーバイザー ノード実行中 ---")
 
-    response = supervisor_chain.invoke({"messages": state["messages"]})
-    for msg in state["messages"]:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for call in msg.tool_calls:
-                logging.info(f"Supervisor messages: {call.get('args')}")
+    plan = state.get("plan")
+    step = state.get("plan_step", 0)
 
-    # AIMessageの場合、tool_callsは response.tool_calls でアクセス
-    # responseがAIMessageインスタンスであることを確認
-    if not isinstance(response, AIMessage):
-        # 通常はAIMessageが返されるはずですが、万が一異なる場合のエラーハンドリング
-        logging.error("supervisor_node: responseがAIMessageではありません。")
-        error_response = AIMessage(content="エラーが発生しました。SupervisorがAIMessageを受け取れませんでした。")
-        return {"messages": [error_response], "next": "FINISH"}
+    if not plan:
+        logging.info("supervisor_node: プランが無いので planning_node を実行します")
+        return {"messages": [], "next": "planning_node"}
 
-    tool_calls_list = response.tool_calls or []
+    if step >= len(plan):
+        logging.info("supervisor_node: 全てのステップが完了しました")
+        finish_message = AIMessage(content="分析が完了しました")
+        return {"messages": [finish_message], "next": "FINISH"}
 
-    if not tool_calls_list:
-        logging.info("supervisor_node: 判断: (tool_callsなし)応答完了または直接応答")
-        # LLMが直接応答した場合 (ツールコールもディスパッチもなし)
-        return {
-            "messages": [response], # LLMの応答を履歴に追加
-            "next": "FINISH"
-        }
-    else:
-        first_call = tool_calls_list[0] # response.tool_calls の要素は {'name': ..., 'args': ..., 'id': ...} の形式
+    current = plan[step]
+    next_agent = current.get("agent")
+    task_description = current.get("task", "")
+    tool_call_id = f"plan_step_{step}"
+    ai_message = AIMessage(
+        content="", 
+        tool_calls=[{"name": next_agent, "args": {"task_description": task_description}, "id": tool_call_id}]
+    )
 
-        called_tool_name = first_call.get('name')
-        called_tool_arguments = first_call.get('args') # 'args' は既に辞書であると期待される
+    logging.info(f"supervisor_node: 次に {next_agent} を実行します。タスク: {task_description}")
 
-        if not called_tool_name or not isinstance(called_tool_arguments, dict):
-            logging.error(f"supervisor_node: 不正なtool_call構造 (nameまたはargsが期待通りでない): {first_call}")
-            error_response = AIMessage(content="Tool call structure is invalid (name or args missing/invalid).")
-            return {"messages": [error_response], "next": "FINISH"}
-
-        # DispatchDecisionのスキーマに 'next_agent' が含まれているかで判断
-        # called_tool_arguments は first_call['args'] であり、ツール呼び出しの引数そのもの
-        if "next_agent" not in called_tool_arguments:
-            # 'next_agent' が引数にない場合、スーパーバイザーが直接ツールを実行するケース
-            # (例: metadata_retrieval_node や analysis_plan_node)
-            logging.info(f"supervisor_node: 判断: ツール '{called_tool_name}' を直接実行します。")
-            # この場合、response (AIMessage) にはツール実行に必要な情報(tool_call)が含まれている
-            # ToolNode はこの response.tool_calls を見てツールを実行する
-            return {"messages": [response], "next": "tools"}
-        else:
-            # 'next_agent' が引数にある場合、専門家へのディスパッチ (DispatchDecision が呼ばれた)
-            # called_tool_arguments は DispatchDecision の引数 (next_agent, task_description, rationale)
-            try:
-                dispatch_decision = DispatchDecision(**called_tool_arguments)
-            except Exception as e: # Pydanticのバリデーションエラーなど
-                logging.error(f"supervisor_node: DispatchDecisionのパースに失敗: {e}, args: {called_tool_arguments}")
-                error_response = AIMessage(content=f"Failed to parse dispatch decision: {e}")
-                return {"messages": [error_response], "next": "FINISH"}
-
-            logging.info(f"supervisor_node: 判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
-            logging.info(f"supervisor_node: 判断理由: {dispatch_decision.rationale}")
-            logging.info(f"supervisor_node: 具体的な指示: {dispatch_decision.task_description}")
-
-            # AIMessage (response) をそのまま履歴に追加し、
-            # 専門家ノードがこのAIMessageのtool_callsから指示を読み取る
-            # response.tool_calls[0]['args'] の中に task_description が含まれている想定
-            return {
-                "messages": [response], # response（AIMessage）を履歴に追加
-                "next": dispatch_decision.next_agent
-            }
+    return {
+        "messages": [ai_message],
+        "next": next_agent,
+        "plan_step": step + 1
+    }
 
 def build_workflow():
     graph_builder = StateGraph(AgentState)
 
     graph_builder.add_node("supervisor", supervisor_node)
+    graph_builder.add_node("planning_node", planning_node)
     graph_builder.add_node("sql_node", sql_node)
     graph_builder.add_node("processing_node", processing_node)
     graph_builder.add_node("interpret_node", interpret_node) # interpret_node を追加
@@ -803,6 +828,7 @@ def build_workflow():
         "supervisor",
         lambda state: state["next"],
         {
+            "planning_node": "planning_node",
             "sql_node": "sql_node",
             "processing_node": "processing_node",
             "interpret_node": "interpret_node", # interpret_node へのエッジを追加
@@ -811,6 +837,7 @@ def build_workflow():
         }
     )
 
+    graph_builder.add_edge("planning_node", "supervisor")
     graph_builder.add_edge("sql_node", "supervisor")
     graph_builder.add_edge("processing_node", "supervisor")
     graph_builder.add_edge("interpret_node", "supervisor") # interpret_node から supervisor へのエッジを追加
