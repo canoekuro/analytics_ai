@@ -60,10 +60,14 @@ embeddings = AzureOpenAIEmbeddings(
 vectorstore_tables = FAISS.load_local("faiss_tables", embeddings, allow_dangerous_deserialization=True)
 vectorstore_queries = FAISS.load_local("faiss_queries", embeddings, allow_dangerous_deserialization=True)
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
     next: str  # 次に実行すべきノード名
     df_history: List[dict]
+    plan: Optional[dict]
+    current_step: int
+    plan_results: List[Any]
+    last_payload: Any
 
 history_back_number = 5
 RERANK_CANDIDATE_COUNT = 5
@@ -146,6 +150,30 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
 
     return step_answer
 
+def planning_node(state: AgentState):
+    """ユーザーの要望から分析計画を立案するノード"""
+    conversation_history = state.get("messages", [])
+    if conversation_history:
+        last_input = conversation_history[-1].content
+    else:
+        last_input = ""
+
+    plan_text = analysis_plan_node(last_input, conversation_history)
+    try:
+        plan = json.loads(plan_text)
+    except Exception:
+        logging.warning("planning_node: 生成結果がJSONではありませんでした。暫定プランを作成します。")
+        plan = {"steps": [{"type": "interpret", "description": plan_text}]}
+
+    state["plan"] = plan
+    state["current_step"] = 0
+    state["plan_results"] = []
+
+    plan_msg = SystemMessage(content=f"次の分析計画に従って処理してください: {json.dumps(plan, ensure_ascii=False)}")
+    state["messages"].append(plan_msg)
+
+    return {**state, "next": "supervisor"}
+
 def sql_node(state: AgentState):
     """
     自然言語のタスク記述とstate内の会話履歴を受け取り、ルールを強く意識した上でSQLを生成・実行します。
@@ -156,7 +184,8 @@ def sql_node(state: AgentState):
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
             error_message_payload = {"status": "error", "error_message": "不正な呼び出し形式です。スーパーバイザーからのAIMessage(tool_calls付き)が見つかりません。"}
             logging.error(f"sql_node: {error_message_payload['error_message']}")
-            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=None)]}
+            state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=None)]}
+            return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
 
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
@@ -165,13 +194,15 @@ def sql_node(state: AgentState):
         if not isinstance(arguments, dict):
             error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
             logging.error(f"sql_node: {error_message_payload['error_message']}")
-            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
         
         task_description = arguments.get('task_description')
         if task_description is None:
             error_message_payload = {"status": "error", "error_message": "task_descriptionがスーパーバイザーの指示に含まれていません。"}
             logging.error(f"sql_node: {error_message_payload['error_message']}")
-            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
         # --- 修正ここまで ---
 
         conversation_history = state.get("messages", [])
@@ -184,7 +215,8 @@ def sql_node(state: AgentState):
         logging.error(f"sql_node: {error_message_detail}")
         current_tool_call_id = locals().get("tool_call_id", None) # tool_call_idが取得できていればそれを使う
         error_message_payload = {"status": "error", "error_message": error_message_detail}
-        return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=current_tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=current_tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
 
     # ★ --- 1. 候補となるテーブルを多めに取得（Re-rankingステップ） ---
     logging.info(f"sql_node(Re-rank): 候補テーブルを広く検索中 (k=RERANK_CANDIDATE_COUNT)...")
@@ -226,7 +258,8 @@ def sql_node(state: AgentState):
     if not final_rag_tables_text:
         logging.error("sql_node: 最終的に使用するテーブル情報が見つかりませんでした。")
         result_payload = {"status": "error", "error_message": "関連するテーブル情報が見つかりませんでした。"}
-        return {"messages": [ToolMessage(content=json.dumps(result_payload), tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=json.dumps(result_payload), tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": result_payload, "next": "supervisor"}
 
     # ★ --- 4. ルール遵守CoTを組み込んだシステムプロンプトを作成 ---
     system_prompt = """
@@ -329,15 +362,17 @@ def sql_node(state: AgentState):
     if new_history_item: # 成功した場合のみ履歴に追加 (空の辞書でないことを確認)
         updated_df_history = updated_df_history + [new_history_item]
 
-    return {
+    state_update = {
         "messages": [
             ToolMessage(
                 content=json.dumps(result_payload, ensure_ascii=False),
                 tool_call_id=tool_call_id
             )
         ],
-        "df_history": updated_df_history
+        "df_history": updated_df_history,
     }
+
+    return {**state, **state_update, "last_payload": result_payload, "next": "supervisor"}
 
 # 解釈ノード
 def interpret_node(state: AgentState):
@@ -352,7 +387,8 @@ def interpret_node(state: AgentState):
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
             error_message = "不正な呼び出し形式です。スーパーバイザーからのAIMessage(tool_calls付き)が見つかりません。"
             logging.error(f"interpret_node: {error_message}")
-            return {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+            state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+            return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
@@ -361,20 +397,23 @@ def interpret_node(state: AgentState):
         if not isinstance(arguments, dict):
             error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
             logging.error(f"interpret_node: {error_message_payload['error_message']}")
-            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
 
         task_description = arguments.get('task_description')
         if task_description is None:
             error_message = "task_descriptionがスーパーバイザーの指示に含まれていません。"
             logging.error(f"interpret_node: {error_message}")
-            return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
         # --- 修正ここまで ---
 
     except (IndexError, KeyError, json.JSONDecodeError, AttributeError, ValueError) as e:
         error_message_detail = f"ノード初期化エラー: {e}. Messages: {state.get('messages')}"
         logging.error(f"interpret_node: {error_message_detail}")
         current_tool_call_id = locals().get("tool_call_id", None)
-        return {"messages": [ToolMessage(content=error_message_detail, tool_call_id=current_tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message_detail, tool_call_id=current_tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message_detail, "next": "supervisor"}
 
     logging.info(f"interpret_node: df_historyの読み込み開始・・・ '{task_description}'")
     df_history = state.get("df_history", []) # getのデフォルトを空リストに
@@ -382,7 +421,8 @@ def interpret_node(state: AgentState):
         # RuntimeErrorを発生させる代わりに、ToolMessageでエラーを返す
         error_message = "interpret_node: df_historyが空です。利用可能なデータがありません。"
         logging.warning(error_message) # Warningレベルに変更
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     full_data_list = []
     for entry in df_history:
@@ -414,7 +454,8 @@ def interpret_node(state: AgentState):
         # RuntimeErrorを発生させる代わりに、ToolMessageでエラーを返す
         error_message = "interpret_node: 利用可能なデータがありませんでした（空またはエラー）。"
         logging.warning(error_message) # Warningレベルに変更
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     conversation_history = state.get("messages", [])
     non_system_history = [msg for msg in conversation_history if msg.type != "system"]
@@ -444,7 +485,7 @@ def interpret_node(state: AgentState):
 
         if interpretation_text:
             logging.info(f"interpret_node: 解釈作成完了{interpretation_text}")
-            return {
+            state_update = {
                 "messages": [
                     ToolMessage(
                         content=interpretation_text,
@@ -452,16 +493,19 @@ def interpret_node(state: AgentState):
                     )
                 ]
             }
+            return {**state, **state_update, "last_payload": interpretation_text, "next": "supervisor"}
         else:
             # RuntimeErrorを発生させる代わりに、ToolMessageでエラーを返す
             error_message = "interpret_node: LLMが空の解釈を返しました。"
             logging.warning(error_message) # Warningレベルに変更
-            return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     except Exception as e:
         error_message = f"データの解釈中にエラーが発生しました: {e}"
         logging.error(error_message)
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
 
 
@@ -486,7 +530,8 @@ def processing_node(state: AgentState):
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
             error_message = "不正な呼び出し形式です。スーパーバイザーからのAIMessage(tool_calls付き)が見つかりません。"
             logging.error(f"processing_node: {error_message}")
-            return {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+            state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=None)]}
+            return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
@@ -495,26 +540,30 @@ def processing_node(state: AgentState):
         if not isinstance(arguments, dict):
             error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
             logging.error(f"processing_node: {error_message_payload['error_message']}")
-            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message_payload, "next": "supervisor"}
 
         task_description = arguments.get('task_description')
         if task_description is None:
             error_message = "task_descriptionがスーパーバイザーの指示に含まれていません。"
             logging.error(f"processing_node: {error_message}")
-            return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+            return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     except (IndexError, KeyError, json.JSONDecodeError, AttributeError, ValueError) as e:
         error_message_detail = f"ノード初期化エラー: {e}. Messages: {state.get('messages')}"
         logging.error(f"processing_node: {error_message_detail}")
         current_tool_call_id = locals().get("tool_call_id", None)
-        return {"messages": [ToolMessage(content=error_message_detail, tool_call_id=current_tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message_detail, tool_call_id=current_tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message_detail, "next": "supervisor"}
 
     logging.info(f"processing_node: df_historyの読み込み開始・・・ '{task_description}'")
     df_history = state.get("df_history", []) # getのデフォルトを空リストに
     if not df_history: # df_historyがNoneまたは空の場合
         error_message = "processing_node: df_historyが空です。利用可能なデータがありません。"
         logging.warning(error_message)
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     recent_items = df_history[-history_back_number:]
     df_explain_list = []
@@ -542,7 +591,8 @@ def processing_node(state: AgentState):
     if not df_locals:
         error_message = "processing_node: 利用可能なDataFrameが0でした。"
         logging.warning(error_message)
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     full_explain_string = "\n".join(df_explain_list)
     locals_for_tool = {**df_locals, "px": px, "pd": pd} # `locals`は組み込み関数なので変数名を変更
@@ -665,14 +715,15 @@ def processing_node(state: AgentState):
     except Exception as e:
         error_message = f"生成AIがデータ加工・グラフ作成に失敗しました。: {e}. 実行しようとしたコード: {code_collector.codes}"
         logging.error(f"processing_node: {error_message}")
-        return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        state_update = {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
+        return {**state, **state_update, "last_payload": error_message, "next": "supervisor"}
 
     updated_df_history = state.get("df_history", [])
     if new_history_item: # new_history_itemがNoneでない（つまり有効なDataFrameが生成された）場合のみ追加
         updated_df_history = updated_df_history + [new_history_item]
     
     logging.info(f"processing_node:実行完了")
-    return {
+    state_update = {
         "messages": [
             ToolMessage(
                 content=content,
@@ -681,6 +732,7 @@ def processing_node(state: AgentState):
         ],
         "df_history": updated_df_history,
     }
+    return {**state, **state_update, "last_payload": content, "next": "supervisor"}
 
 # --- 2. スーパーバイザーの出力スキーマ定義 (Pydantic) ---
 class DispatchDecision(BaseModel):
@@ -721,6 +773,23 @@ supervisor_chain = supervisor_prompt | llm_with_supervisor_tools # 修正: llm_w
 def supervisor_node(state: AgentState):
     """スーパーバイザーとして次にどのアクションをとるべきか判断する"""
     logging.info("--- スーパーバイザー ノード実行中 ---")
+
+    if state.get("plan"):
+        plan = state["plan"]
+        idx = state.get("current_step", 0)
+
+        if "last_payload" in state:
+            state["plan_results"] = state.get("plan_results", []) + [state["last_payload"]]
+            state["current_step"] = idx + 1
+            idx = state["current_step"]
+            state.pop("last_payload", None)
+
+        if idx >= len(plan.get("steps", [])):
+            return {**state, "next": "FINISH"}
+
+        step = plan["steps"][idx]
+        mapping = {"sql": "sql_node", "processing": "processing_node", "interpret": "interpret_node"}
+        return {**state, "next": mapping.get(step.get("type"), "interpret_node"), "task_description": step}
 
     response = supervisor_chain.invoke({"messages": state["messages"]})
     for msg in state["messages"]:
@@ -790,6 +859,7 @@ def supervisor_node(state: AgentState):
 def build_workflow():
     graph_builder = StateGraph(AgentState)
 
+    graph_builder.add_node("planning_node", planning_node)
     graph_builder.add_node("supervisor", supervisor_node)
     graph_builder.add_node("sql_node", sql_node)
     graph_builder.add_node("processing_node", processing_node)
@@ -797,7 +867,7 @@ def build_workflow():
     tool_node = ToolNode(supervisor_tools) # 修正: supervisor_tools を使用
     graph_builder.add_node("tools", tool_node)
 
-    graph_builder.set_entry_point("supervisor")
+    graph_builder.set_entry_point("planning_node")
 
     graph_builder.add_conditional_edges(
         "supervisor",
@@ -811,6 +881,7 @@ def build_workflow():
         }
     )
 
+    graph_builder.add_edge("planning_node", "supervisor")
     graph_builder.add_edge("sql_node", "supervisor")
     graph_builder.add_edge("processing_node", "supervisor")
     graph_builder.add_edge("interpret_node", "supervisor") # interpret_node から supervisor へのエッジを追加
