@@ -95,10 +95,8 @@ def fix_sql_with_llm(llm, original_sql, error_message, rag_tables, rag_queries, 
     return fixed_sql
 
 def get_table_name_from_formatted_doc(doc_content: str) -> Optional[str]:
-
-        for line in doc_content.split('\n'):
-            line = line.strip()
-            if line.startswith("<table_name>") and line.endswith("</table_name>"):
-                return line[len("<table_name>"):-len("</table_name>")].strip()
-            else:
-                return None
+    for line in doc_content.split('\n'):
+        line = line.strip()
+        if line.startswith("<table_name>") and line.endswith("</table_name>"):
+            return line[len("<table_name>"):-len("</table_name>")].strip()
+    return None  # for全部回して見つからなかったらNone
