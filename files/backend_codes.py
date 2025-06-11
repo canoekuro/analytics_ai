@@ -21,10 +21,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from functions import extract_sql, try_sql_execute, fix_sql_with_llm, get_table_name_from_formatted_doc
-
-# 基本的なロギングを設定
-logging.basicConfig(level=logging.INFO)
+from files.functions import extract_sql, try_sql_execute, fix_sql_with_llm, get_table_name_from_formatted_doc
 
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
 # llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
@@ -77,7 +74,7 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
     自然言語のタスク記述と直近の会話履歴を受け取り、文脈を理解した上でテーブル定義を示します。
     ユーザーからデータやテーブル、カラムについて質問があった時に使用します。
     """
-
+    logging.info(f"metadata_retrieval_node: 開始")
     # システムメッセージ以外を抽出
     non_system_history = [msg for msg in conversation_history if msg.type != "system"]
     # 直近N件だけ取り出し
@@ -88,8 +85,7 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
     retrieved_docs = vectorstore_tables.similarity_search(task_description)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
     prompt_template = """
-    以下のテーブル定義情報を参照して、ユーザーの質問に答えてください。
-    ユーザーが理解しやすいように、テーブルやカラムの役割、データ型、関連性などを説明してください。
+    以下のテーブル定義情報を参照して、ユーザーの質問に対して簡潔に、わかりやすく答えてください。
 
     【テーブル定義情報】
     {retrieved_table_info}
@@ -105,6 +101,7 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     metadata_answer = response.content.strip()
+    logging.info(f"metadata_retrieval_node: 回答完了{metadata_answer}")
 
     return metadata_answer
 
@@ -114,6 +111,8 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     自然言語のタスク記述と直近の会話履歴を受け取り、文脈を理解した上で必要な分析ステップを考えます。
     ユーザーから分析依頼があり、分析要件を具体化したい際に使います。
     """
+    logging.info(f"analysis_plan_node: 開始")
+
     # システムメッセージ以外を抽出
     non_system_history = [msg for msg in conversation_history if msg.type != "system"]
     # 直近N件だけ取り出し
@@ -143,6 +142,7 @@ def analysis_plan_node(task_description: str, conversation_history: list[str]):
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
     response = llm.invoke(llm_prompt)
     step_answer = response.content.strip()
+    logging.info(f"analysis_plan_node: 回答完了{step_answer}")
 
     return step_answer
 
@@ -152,7 +152,6 @@ def sql_node(state: AgentState):
     （二段階選抜とルール遵守CoTを実装）
     """
     try:
-        # --- 修正: スーパーバイザーからの指示の受け取り方 ---
         supervisor_ai_message = state["messages"][-1]
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
             error_message_payload = {"status": "error", "error_message": "不正な呼び出し形式です。スーパーバイザーからのAIMessage(tool_calls付き)が見つかりません。"}
@@ -162,9 +161,12 @@ def sql_node(state: AgentState):
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
 
-        arguments_json = first_tool_call['function']['arguments']
-        arguments = json.loads(arguments_json)
-
+        arguments = first_tool_call.get('args')
+        if not isinstance(arguments, dict):
+            error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
+            logging.error(f"sql_node: {error_message_payload['error_message']}")
+            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
+        
         task_description = arguments.get('task_description')
         if task_description is None:
             error_message_payload = {"status": "error", "error_message": "task_descriptionがスーパーバイザーの指示に含まれていません。"}
@@ -191,19 +193,18 @@ def sql_node(state: AgentState):
     candidate_tables_info_for_prompt = "\n\n".join(
         [doc.page_content for name, doc in zip(candidate_table_names, candidate_docs) if name]
     )
-
     # ★ --- 2. LLMにテーブルを選別させる（1回目の問いかけ） ---
     if candidate_tables_info_for_prompt:
         logging.info(f"sql_node(Re-rank): LLMにテーブル選別を依頼中...")
         rerank_prompt = f"""
         ユーザーの最終的な要求は「{task_description}」です。
-        この要求に答えるために、以下のテーブル定義リストの中から、SQLクエリの生成に本当に必要だと思われるテーブル名をすべて選び出し、カンマ区切りで出力してください。
-        余計な説明は不要です。テーブル名のみをカンマ区切りで出力してください。
+        この要求に答えるために、以下のテーブル定義リストの中から、SQLクエリの生成に必要だと思われるテーブル名を1つだけ選び出して出力してください。
+        余計な説明は不要です。テーブル名のみを出力してください。
 
         【テーブル定義リスト】
         {candidate_tables_info_for_prompt}
 
-        【必要なテーブル名リスト（カンマ区切り）】
+        【必要なテーブル名リスト（1つだけ）】
         """
         rerank_response = llm.invoke(rerank_prompt)
         required_table_names_str = rerank_response.content.strip()
@@ -297,22 +298,26 @@ def sql_node(state: AgentState):
         ])
         sql_generated_clean = extract_sql(response.content.strip())
         last_sql_generated = sql_generated_clean
+        logging.info(f"sql_node: 生成SQL{last_sql_generated }")
         result_df, sql_error = try_sql_execute(sql_generated_clean)
 
         if sql_error:
             logging.warning(f"最初のSQLが失敗しました: {sql_error}。修正して再試行します。")
             fixed_sql = fix_sql_with_llm(llm, sql_generated_clean, sql_error, final_rag_tables_text, rag_queries, task_description, context)
             last_sql_generated = fixed_sql
+            logging.info(f"sql_node: 修正SQL{last_sql_generated }")
             result_df, sql_error = try_sql_execute(fixed_sql)
 
             if sql_error:
                 logging.error(f"修正SQLも失敗: {sql_error}")
                 result_payload = {"status": "error", "error_message": str(sql_error), "last_attempted_sql": last_sql_generated}
             else:
+                logging.info(f"sql_node: データの取得が完了しました。'")
                 result_payload = {"status": "success", "executed_sql": last_sql_generated, "dataframe_as_json": result_df.to_json(orient="records")}
                 if result_df is not None and not result_df.empty:
                      new_history_item = {task_description: result_df.to_dict(orient="records")}
         else:
+            logging.info(f"sql_node: データの取得が完了しました。'")
             result_payload = {"status": "success", "executed_sql": last_sql_generated, "dataframe_as_json": result_df.to_json(orient="records")}
             if result_df is not None and not result_df.empty:
                 new_history_item = {task_description: result_df.to_dict(orient="records")}
@@ -341,6 +346,7 @@ def interpret_node(state: AgentState):
     分析のためにデータを解釈する必要がある際に使用します。
     """
     try:
+        logging.info(f"interpret_node: 開始")
         # --- 修正: スーパーバイザーからの指示の受け取り方 ---
         supervisor_ai_message = state["messages"][-1]
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
@@ -351,8 +357,11 @@ def interpret_node(state: AgentState):
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
 
-        arguments_json = first_tool_call['function']['arguments']
-        arguments = json.loads(arguments_json)
+        arguments = first_tool_call.get('args')
+        if not isinstance(arguments, dict):
+            error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
+            logging.error(f"interpret_node: {error_message_payload['error_message']}")
+            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
 
         task_description = arguments.get('task_description')
         if task_description is None:
@@ -433,7 +442,17 @@ def interpret_node(state: AgentState):
         ])
         interpretation_text = response.content.strip() if response.content else ""
 
-        if not interpretation_text:
+        if interpretation_text:
+            logging.info(f"interpret_node: 解釈作成完了{interpretation_text}")
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=interpretation_text,
+                        tool_call_id=tool_call_id
+                    )
+                ]
+            }
+        else:
             # RuntimeErrorを発生させる代わりに、ToolMessageでエラーを返す
             error_message = "interpret_node: LLMが空の解釈を返しました。"
             logging.warning(error_message) # Warningレベルに変更
@@ -444,14 +463,6 @@ def interpret_node(state: AgentState):
         logging.error(error_message)
         return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
 
-    return {
-        "messages": [
-            ToolMessage(
-                content=interpretation_text,
-                tool_call_id=tool_call_id
-            )
-        ]
-    }
 
 
 # python用のCallback
@@ -469,6 +480,7 @@ def processing_node(state: AgentState):
     分析のためにデータの加工やグラフ作成をする必要がある際に使用します。
     """
     try:
+        logging.info(f"processing_node: 開始")
         # --- 修正: スーパーバイザーからの指示の受け取り方 ---
         supervisor_ai_message = state["messages"][-1]
         if not isinstance(supervisor_ai_message, AIMessage) or not supervisor_ai_message.tool_calls:
@@ -479,15 +491,17 @@ def processing_node(state: AgentState):
         first_tool_call = supervisor_ai_message.tool_calls[0]
         tool_call_id = first_tool_call['id']
 
-        arguments_json = first_tool_call['function']['arguments']
-        arguments = json.loads(arguments_json)
+        arguments = first_tool_call.get('args')
+        if not isinstance(arguments, dict):
+            error_message_payload = {"status": "error", "error_message": "argumentsの形式がdictではありません。"}
+            logging.error(f"processing_node: {error_message_payload['error_message']}")
+            return {"messages": [ToolMessage(content=json.dumps(error_message_payload), tool_call_id=tool_call_id)]}
 
         task_description = arguments.get('task_description')
         if task_description is None:
             error_message = "task_descriptionがスーパーバイザーの指示に含まれていません。"
             logging.error(f"processing_node: {error_message}")
             return {"messages": [ToolMessage(content=error_message, tool_call_id=tool_call_id)]}
-        # --- 修正ここまで ---
 
     except (IndexError, KeyError, json.JSONDecodeError, AttributeError, ValueError) as e:
         error_message_detail = f"ノード初期化エラー: {e}. Messages: {state.get('messages')}"
@@ -587,7 +601,7 @@ def processing_node(state: AgentState):
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
 
-    logging.info(f"processing_node: 分析開始・・・ '{task_description}'")
+    logging.info(f"processing_node: データ加工開始・・・ '{task_description}'")
     llm_with_tool = llm.bind_tools(tools_for_agent) # 修正: tools_for_agentを使用
     agent = create_openai_tools_agent(llm_with_tool, tools_for_agent, prompt) # 修正: tools_for_agentを使用
     agent_executor = AgentExecutor(
@@ -657,6 +671,7 @@ def processing_node(state: AgentState):
     if new_history_item: # new_history_itemがNoneでない（つまり有効なDataFrameが生成された）場合のみ追加
         updated_df_history = updated_df_history + [new_history_item]
     
+    logging.info(f"processing_node:実行完了")
     return {
         "messages": [
             ToolMessage(
@@ -705,69 +720,70 @@ supervisor_chain = supervisor_prompt | llm_with_supervisor_tools # 修正: llm_w
 
 def supervisor_node(state: AgentState):
     """スーパーバイザーとして次にどのアクションをとるべきか判断する"""
-    logging.info("--- スーパーバイザー ノード実行 ---")
-    logging.info(f"Supervisor messages: {state['messages']}") # 入力メッセージをログに出力
+    logging.info("--- スーパーバイザー ノード実行中 ---")
 
     response = supervisor_chain.invoke({"messages": state["messages"]})
-    logging.info(f"Supervisor response: {response}") # LLMからのレスポンスをログに出力
+    for msg in state["messages"]:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for call in msg.tool_calls:
+                logging.info(f"Supervisor messages: {call.get('args')}")
 
-    # AIMessageの場合、tool_callsは additional_kwargsではなく .tool_calls でアクセス (LangChainのバージョンによる)
+    # AIMessageの場合、tool_callsは response.tool_calls でアクセス
     # responseがAIMessageインスタンスであることを確認
-    if isinstance(response, AIMessage):
-        tool_calls = response.tool_calls or [] # response.tool_calls が None の場合も考慮
-    else:
-        # 互換性のため、古い形式も試みる (通常はAIMessageを期待)
-        tool_calls = response.additional_kwargs.get("tool_calls", [])
+    if not isinstance(response, AIMessage):
+        # 通常はAIMessageが返されるはずですが、万が一異なる場合のエラーハンドリング
+        logging.error("supervisor_node: responseがAIMessageではありません。")
+        error_response = AIMessage(content="エラーが発生しました。SupervisorがAIMessageを受け取れませんでした。")
+        return {"messages": [error_response], "next": "FINISH"}
 
-    if not tool_calls:
+    tool_calls_list = response.tool_calls or []
+
+    if not tool_calls_list:
         logging.info("supervisor_node: 判断: (tool_callsなし)応答完了または直接応答")
         # LLMが直接応答した場合 (ツールコールもディスパッチもなし)
         return {
-            "messages": [*state["messages"], response], # LLMの応答を履歴に追加
-            "next": "FINISH" # FINISHするか、ユーザーに応答を返す特別なノードを設けるか
+            "messages": [response], # LLMの応答を履歴に追加
+            "next": "FINISH"
         }
     else:
-        first_call = tool_calls[0]
-        # tool_callsの構造を確認: 'function'キーがあり、その下に'arguments'があるか
-        if "function" not in first_call or "arguments" not in first_call["function"]:
-            logging.error(f"supervisor_node: 不正なtool_call構造: {first_call}")
-            # エラー処理: FINISHするか、エラーメッセージを返すか
-            error_response = AIMessage(content="Tool call structure is invalid.")
-            return {"messages": [*state["messages"], error_response], "next": "FINISH"}
+        first_call = tool_calls_list[0] # response.tool_calls の要素は {'name': ..., 'args': ..., 'id': ...} の形式
 
-        args_json = first_call["function"]["arguments"]
-        try:
-            args = json.loads(args_json)
-        except json.JSONDecodeError as e:
-            logging.error(f"supervisor_node: argumentsのJSONデコードに失敗: {e}, args_json: {args_json}")
-            # エラー処理
-            error_response = AIMessage(content=f"Failed to decode tool call arguments: {e}")
-            return {"messages": [*state["messages"], error_response], "next": "FINISH"}
+        called_tool_name = first_call.get('name')
+        called_tool_arguments = first_call.get('args') # 'args' は既に辞書であると期待される
+
+        if not called_tool_name or not isinstance(called_tool_arguments, dict):
+            logging.error(f"supervisor_node: 不正なtool_call構造 (nameまたはargsが期待通りでない): {first_call}")
+            error_response = AIMessage(content="Tool call structure is invalid (name or args missing/invalid).")
+            return {"messages": [error_response], "next": "FINISH"}
 
         # DispatchDecisionのスキーマに 'next_agent' が含まれているかで判断
-        if "next_agent" not in args:
-            logging.info("supervisor_node: 判断: ツールを直接実行します。")
-            # スーパーバイザーがツールを実行するケース
+        # called_tool_arguments は first_call['args'] であり、ツール呼び出しの引数そのもの
+        if "next_agent" not in called_tool_arguments:
+            # 'next_agent' が引数にない場合、スーパーバイザーが直接ツールを実行するケース
+            # (例: metadata_retrieval_node や analysis_plan_node)
+            logging.info(f"supervisor_node: 判断: ツール '{called_tool_name}' を直接実行します。")
             # この場合、response (AIMessage) にはツール実行に必要な情報(tool_call)が含まれている
-            return {"messages": [*state["messages"], response], "next": "tools"}
+            # ToolNode はこの response.tool_calls を見てツールを実行する
+            return {"messages": [response], "next": "tools"}
         else:
-            # 専門家へのディスパッチ
+            # 'next_agent' が引数にある場合、専門家へのディスパッチ (DispatchDecision が呼ばれた)
+            # called_tool_arguments は DispatchDecision の引数 (next_agent, task_description, rationale)
             try:
-                dispatch_decision = DispatchDecision(**args)
+                dispatch_decision = DispatchDecision(**called_tool_arguments)
             except Exception as e: # Pydanticのバリデーションエラーなど
-                logging.error(f"supervisor_node: DispatchDecisionのパースに失敗: {e}, args: {args}")
+                logging.error(f"supervisor_node: DispatchDecisionのパースに失敗: {e}, args: {called_tool_arguments}")
                 error_response = AIMessage(content=f"Failed to parse dispatch decision: {e}")
-                return {"messages": [*state["messages"], error_response], "next": "FINISH"}
+                return {"messages": [error_response], "next": "FINISH"}
 
             logging.info(f"supervisor_node: 判断: 専門家 '{dispatch_decision.next_agent}' にタスクを割り振ります。")
             logging.info(f"supervisor_node: 判断理由: {dispatch_decision.rationale}")
             logging.info(f"supervisor_node: 具体的な指示: {dispatch_decision.task_description}")
 
-            # --- 修正: dispatch_messageの作成と追加を削除 ---
             # AIMessage (response) をそのまま履歴に追加し、
             # 専門家ノードがこのAIMessageのtool_callsから指示を読み取る
+            # response.tool_calls[0]['args'] の中に task_description が含まれている想定
             return {
-                "messages": [*state["messages"], response], # response（AIMessage）を履歴に追加
+                "messages": [response], # response（AIMessage）を履歴に追加
                 "next": dispatch_decision.next_agent
             }
 
@@ -799,6 +815,7 @@ def build_workflow():
     graph_builder.add_edge("processing_node", "supervisor")
     graph_builder.add_edge("interpret_node", "supervisor") # interpret_node から supervisor へのエッジを追加
     graph_builder.add_edge("tools", "supervisor")
+    graph_builder.add_edge("supervisor", END)
 
     memory = MemorySaver()
     return graph_builder.compile(checkpointer=memory)
