@@ -2,8 +2,11 @@ import re
 import sqlite3
 import pandas as pd
 import logging
-from typing import TypedDict, List, Optional, Any
+from typing import List, Optional
 import ast
+import streamlit as st
+import datetime
+from langchain_core.messages import ToolMessage, AIMessage
 
 #SQL関連の関数
 #SQLのコードブロックがあった際にそれを削除
@@ -143,9 +146,72 @@ def fetch_tool_args(
         return args, None
 
     except Exception as e:
-        return None, {
-            "messages": [ToolMessage(
-                content=json.dumps({"status": "error", "error_message": str(e)}),
-                tool_call_id=locals().get("tool_call_id", None)
-            )]
-        }
+        return None, {"error_message":str(e), "tool_call_id":locals().get("tool_call_id", None)}
+    
+def plan_list_conv(plan, plan_cursor):
+    """
+    # 計画リストを整形し、現在のステップを視覚的に強調します
+    """
+    plan_list_str = []
+    for i, step in enumerate(plan):
+        if i < plan_cursor:
+            prefix = f"  - [完了済] ステップ{i+1}"
+        elif i == plan_cursor:
+            prefix = f"> - [現在地] ステップ{i+1}" # 強調表示
+        else:
+            prefix = f"  - [着手予定] ステップ{i+1}"
+        plan_list_str.append(f"{prefix} ({step['agent']}): {step['task']}")
+    plan_str = "\n".join(plan_list_str)
+    # 現在実行すべきタスクを明記します
+    current_task = plan[plan_cursor]
+    current_task_str = f"「{current_task['task']}」({current_task['agent']})"
+    plan_now = f"""
+
+    == 実行中の計画 ==\n
+    {plan_str}\n\n
+    現在のタスクは {current_task_str} です。\n
+
+    """
+    return plan_now
+
+def render_plan_sidebar():
+    if not st.session_state.plan_steps:
+        return
+
+    steps = st.session_state.plan_steps
+    cursor = st.session_state.plan_cursor
+    done_ratio = max(0, min(cursor, len(steps))) # 進捗 0-1
+
+    with st.sidebar:
+        st.subheader("🗺️ プラン進捗")
+        st.progress(done_ratio)
+
+        for idx, step in enumerate(steps):
+            if idx < cursor:
+                icon = "✔️"     # 完了
+            elif idx == cursor:
+                icon = "🟢"     # 実行中
+            else:
+                icon = "□"      # 未着手
+            st.markdown(f"{icon} **{step["task"]}**")
+
+def extract_alerts(chunk):
+    alerts = []   # list に変更
+
+    for node_key, node_val in chunk.items():
+        msgs = node_val.get("messages", [])
+        for msg in msgs:
+            try:
+                payload = json.loads(msg.content) \
+                    if isinstance(msg, (ToolMessage, AIMessage)) else None
+            except json.JSONDecodeError:
+                continue
+
+            if payload and payload.get("status") in ("error", "warning"):
+                alerts.append({
+                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "node": payload.get("node", node_key),
+                    "status": payload["status"],
+                    "summary": payload.get("summary", payload.get("error_message", "")),
+                })
+    return alerts   # 0 件なら []
