@@ -8,6 +8,7 @@ import logging
 import plotly.io as pio
 import plotly.graph_objects as go
 from functions import render_plan_sidebar, extract_alerts
+import streamlit.components.v1 as components 
 
 logger = logging.getLogger("langgraph")
 logger.setLevel(logging.DEBUG)
@@ -55,10 +56,15 @@ for message in st.session_state.messages:
             if "result_df_json" in message["content"] and message["content"]["result_df_json"]:
                 df_data = json.loads(message["content"]["result_df_json"])
                 st.dataframe(pd.DataFrame(df_data))
-            if "fig_json" in message["content"] and message["content"]["fig_json"]:
-                fig_dict = pio.from_json(message["content"]["fig_json"], output_type="dict")
-                fig = go.Figure(fig_dict)
-                st.plotly_chart(fig, use_container_width=True)
+            if "fig_html_path" in message["content"] and message["content"]["fig_html_path"]:
+                html_path = message["content"]["fig_html_path"]
+                display_height = message["content"].get("display_height", 600)
+                try:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    components.html(html_content, height=display_height, scrolling=True)
+                except FileNotFoundError:
+                    st.error(f"グラフファイルが見つかりません: {html_path}")
             if "interpretation_text" in message["content"] and message["content"]["interpretation_text"]:
                 st.markdown(message["content"]["interpretation_text"])
 

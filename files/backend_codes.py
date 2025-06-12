@@ -610,6 +610,9 @@ def processing_node(state: AgentState):
     - 最終的な成果物としてデータフレームを返す場合は、そのデータフレームを `final_df` という名前の変数に格納してください。
     - `fig` と `final_df` の両方を同時に生成・格納することも可能です。
     - コードは1つのブロックにまとめてください。許可されていないライブラリ（os, subprocess等）のimportは含めないでください。
+    - グラフ生成の際には、ユーザーからの指定が特になければ最も適切と思われる種類のグラフを自動で選択してください。
+    - 選択したグラフの種類とデータ量を考慮し、グラフが最も見やすくなるように幅と高さを動的に調整するコードを生成してください。例えば、もし横棒グラフを選択し、項目数が多い場合は、十分な高さを確保してください。
+
 
     【生成するPythonコード】
     """
@@ -649,9 +652,9 @@ def processing_node(state: AgentState):
         content_payload = json.loads(tool_output_str) # ツール出力はJSON文字列なのでパース
         
         final_df_json = content_payload.get("final_df_json")
-        fig_json = content_payload.get("fig_json")
-
-        logging.info(f"processing_node: コード実行成功。fig_json: {'あり' if fig_json else 'なし'}, final_df_json: {'あり' if final_df_json else 'なし'}")
+        fig_html_path = content_payload.get("fig_html_path")
+        display_height = content_payload.get("display_height")
+        logging.info(f"processing_node: コード実行成功。fig_html_path: {'あり' if fig_html_path else 'なし'}, final_df_json: {'あり' if final_df_json else 'なし'}")
 
         # stateの更新
         updated_df_history = state.get("df_history", [])
@@ -663,12 +666,12 @@ def processing_node(state: AgentState):
             updated_df_history = updated_df_history + [{new_task_description: new_df_records}]
 
         updated_fig_history = state.get("fig_history", [])
-        if fig_json:
-            updated_fig_history = updated_fig_history + [fig_json]
+        if fig_html_path:
+            updated_fig_history = updated_fig_history + [fig_html_path]
 
         # Supervisorに返すToolMessageのコンテンツを作成
         result_summary = []
-        if fig_json:
+        if fig_html_path:
             result_summary.append("グラフを生成しました。")
         if final_df_json:
             result_summary.append("加工されたデータフレームを生成しました。")
@@ -679,7 +682,7 @@ def processing_node(state: AgentState):
             "status": "success",
             "node": "processing_node",
             "summary": result_summary,
-            "result_payload": {"fig_json":fig_json, "result_df_json":final_df_json}
+            "result_payload": {"fig_html_path":fig_html_path, "display_height":display_height, "result_df_json":final_df_json}
         })
         return {
             "messages": [ToolMessage(content=result, tool_call_id=tool_call_id)],
