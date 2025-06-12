@@ -3,8 +3,11 @@ import pandas as pd
 import json
 import uuid
 from backend_codes import build_workflow
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import logging
+import plotly.io as pio
+import plotly.graph_objects as go
+from functions import render_plan_sidebar, extract_alerts
 
 logger = logging.getLogger("langgraph")
 logger.setLevel(logging.DEBUG)
@@ -18,7 +21,7 @@ def get_workflow():
 compiled_workflow = get_workflow()
 
 # --- 2. Streamlitページの基本設定 ---
-st.title("🤖 データ分析チャットAI")
+st.title("データ分析チャットAI")
 st.caption("このAIは、裏側でLangGraphというフレームワークで動作しています。")
 
 # -セッションごとのチャット履歴を初期化 ---
@@ -27,6 +30,19 @@ if "messages" not in st.session_state:
 # セッションIDを自前で管理する場合
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
+# AI から追加情報を求められているか
+if "awaiting_ai_question" not in st.session_state:
+    st.session_state["awaiting_ai_question"] = False   
+if "pending_question" not in st.session_state:
+    st.session_state["pending_question"] = ""
+#分析plan進捗管理用のstate
+if "plan_steps" not in st.session_state:
+    st.session_state["plan_steps"] = []
+if "plan_cursor" not in st.session_state:
+    st.session_state["plan_cursor"] = -1
+#error表示用
+if "error_log" not in st.session_state:
+    st.session_state["error_log"] = []
 
 # --- 4. 過去のメッセージをすべて表示 ---
 for message in st.session_state.messages:
@@ -40,18 +56,29 @@ for message in st.session_state.messages:
                 df_data = json.loads(message["content"]["result_df_json"])
                 st.dataframe(pd.DataFrame(df_data))
             if "fig_json" in message["content"] and message["content"]["fig_json"]:
-                fig = pd.io.json.read_json(message["content"]["fig_json"], typ='frame')
-                st.plotly_chart(fig)
-            if "interpretation" in message["content"] and message["content"]["interpretation"]:
-                 st.markdown(message["content"]["interpretation"])
+                fig_dict = pio.from_json(message["content"]["fig_json"], output_type="dict")
+                fig = go.Figure(fig_dict)
+                st.plotly_chart(fig, use_container_width=True)
+            if "interpretation_text" in message["content"] and message["content"]["interpretation_text"]:
+                st.markdown(message["content"]["interpretation_text"])
 
 
-# --- 5. ユーザーからの入力を受け付け ---
-user_input = st.chat_input("分析したいことを入力してください（例: カテゴリ別の売上を見せて）")
+# ユーザーからの入力を受け付け
+if st.session_state.awaiting_ai_question:
+    prompt_label = "AI からの質問に回答してください" 
+else:
+    prompt_label = "分析したいことを入力してください（例: カテゴリ別の売上を見せて）"
+user_input = st.chat_input(prompt_label)
+
 
 if user_input:
     # ユーザーの入力を履歴に追加して表示
     st.session_state.messages.append({"role": "user", "content": user_input})
+     # もしユーザー質問フェーズなら、userinputがあった時点で解除
+    if st.session_state.awaiting_ai_question:
+        st.session_state.awaiting_ai_question = False
+        st.session_state.pending_question = ""
+
     with st.chat_message("user"):
         st.markdown(user_input)
 
@@ -69,12 +96,25 @@ if user_input:
                 # .invoke()の代わりに.stream()を使い、リアルタイムでチャンクを処理
                 for chunk in compiled_workflow.stream(input_data, config, stream_mode="updates"):
                     
+                    #ユーザーへの質問モードであれば待機フラグを立てる
+                    if "ask_user_node" in chunk:
+                        st.session_state.awaiting_ai_question = True
+                        #supervisorが質問をしていたらその質問内容を取得
+                        if "supervisor" in chunk:
+                            sup_msgs = chunk["supervisor"]["messages"]
+                            if sup_msgs and isinstance(sup_msgs[0], AIMessage):
+                                st.session_state.pending_question = sup_msgs[0].content
+                    
+                    # chunkにplanが出現したらstateに格納    
+                    if "plan" in chunk:
+                        st.session_state.plan_steps = chunk["plan"]
+                    if "plan_cursor" in chunk:
+                        st.session_state.plan_cursor = chunk["plan_cursor"] 
+                
                     # --- chunkを解析して、実行状況をリアルタイムで表示 ---
                     if "supervisor" in chunk:
                         # スーパーバイザーが思考中
                         status.update(label=f"どの専門家に依頼するか思考中...")
-                    elif "tools" in chunk:
-                        status.update(label=f"ツールを使用中...")
                     elif "sql_node" in chunk:
                         # SQLノードが実行中
                         status.update(label="データベースにアクセスし、SQLを実行中...")
@@ -84,25 +124,53 @@ if user_input:
                     elif "interpret_node" in chunk:
                         # 解釈ノードが実行中
                         status.update(label="結果を解釈し、説明を生成中...")
+                    elif "metadata_retrieval_node" in chunk:
+                        # テーブル情報ノードが実行中
+                        status.update(label="テーブル情報を取得中...")
                     else:
                         status.update(label="少々お待ちください...")
+                    
+                    #エラーがあった場合はsession_stateに追加
+                    alerts = extract_alerts(chunk)
+                    if alerts:
+                        st.session_state.error_log.extend(alerts)
+
+                    #エラーログはsidebarに表示
+                    if len(st.session_state.error_log)>0:
+                         with st.sidebar.expander("エラーログ", expanded=False):
+                             for rec in reversed(st.session_state.error_log[-50:]):  # 直近50件
+                                 status = rec["status"]
+                                 node = rec["node"]
+                                 summary = rec["summary"]
+                                 st.markdown(f"{node}_{status}:{summary}")
 
                 status.update(label="分析完了！", state="complete", expanded=False)
                 ai_response = chunk["supervisor"]["messages"][0]
                 response_content = None
 
-                # 返答の形式に応じて内容を解析
-                if isinstance(ai_response, AIMessage):
-                    # 通常のテキスト応答
-                    response_content = ai_response.content
-
+                # ユーザーへの質問モードであれば、質問内容を返答内容とする。
+                if st.session_state.awaiting_ai_question:
+                     response_content = st.session_state.pending_question
                 else:
-                    response_content = "AI応答の最終状態が取得できませんでした。"
+                    if isinstance(ai_response, AIMessage):
+                        # 質問モードでなく、かつ、返答がAIMessageであれば通常のテキスト応答
+                        response_content = ai_response.content
+                    else:
+                        response_content = "AI応答の最終状態が取得できませんでした。"
 
                 # 解析したAIの応答を履歴に追加
                 st.session_state.messages.append({"role": "assistant", "content": response_content})             
-                # 画面を再読み込みして、最新のチャット履歴を表示
-                st.rerun()
 
+                # ToolMessageの場合、result_payload(figやdf,interpretなど)の内容を追加
+                if isinstance(ai_response, ToolMessage):
+                    payload = json.loads(ai_response.content)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": payload["result_payload"]
+                    })
+
+                # plan進捗を表示
+                render_plan_sidebar()
+                st.rerun()
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
