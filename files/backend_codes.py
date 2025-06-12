@@ -803,7 +803,6 @@ def supervisor_node(state: AgentState):
             - sql_node: 依頼に従ってSQLを生成し、データを取得する\n
             - processing_node: 依頼に従ってデータの加工やグラフ作成をする\n
             - interpret_node: 依頼に従ってデータの解釈を行う\n
-            - ask_user_node: ユーザーに直接質問して、不明な点や必要な情報を確認する
             - planning_node: 複雑な分析に関して、分析プランを作成する
             - ask_user_node: 不明確な分析依頼に対して、ユーザーに追加で質問をする
 
