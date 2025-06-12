@@ -1,5 +1,8 @@
 from pydantic import BaseModel, Field
 from langchain.tools import BaseTool
+from typing import Dict, Any
+from enum import Enum
+from pydantic import BaseModel, Field
 import json
 import pandas as pd
 
@@ -47,3 +50,22 @@ class PythonExecTool(BaseTool):
             ),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+class NodeStatus(str, Enum):
+    success = "success"
+    error = "error"
+
+class NodeType(str, Enum):
+    sql_node= "sql_node"
+    processing_node= "processing_node"
+    interpret_node= "interpret_node"
+    planning_node= "planning_node"
+    ask_user_node= "ask_user_node"
+    metadata_retrieval_node= "metadata_retrieval_node"
+    
+
+class NodeResponse(BaseModel):
+    status: NodeStatus # 成功 / 失敗
+    node: NodeType # nodeの種類
+    summary: str = Field(min_length=1) # 1 行サマリ
+    result_payload: Dict[str, Any] | None = None # 任意の自由領域
