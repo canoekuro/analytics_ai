@@ -7,6 +7,7 @@ import ast
 import streamlit as st
 import datetime
 from langchain_core.messages import ToolMessage, AIMessage
+import yaml
 
 #SQL関連の関数
 #SQLのコードブロックがあった際にそれを削除
@@ -167,6 +168,7 @@ def plan_list_conv(plan, plan_cursor):
     current_task_str = f"「{current_task['task']}」({current_task['agent']})"
     plan_now = f"""
 
+    実行中の分析計画は以下のとおりです。これに従ってタスクを進めてください。
     == 実行中の計画 ==\n
     {plan_str}\n\n
     現在のタスクは {current_task_str} です。\n
@@ -215,3 +217,14 @@ def extract_alerts(chunk):
                     "summary": payload.get("summary", payload.get("error_message", "")),
                 })
     return alerts   # 0 件なら []
+def load_prompts(file_path="prompts.yaml"):
+    """YAMLファイルからプロンプトを読み込む"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logging.error(f"プロンプトファイルが見つかりません: {file_path}")
+        return {}
+    except Exception as e:
+        logging.error(f"プロンプトファイルの読み込み中にエラーが発生しました: {e}")
+        return {}

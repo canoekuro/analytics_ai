@@ -15,8 +15,10 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langgraph.prebuilt import ToolNode
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from files.functions import extract_sql, try_sql_execute, get_table_name_from_formatted_doc, fetch_tool_args, plan_list_conv
+from files.functions import extract_sql, try_sql_execute, get_table_name_from_formatted_doc, fetch_tool_args, plan_list_conv, load_prompts
 from files.classes import PythonExecTool, DispatchDecision
+import re
+import ast 
 
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
 # llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
@@ -45,6 +47,16 @@ llm = AzureChatOpenAI(
     streaming=False
 )
 
+llm_json_mode = AzureChatOpenAI(
+    openai_api_key=api_key,
+    azure_endpoint=endpoint,
+    openai_api_version=version,
+    deployment_name=deployment,
+    temperature=0,
+    streaming=False,
+    model_kwargs={"response_format": {"type": "json_object"}},
+)
+
 embeddings = AzureOpenAIEmbeddings(
     openai_api_key=api_key,
     azure_endpoint=endpoint,
@@ -59,13 +71,13 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
     next: str
     df_history: List[dict]
-    fig_history: List
     plan: Optional[List[Dict[str, str]]] = None  # planning_nodeが生成したプラン
-    plan_step: Optional[int] = None  # 現在のステップ番号
+    plan_cursor: Optional[int] = None  # 現在のステップ番号
     retry_counts: Dict[str, int]
+    user_directives: Optional[Dict[str, str]] = None
 
 
-history_back_number = 5
+CONTEXT_BACK_NUMBER = 5
 RERANK_CANDIDATE_COUNT = 5
 RETRY_LIMITS: dict[str, int] = {
     "planning_node": 1,
@@ -75,6 +87,8 @@ RETRY_LIMITS: dict[str, int] = {
     "interpret_node": 1,
     # 必要に応じて追加
 }
+HISTORY_MAX_ITEMS = 5
+PROMPTS = load_prompts()
 
 
 @tool
@@ -88,28 +102,23 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
     # システムメッセージ以外を抽出
     non_system_history = [msg for msg in conversation_history if msg.type != "system"]
     # 直近N件だけ取り出し
-    recent_history = non_system_history[-history_back_number:]
+    recent_history = non_system_history[-CONTEXT_BACK_NUMBER:]
     context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
 
     # Rag情報
     retrieved_docs = vectorstore_tables.similarity_search(task_description)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    prompt_template = """
-    以下のテーブル定義情報を参照して、ユーザーの質問に対して簡潔に、わかりやすく答えてください。
-
-    【テーブル定義情報】
-    {retrieved_table_info}
-
-    【現在のタスク】
-    {task_description}
-
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【回答】
-    """
-    llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
-    response = llm.invoke(llm_prompt)
+    prompt_template = PROMPTS.get("metadata_retrieval_node")
+    if not prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    # 変数を当てはめて最終的なプロンプトを生成
+    prompt = prompt_template.format(
+        retrieved_table_info=retrieved_table_info,
+        task_description=task_description,
+        context=context
+    )
+    response = llm.invoke(prompt)
     metadata_answer = response.content.strip()
     logging.info(f"metadata_retrieval_node: 回答完了{metadata_answer}")
     result = json.dumps({
@@ -118,8 +127,54 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
         "summary": metadata_answer,
         "result_payload": None
     })
-
     return result
+
+def command_parser_node(state: AgentState):
+    """
+    ユーザーの最新のメッセージを解析し、特別なコマンド（planやdirectives）が含まれていれば
+    それを抽出してStateを更新する。
+    処理後は必ずsupervisorノードに処理を渡す。
+    """
+    logging.info("--- コマンドパーサー ノード実行中 ---")
+    
+    last_message = state["messages"][-1]
+    # AIMessageやToolMessageは対象外とし、ユーザーからのメッセージのみを解析
+    if not isinstance(last_message, HumanMessage):
+        return {"next": "supervisor"}
+
+    content = last_message.content
+    updates = {}
+
+    # --- planブロックの抽出 ---
+    plan_match = re.search(r"```plan\s*\n(.*?)\n```", content, re.DOTALL)
+    if plan_match:
+        plan_str = plan_match.group(1)
+        try:
+            # ast.literal_evalで安全に文字列をPythonオブジェクト（リスト）に変換
+            parsed_plan = ast.literal_eval(plan_str)
+            if isinstance(parsed_plan, list):
+                updates["plan"] = parsed_plan
+                updates["plan_cursor"] = 0 # plan_cursorを初期化
+                logging.info(f"ユーザー定義のプランを検出しました: {parsed_plan}")
+        except (ValueError, SyntaxError) as e:
+            logging.warning(f"ユーザー定義プランのパースに失敗しました: {e}")
+
+    # --- directivesブロックの抽出 ---
+    directives_match = re.search(r"```directives\s*\n(.*?)\n```", content, re.DOTALL)
+    if directives_match:
+        directives_str = directives_match.group(1)
+        try:
+            # json.loadsで文字列をPythonオブジェクト（辞書）に変換
+            parsed_directives = json.loads(directives_str)
+            if isinstance(parsed_directives, dict):
+                updates["user_directives"] = parsed_directives
+                logging.info(f"ユーザー定義の指示を検出しました: {parsed_directives}")
+        except json.JSONDecodeError as e:
+            logging.warning(f"ユーザー定義指示のパースに失敗しました: {e}")
+
+    # 次のノードは常にsupervisor
+    updates["next"] = "supervisor"
+    return updates
 
 def planning_node(state: AgentState):
     """
@@ -175,7 +230,7 @@ def planning_node(state: AgentState):
 
     logging.info(f"planning_node: 生成AIが考えています・・・ '{task_description}'")
     llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
-    response = llm.invoke(llm_prompt)
+    response = llm_json_mode.invoke(llm_prompt)
     step_answer = response.content.strip()
     logging.info(f"planning_node: 回答完了{step_answer}")
 
@@ -354,6 +409,7 @@ def sql_node(state: AgentState):
             new_history_item = {task_description: result_df.to_dict(orient="records")}
             updated_df_history = state.get("df_history", [])
             updated_df_history = updated_df_history + [new_history_item]
+            updated_df_history = updated_df_history[-HISTORY_MAX_ITEMS:]
             result = json.dumps({
                 "status": "success",
                 "node": "sql_node",
@@ -542,7 +598,7 @@ def processing_node(state: AgentState):
         })
         return {"messages": [ToolMessage(content=result, tool_call_id=tool_call_id)]}
 
-    recent_items = df_history[-history_back_number:]
+    recent_items = df_history[-CONTEXT_BACK_NUMBER:]
     df_explain_list = []
     df_locals = {}
     for idx, entry in enumerate(recent_items):
@@ -664,10 +720,7 @@ def processing_node(state: AgentState):
             # 新しいタスク名（加工後）と共に履歴に追加
             new_task_description = f"{task_description} (加工・分析後のデータ)"
             updated_df_history = updated_df_history + [{new_task_description: new_df_records}]
-
-        updated_fig_history = state.get("fig_history", [])
-        if fig_html_path:
-            updated_fig_history = updated_fig_history + [fig_html_path]
+            updated_df_history = updated_df_history[-HISTORY_MAX_ITEMS:]
 
         # Supervisorに返すToolMessageのコンテンツを作成
         result_summary = []
@@ -687,7 +740,6 @@ def processing_node(state: AgentState):
         return {
             "messages": [ToolMessage(content=result, tool_call_id=tool_call_id)],
             "df_history": updated_df_history,
-            "fig_history": updated_fig_history
             }
 
     except Exception as e:
@@ -738,6 +790,7 @@ def supervisor_node(state: AgentState):
             logging.info("supervisor_node: タスク成功を検出 (status: success)")
             summary_parts = f"""
 
+                直前のタスク結果は下記の通りです。これを踏まえて指示を出してください。
                 == 直前のタスク結果 ==\n
                 {pre_node}による直前のタスクは成功しました。結果は{summary}です。
 
@@ -759,6 +812,7 @@ def supervisor_node(state: AgentState):
             logging.warning(f"supervisor_node: タスク失敗 {summary}")
             summary_parts = f"""
 
+                直前のタスク結果は下記の通りです。これを踏まえて指示を出してください。
                 == 直前のタスク結果 ==\n
                 {pre_node}による直前のタスクは失敗しました。エラー内容は{summary}です。
                 
@@ -813,6 +867,16 @@ def supervisor_node(state: AgentState):
             計画の次のステップを実行するために、まずツールで解決できるか検討し、できなければ専門家への割り振りを考えてください。\n
             専門家へ割り振る際は、次に指名すべきメンバーと、そのメンバーへの具体的な指示内容を決定してください。\n
             計画の最後のステップが完了したと判断した場合は、next_agentに 'FINISH' を指定してください。\n\n
+
+            == 指示 (task_description) の書き方 ==\n
+            専門家への指示内容は、単なる作業依頼ではなく、以下の情報を盛り込んだ「リッチなコンテキスト」として記述してください。これにより、専門家は前後の文脈を完全に理解して、より精度の高い作業を行うことができます。\n\n
+            1.  **最終目標の共有**: ユーザーが元々何を達成したいのか、計画がある場合には、全体計画のどの部分にいるのかを記述します。（例：「最終目標は『商品カテゴリ別の月次売上トレンドの可視化』です。」）\n
+            2.  **直前のステップの要約**: 直前のタスクの結果や、現在利用可能なデータについて具体的に記述します。（例：「直前のステップで、SQLを使い売上実績データを`df1`として取得済みです。`df1`には'売上日', 'カテゴリ', '金額'カラムが含まれています。」）\n
+            3.  **具体的な実行指示**: このステップで専門家に実行してほしいことを明確に指示します。（例：「この`df1`を利用して、カテゴリ別に月次の売上合計を算出し、その結果を`final_df`としてください。」）\n
+
+            == ユーザー指示の反映ルール ==
+            専門家への指示（task_description）を作成する際は、必ずユーザーからの追加指示（user_directives）がないか確認してください。
+            もし該当する専門家への指示が存在する場合、その内容を「ユーザーからの追加指示：」という接頭辞をつけて、あなたの指示の末尾に必ず含めてください。
         """
  
     # 動的に生成したプロンプトでChainを組み立てます
@@ -883,7 +947,7 @@ def supervisor_node(state: AgentState):
 
 def build_workflow():
     graph_builder = StateGraph(AgentState)
-
+    graph_builder.add_node("command_parser_node", command_parser_node) 
     graph_builder.add_node("supervisor", supervisor_node)
     graph_builder.add_node("sql_node", sql_node)
     graph_builder.add_node("processing_node", processing_node)
@@ -893,7 +957,8 @@ def build_workflow():
     tool_node = ToolNode(supervisor_tools)
     graph_builder.add_node("tools", tool_node)
 
-    graph_builder.set_entry_point("supervisor")
+    graph_builder.set_entry_point("command_parser_node")
+    graph_builder.add_edge("command_parser_node", "supervisor")
 
     graph_builder.add_conditional_edges(
         "supervisor",

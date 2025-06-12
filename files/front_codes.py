@@ -8,10 +8,20 @@ import logging
 import plotly.io as pio
 import plotly.graph_objects as go
 from functions import render_plan_sidebar, extract_alerts
-import streamlit.components.v1 as components 
+import streamlit.components.v1 as components
+import io
+import pprint
 
-logger = logging.getLogger("langgraph")
-logger.setLevel(logging.DEBUG)
+# --- ログをキャプチャするための準備 ---
+# Streamlitアプリ内でログを一時的に補足するための設定
+log_stream = io.StringIO()
+log_handler = logging.StreamHandler(log_stream)
+log_handler.setLevel(logging.INFO) # INFOレベル以上のログをキャプチャ
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_handler.setFormatter(formatter)
+root_logger = logging.getLogger() 
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(log_handler)
 
 # --- 1. ワークフローの準備（初回実行時のみ） ---
 # @st.cache_resourceを使うことで、アプリの再実行時にワークフローを再構築するのを防ぎ、高速化します。
@@ -92,26 +102,30 @@ if user_input:
     # アシスタントの応答スペースを確保
     with st.chat_message("assistant"):
         
-        # st.spinnerの代わりにst.statusを使用。実行状況を動的に更新できる
+        # st.statusを使用して、実行状況を動的に更新
         with st.status("AIがリクエストを分析中...", expanded=True) as status:
             try:
                 # LangGraphバックエンドの呼び出し設定
                 config = {"configurable": {"thread_id": st.session_state.session_id}}
                 input_data = {"messages": [HumanMessage(content=user_input)]}
                 
-                # .invoke()の代わりに.stream()を使い、リアルタイムでチャンクを処理
+                # 思考プロセス表示用のExpanderをstatus内に用意
+                with st.expander("詳細ログを見る"):
+                    log_placeholder = st.empty()
+                    chunk_placeholder = st.empty()
+
+                # .stream()を使い、リアルタイムでチャンクを処理
                 for chunk in compiled_workflow.stream(input_data, config, stream_mode="updates"):
                     
-                    #ユーザーへの質問モードであれば待機フラグを立てる
+                    # ユーザーへの質問モードであれば待機フラグを立てる
                     if "ask_user_node" in chunk:
                         st.session_state.awaiting_ai_question = True
-                        #supervisorが質問をしていたらその質問内容を取得
                         if "supervisor" in chunk:
                             sup_msgs = chunk["supervisor"]["messages"]
                             if sup_msgs and isinstance(sup_msgs[0], AIMessage):
                                 st.session_state.pending_question = sup_msgs[0].content
                     
-                    # chunkにplanが出現したらstateに格納    
+                    # planが出現したらstateに格納
                     if "plan" in chunk:
                         st.session_state.plan_steps = chunk["plan"]
                     if "plan_cursor" in chunk:
@@ -119,22 +133,27 @@ if user_input:
                 
                     # --- chunkを解析して、実行状況をリアルタイムで表示 ---
                     if "supervisor" in chunk:
-                        # スーパーバイザーが思考中
                         status.update(label=f"どの専門家に依頼するか思考中...")
                     elif "sql_node" in chunk:
-                        # SQLノードが実行中
                         status.update(label="データベースにアクセスし、SQLを実行中...")
                     elif "processing_node" in chunk:
-                        # データ加工/グラフ作成ノードが実行中
                         status.update(label="データを加工し、グラフを作成中...")
                     elif "interpret_node" in chunk:
-                        # 解釈ノードが実行中
                         status.update(label="結果を解釈し、説明を生成中...")
                     elif "metadata_retrieval_node" in chunk:
-                        # テーブル情報ノードが実行中
                         status.update(label="テーブル情報を取得中...")
                     else:
                         status.update(label="少々お待ちください...")
+
+                    # --- 詳細ログの表示を更新 ---
+                    # chunkの生データを整形して表示
+                    chunk_placeholder.markdown("**Last Received Chunk:**")
+                    chunk_placeholder.code(pprint.pformat(chunk, indent=2), language="json")
+
+                    # キャプチャしたログを表示
+                    log_placeholder.markdown("**Backend Logs:**")
+                    log_stream.seek(0) # ストリームの読み取り位置を先頭に戻す
+                    log_placeholder.text(log_stream.read())
                     
                     #エラーがあった場合はsession_stateに追加
                     alerts = extract_alerts(chunk)
@@ -144,11 +163,11 @@ if user_input:
                     #エラーログはsidebarに表示
                     if len(st.session_state.error_log)>0:
                          with st.sidebar.expander("エラーログ", expanded=False):
-                             for rec in reversed(st.session_state.error_log[-50:]):  # 直近50件
-                                 status = rec["status"]
+                             for rec in reversed(st.session_state.error_log[-50:]):
+                                 status_val = rec["status"]
                                  node = rec["node"]
                                  summary = rec["summary"]
-                                 st.markdown(f"{node}_{status}:{summary}")
+                                 st.markdown(f"{node}_{status_val}:{summary}")
 
                 status.update(label="分析完了！", state="complete", expanded=False)
                 ai_response = chunk["supervisor"]["messages"][0]
@@ -180,3 +199,7 @@ if user_input:
                 st.rerun()
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
+            finally:
+                # --- ハンドラをクリーンアップ ---
+                root_logger.removeHandler(log_handler)
+                log_stream.close()
