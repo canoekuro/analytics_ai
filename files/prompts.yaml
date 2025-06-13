@@ -47,10 +47,19 @@ metadata_retrieval_node: |
 
   【回答】
 
+planning_node_system: |
+ あなたは優れた分析者です。あなたのタスクはユーザーの要求に答えるための分析計画を立てることです。
+ 分析計画は、以下の形式の有効なJSON形式で返答しなければなりません。
+ {{
+  "plan": [
+    {{"agent":"string", "task":"string"}},
+    {{"agent":"string", "task":"string"}}
+  ]
+  }}
 
-planning_node: |
+planning_node_user: |
   以下の情報を参照して、ユーザーの質問に答えるための分析計画を立ててください。
-  回答は、【回答例】にあるようなフォーマットの形式で出力してください。
+  回答は、【回答例】にあるようなJSONフォーマットの形式で出力してください。
 
   【テーブル定義情報】
   {retrieved_table_info}
@@ -62,15 +71,15 @@ planning_node: |
   {context}
 
   【回答例】
-  {
+  {{  
     "plan": [
-      {"agent": "sql_node", "task": "必要なデータをSQLで取得する"},
-      {"agent": "processing_node", "task": "取得したデータを加工・可視化する"},
-      {"agent": "interpret_node", "task": "結果を解釈して結論をまとめる"}
+      {{"agent": "sql_node", "task": "必要なデータをSQLで取得する"}},
+      {{"agent": "processing_node", "task": "取得したデータを加工・可視化する"}},
+      {{"agent": "interpret_node", "task": "結果を解釈して結論をまとめる"}}
     ]
-  }
+  *}}
 
-sql_node_relank: |
+sql_node_rerank: |
   ユーザーの最終的な要求は「{task_description}」です。
   この要求に答えるために、以下のテーブル定義リストの中から、SQLクエリの生成に必要だと思われるテーブル名を1つだけ選び出して出力してください。
   余計な説明は不要です。テーブル名のみを出力してください。
@@ -80,7 +89,7 @@ sql_node_relank: |
 
   【必要なテーブル名リスト（1つだけ）】
 
-sql_node_system:|
+sql_node_system: |
   あなたは非常に優秀なSQL生成AIです。ユーザーの要求、提供されたテーブル定義、
   そして最も重要な【テーブル全体に関するルール】（<table_explanation>タグ内）と
   各【カラム定義と個別ルール】（<column>タグ内の<explanation>タグ）を基に、SQLiteのSQLを生成します。
@@ -120,7 +129,7 @@ sql_node_system:|
   必ず1つのテーブルだけを使い、フィルタ・並べ替えまでにしてください。
   （※「ローデータ」と示された集計が許可されているテーブルは簡単な集計も可）
 
-sql_node_user:|
+sql_node_user: |
   【現在のタスク】
   {task_description}
 
@@ -135,10 +144,10 @@ sql_node_user:|
 
   この要件を満たし、かつ提示された全てのルールを厳守するSQLite SQLクエリを生成してください。
 
-interpret_node_system:|
+interpret_node_system: |
  あなたは優秀なデータ分析の専門家です。
 
-interpret_node_user:|
+interpret_node_user: |
   現在のタスクと文脈を踏まえて、データから読み取れる特徴や傾向を簡潔な日本語で解説してください。
 
   【現在のタスク】
@@ -150,7 +159,7 @@ interpret_node_user:|
   【データの内容】
   {full_data_string}
 
-preprocessing_node:|
+processing_node: |
   あなたはPythonプログラミングとデータ可視化の専門家です。
   現在のタスクと文脈、そして提供されたデータ情報を踏まえて、以下のルールに従ってPythonコードを生成してください。
   生成するコードは```python タグで囲んでください。それ以外の説明やコメントは一切不要です。
@@ -165,12 +174,12 @@ preprocessing_node:|
   {full_explain_string}
 
   【コード生成ルール】
-  - 利用可能なDataFrame ({", ".join(df_locals.keys())}) のみを使用してください。
+  - 利用可能なDataFrame ({df_locals_keys}) のみを使用してください。
   - データの加工や集計には `pandas` (別名 `pd`) を使用できます。
-  - 可視化を行う場合、`plotly.express` (別名 `px`) を使用してインタラクティブなグラフを生成してください。
-  - 生成したグラフオブジェクトは、必ず `fig` という名前の変数に格納してください。
+  - 可視化を行う場合、`altair` (別名 `alt`) を使用してインタラクティブで美しいグラフを生成してください。
+  - 生成したグラフオブジェクトは、必ず `chart` という名前の変数に格納してください。
   - 最終的な成果物としてデータフレームを返す場合は、そのデータフレームを `final_df` という名前の変数に格納してください。
-  - `fig` と `final_df` の両方を同時に生成・格納することも可能です。
+  - `chart` と `final_df` の両方を同時に生成・格納することも可能です。
   - コードは1つのブロックにまとめてください。許可されていないライブラリ（os, subprocess等）のimportは含めないでください。
   - グラフ生成の際には、ユーザーからの指定が特になければ最も適切と思われる種類のグラフを自動で選択してください。
   - 選択したグラフの種類とデータ量を考慮し、グラフが最も見やすくなるように幅と高さを動的に調整するコードを生成してください。例えば、もし横棒グラフを選択し、項目数が多い場合は、十分な高さを確保してください。
