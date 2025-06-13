@@ -3,8 +3,8 @@
 import os
 import pandas as pd
 import logging
-from typing import TypedDict, List, Optional, Dict, Any, Annotated
-import plotly.express as px
+from typing import TypedDict, List, Optional, Dict, Any, Annotated, Union
+import altair as alt
 import json
 from langchain_community.vectorstores import FAISS
 from langchain_core.tools import tool
@@ -18,7 +18,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from files.functions import extract_sql, try_sql_execute, get_table_name_from_formatted_doc, fetch_tool_args, plan_list_conv, load_prompts
 from files.classes import PythonExecTool, DispatchDecision
 import re
-import ast 
+import ast
+from pathlib import Path
+
 
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
 # llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash") # デフォルトをgemini-1.5-proに変更
@@ -88,8 +90,8 @@ RETRY_LIMITS: dict[str, int] = {
     # 必要に応じて追加
 }
 HISTORY_MAX_ITEMS = 5
-PROMPTS = load_prompts()
-
+BASE_DIR = Path(__file__).resolve().parent
+PROMPTS = load_prompts(BASE_DIR/"prompts.yaml")
 
 @tool
 def metadata_retrieval_node(task_description: str, conversation_history: list[str]):
@@ -99,15 +101,22 @@ def metadata_retrieval_node(task_description: str, conversation_history: list[st
     """
     logging.info(f"metadata_retrieval_node: 開始")
 
-    # システムメッセージ以外を抽出
-    non_system_history = [msg for msg in conversation_history if msg.type != "system"]
-    # 直近N件だけ取り出し
-    recent_history = non_system_history[-CONTEXT_BACK_NUMBER:]
-    context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_history])
+    processed = []
+    for m in conversation_history:
+        if hasattr(m, "type") and hasattr(m, "content"):
+            t, c = m.type, m.content
+        else:  # 文字列やその他
+            t, c = "user", str(m)
+        if t != "system":
+            processed.append((t, c))
+    recent_history = processed[-CONTEXT_BACK_NUMBER:]
+    context = "\n".join(f"{t}: {c}" for t, c in recent_history)
 
     # Rag情報
-    retrieved_docs = vectorstore_tables.similarity_search(task_description)
+    retrieved_docs = vectorstore_tables.similarity_search(task_description, k=100)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
+
+    #プロンプト読み込み
     prompt_template = PROMPTS.get("metadata_retrieval_node")
     if not prompt_template:
         raise ValueError("プロンプトがファイルから読み込めませんでした。")
@@ -148,7 +157,7 @@ def command_parser_node(state: AgentState):
     # --- planブロックの抽出 ---
     plan_match = re.search(r"```plan\s*\n(.*?)\n```", content, re.DOTALL)
     if plan_match:
-        plan_str = plan_match.group(1)
+        plan_str = plan_match.group(1).strip()
         try:
             # ast.literal_evalで安全に文字列をPythonオブジェクト（リスト）に変換
             parsed_plan = ast.literal_eval(plan_str)
@@ -201,36 +210,29 @@ def planning_node(state: AgentState):
 
     # Rag情報
     logging.info(f"planning_node: RAG情報を読み込み中 '{task_description}'")
-    retrieved_docs = vectorstore_tables.similarity_search(task_description)
+    retrieved_docs = vectorstore_tables.similarity_search(task_description, k=100)
     retrieved_table_info = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    
 
-    prompt_template = """
-    以下の情報を参照して、ユーザーの質問に答えるための分析計画を立ててください。
-    回答は、【回答例】にあるようなフォーマットの形式で出力してください。
-
-    【テーブル定義情報】
-    {retrieved_table_info}
-
-    【現在のタスク】
-    {task_description}
-
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【回答例】
-    {
-      "plan": [
-        {"agent": "sql_node", "task": "必要なデータをSQLで取得する"},
-        {"agent": "processing_node", "task": "取得したデータを加工・可視化する"},
-        {"agent": "interpret_node", "task": "結果を解釈して結論をまとめる"}
-      ]
-    }
-    """
+    #プロンプト読み込み
+    system_prompt = PROMPTS.get("planning_node_system")
+    if not system_prompt:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    user_prompt_template = PROMPTS.get("planning_node_user")
+    if not user_prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+        
+    # 変数を当てはめて最終的なプロンプトを生成
+    user_prompt = user_prompt_template.format(
+        retrieved_table_info=retrieved_table_info,
+        task_description=task_description,
+        context=context
+    )
 
     logging.info(f"planning_node: 生成AIが考えています・・・ '{task_description}'")
-    llm_prompt = prompt_template.format(retrieved_table_info=retrieved_table_info, task_description=task_description, context=context)
-    response = llm_json_mode.invoke(llm_prompt)
+    response = llm_json_mode.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
     step_answer = response.content.strip()
     logging.info(f"planning_node: 回答完了{step_answer}")
 
@@ -254,7 +256,7 @@ def planning_node(state: AgentState):
         result = json.dumps({
             "status": "error",
             "node": "planning_node",
-            "summary": "プラン生成中にエラーが発生しました: {e}",
+            "summary": f"プラン生成中にエラーが発生しました: {e}",
             "result_payload": None
         })
         return {"messages": [ToolMessage(content=result, tool_call_id=tool_call_id)]}
@@ -292,17 +294,18 @@ def sql_node(state: AgentState):
     # ★ --- 2. LLMにテーブルを選別させる（1回目の問いかけ） ---
     if candidate_tables_info_for_prompt:
         logging.info(f"sql_node(Re-rank): LLMにテーブル選別を依頼中...")
-        rerank_prompt = f"""
-        ユーザーの最終的な要求は「{task_description}」です。
-        この要求に答えるために、以下のテーブル定義リストの中から、SQLクエリの生成に必要だと思われるテーブル名を1つだけ選び出して出力してください。
-        余計な説明は不要です。テーブル名のみを出力してください。
-
-        【テーブル定義リスト】
-        {candidate_tables_info_for_prompt}
-
-        【必要なテーブル名リスト（1つだけ）】
-        """
-        rerank_response = llm.invoke(rerank_prompt)
+        
+        #プロンプト読み込み
+        prompt_template = PROMPTS.get("sql_node_rerank")
+        if not prompt_template:
+            raise ValueError("プロンプトがファイルから読み込めませんでした。")
+        
+        # 変数を当てはめて最終的なプロンプトを生成
+        prompt = prompt_template.format(
+            task_description=task_description,
+            candidate_tables_info_for_prompt=candidate_tables_info_for_prompt
+        )
+        rerank_response = llm.invoke(prompt)
         required_table_names_str = rerank_response.content.strip()
         if required_table_names_str:
              required_table_names = [name.strip() for name in required_table_names_str.split(',')]
@@ -330,68 +333,28 @@ def sql_node(state: AgentState):
         return {"messages": [ToolMessage(content=result, tool_call_id=tool_call_id)]}
 
     # ★ --- 4. ルール遵守CoTを組み込んだシステムプロンプトを作成 ---
-    system_prompt = """
-    あなたは非常に優秀なSQL生成AIです。ユーザーの要求、提供されたテーブル定義、
-    そして最も重要な【テーブル全体に関するルール】（<table_explanation>タグ内）と
-    各【カラム定義と個別ルール】（<column>タグ内の<explanation>タグ）を基に、SQLiteのSQLを生成します。
-
-    SQLを生成する前に、必ず以下の思考プロセスに従って、ステップバイステップで考察を行ってください。
-    あなたの最終的な出力は、思考プロセスを含まない、実行可能なSQLite SQLクエリ文のみにしてください。
-    ---
-    ### 思考プロセス (Chain-of-Thought)
-
-    1.  **ユーザー要求の理解**: ユーザーが最終的に何を知りたいのかを明確にする。
-
-    2.  **使用テーブルの確認とルール遵守**:
-        * 今回使用するテーブルは、提供された【使用するテーブル定義】の中から最も適切なものを1つだけ選択する。
-        * 選択したテーブルの【テーブル全体に関するルール】（<table_explanation>の内容）を特定し、このルールをSQL生成時にどのように考慮するか記述する。
-
-    3.  **使用カラムの特定とルールチェック**:
-        テーブル内のカラムについて【カラム定義と個別ルール】（<column>タグ内の<explanation>の内容）を確認します。以下のチェックリスト形式で思考を整理してください。ルールがない場合は「特になし」と記載する。
-
-        | 使用するカラム名 | カラムの個別ルール                                     | ルールをSQLにどう反映させるか（SELECT句、WHERE句など） |
-        | :--------------- | :----------------------------------------------------- | :----------------------------------------------------- |
-        | (例) カテゴリ    | 必ず出力に含めてください。指定がない場合はWhere句で’All’ | SELECT句に「カテゴリ」を含める。WHERE句の条件を確認。 |
-        | ...              | ...                                                    | ...                                                    |
-
-    4.  **SQL組み立て方針の決定**:
-        * `SELECT`句: 上記のルールチェックに基づき、どのカラムを含めるか。
-        * `FROM`句: ステップ2で確認したテーブル名。
-        * `WHERE`句: 上記のルールチェックとユーザー要求に基づき、どのような条件が必要か。
-        * その他（`GROUP BY`, `ORDER BY`, `LIMIT`）: 必要に応じて。ただし、テーブル全体のルール（例：集計関数禁止など）やSQLiteの制約（JOIN禁止、単一テーブル使用）を厳守する。
-
-    5.  **最終SQLの生成**: 上記の方針に基づき、最終的なSQLite SQLクエリを生成する。ルール違反がないか最終確認する。
-    ---
-
-    上記の思考プロセスを頭の中で実行し、完成したSQLクエリのみを出力してください。
-    SQLの前後にコメントや説明文は出力しないでください。
-    使用できるSQL構文は「SELECT」「WHERE」「GROUP BY」「ORDER BY」「LIMIT」のみです。
-    それ以外の関数、例えば日付関数や高度な型変換、サブクエリやウィンドウ関数、JOINは使わないでください。
-    必ず1つのテーブルだけを使い、フィルタ・並べ替えまでにしてください。
-    （※「ローデータ」と示された集計が許可されているテーブルは簡単な集計も可）
-    """
-
     # --- 5. 本番のSQL生成用ユーザープロンプトを組み立てる ---
     retrieved_queries_docs = vectorstore_queries.similarity_search(task_description, k=3)
     rag_queries = "\n\n".join([doc.page_content for doc in retrieved_queries_docs])
 
-    user_prompt = f"""
-    【現在のタスク】
-    {task_description}
+    #プロンプト読み込み
+    system_prompt = PROMPTS.get("sql_node_system")
+    if not system_prompt:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    user_prompt_template = PROMPTS.get("sql_node_user")
+    if not user_prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    user_prompt = user_prompt_template.format(
+        task_description=task_description,
+        context=context,
+        final_rag_tables_text=final_rag_tables_text,
+        rag_queries=rag_queries
+    )
 
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【使用するテーブル定義】
-    {final_rag_tables_text}
-
-    【類似する問い合わせ例とそのSQL】
-    {rag_queries}
-
-    この要件を満たし、かつ提示された全てのルールを厳守するSQLite SQLクエリを生成してください。
-    """
     new_history_item = {} # tryブロックの外で参照できるように初期化
-    # --- 6. SQL生成の実行と後続処理（2回目の問いかけ & 実行） ---
+    # --- 6. SQL生成の実行
     try:
         logging.info(f"sql_node(CoT): 生成AIが考えています・・・ '{task_description}'")
         response = llm.invoke([
@@ -508,20 +471,21 @@ def interpret_node(state: AgentState):
         })
         return {"messages": [ToolMessage(content=result, tool_call_id=tool_call_id)]}
 
+    #プロンプト読み込み
+    system_prompt = PROMPTS.get("interpret_node_system")
+    if not system_prompt:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    user_prompt_template = PROMPTS.get("interpret_node_user")
+    if not user_prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    user_prompt = user_prompt_template.format(
+        task_description=task_description,
+        context=context,
+        full_data_string=full_data_string
+    )
 
-    system_prompt = "あなたは優秀なデータ分析の専門家です。"
-    user_prompt = f"""
-    現在のタスクと文脈を踏まえて、データから読み取れる特徴や傾向を簡潔な日本語で解説してください。
-
-    【現在のタスク】
-    {task_description}
-
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【データの内容】
-    {full_data_string}
-    """
     try:
         logging.info(f"interpret_node: 生成AIが考えています・・・ '{task_description}'")
         response = llm.invoke([
@@ -643,40 +607,24 @@ def processing_node(state: AgentState):
 
     full_explain_string = "\n".join(df_explain_list)
 
-    # AgentExecutorを廃止し、LLMに直接コードを生成させるためのプロンプト
-    code_generation_prompt = f"""
-    あなたはPythonプログラミングとデータ可視化の専門家です。
-    現在のタスクと文脈、そして提供されたデータ情報を踏まえて、以下のルールに従ってPythonコードを生成してください。
-    生成するコードは```python タグで囲んでください。それ以外の説明やコメントは一切不要です。
+    #プロンプト読み込み
+    df_locals_keys = {", ".join(df_locals.keys())}
 
-    【現在のタスク】
-    {task_description}
-
-    【ユーザーの全体的な質問の文脈】
-    {context}
-
-    【利用可能なデータとその説明】
-    {full_explain_string}
-
-    【コード生成ルール】
-    - 利用可能なDataFrame ({", ".join(df_locals.keys())}) のみを使用してください。
-    - データの加工や集計には `pandas` (別名 `pd`) を使用できます。
-    - 可視化を行う場合、`plotly.express` (別名 `px`) を使用してインタラクティブなグラフを生成してください。
-    - 生成したグラフオブジェクトは、必ず `fig` という名前の変数に格納してください。
-    - 最終的な成果物としてデータフレームを返す場合は、そのデータフレームを `final_df` という名前の変数に格納してください。
-    - `fig` と `final_df` の両方を同時に生成・格納することも可能です。
-    - コードは1つのブロックにまとめてください。許可されていないライブラリ（os, subprocess等）のimportは含めないでください。
-    - グラフ生成の際には、ユーザーからの指定が特になければ最も適切と思われる種類のグラフを自動で選択してください。
-    - 選択したグラフの種類とデータ量を考慮し、グラフが最も見やすくなるように幅と高さを動的に調整するコードを生成してください。例えば、もし横棒グラフを選択し、項目数が多い場合は、十分な高さを確保してください。
-
-
-    【生成するPythonコード】
-    """
+    user_prompt_template = PROMPTS.get("processing_node")
+    if not user_prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    user_prompt = user_prompt_template.format(
+        task_description=task_description,
+        context=context,
+        full_explain_string=full_explain_string,
+        df_locals_keys=df_locals_keys
+    )
 
     logging.info(f"processing_node: 生成AIにコード生成を依頼中・・・ '{task_description}'")
     
     # LLMを直接呼び出してコードを生成
-    response = llm.invoke(code_generation_prompt)
+    response = llm.invoke(user_prompt)
     generated_code_raw = response.content.strip()
 
     # 生成された応答からPythonコード部分のみを抽出
@@ -699,7 +647,7 @@ def processing_node(state: AgentState):
     logging.info(f"processing_node: 生成されたコード:\n---\n{generated_code}\n---")
 
     # Python実行ツールの準備
-    locals_for_tool = {**df_locals, "px": px, "pd": pd}
+    locals_for_tool = {**df_locals, "alt": alt, "pd": pd}
     python_tool = PythonExecTool(locals=locals_for_tool)
 
     try:
@@ -708,9 +656,8 @@ def processing_node(state: AgentState):
         content_payload = json.loads(tool_output_str) # ツール出力はJSON文字列なのでパース
         
         final_df_json = content_payload.get("final_df_json")
-        fig_html_path = content_payload.get("fig_html_path")
-        display_height = content_payload.get("display_height")
-        logging.info(f"processing_node: コード実行成功。fig_html_path: {'あり' if fig_html_path else 'なし'}, final_df_json: {'あり' if final_df_json else 'なし'}")
+        altair_chart_json = content_payload.get("altair_chart_json")
+        logging.info(f"processing_node: コード実行成功。")
 
         # stateの更新
         updated_df_history = state.get("df_history", [])
@@ -724,7 +671,7 @@ def processing_node(state: AgentState):
 
         # Supervisorに返すToolMessageのコンテンツを作成
         result_summary = []
-        if fig_html_path:
+        if altair_chart_json:
             result_summary.append("グラフを生成しました。")
         if final_df_json:
             result_summary.append("加工されたデータフレームを生成しました。")
@@ -735,7 +682,7 @@ def processing_node(state: AgentState):
             "status": "success",
             "node": "processing_node",
             "summary": result_summary,
-            "result_payload": {"fig_html_path":fig_html_path, "display_height":display_height, "result_df_json":final_df_json}
+            "result_payload": {"altair_chart_json":altair_chart_json, "result_df_json":final_df_json}
         })
         return {
             "messages": [ToolMessage(content=result, tool_call_id=tool_call_id)],
@@ -764,13 +711,14 @@ def ask_user_node(state: AgentState):
     # このノード自体は、状態を変更せず、次のノードに処理を渡すだけです。
     return
 
-supervisor_tools = [metadata_retrieval_node] 
+supervisor_tools = [metadata_retrieval_node]
+ALLOWED_TOOL_NAMES = {t.name for t in supervisor_tools}
 def supervisor_node(state: AgentState):
     """スーパーバイザーとして次にどのアクションをとるべきか判断する"""
     logging.info("--- スーパーバイザー ノード実行中 ---")
 
     # supervisorが直接使うツール名
-    llm_with_supervisor_tools = llm.bind_tools(supervisor_tools + [DispatchDecision]) 
+    llm_with_supervisor_tools = llm.bind_tools(supervisor_tools + [DispatchDecision], strict=True) 
     messages = state['messages']
     plan = state.get("plan")
     plan_cursor = state.get("plan_cursor") 
@@ -845,39 +793,16 @@ def supervisor_node(state: AgentState):
         else:
             plan_now = ""
 
-    # 上記の情報をすべて盛り込んだシステムプロンプトを生成します
-    prompt = f"""
-            あなたはAIチームを率いる熟練のプロジェクトマネージャーです。\n"
-            あなたの仕事は、ユーザーの要求と分析計画、直前のタスク結果に基づき、[現在地]と示されたタスクに対して以下のいずれかのアクションを選択することです。\n\n
-            1. 自分でツールを実行する: 簡単な情報照会のタスクなどは、あなたが直接ツールを実行して回答してください。\n
-            2. 専門家に仕事を割り振る: 複雑な作業はタスクを分解し、以下の専門家メンバーに具体的で明確な指示を出してください。\n\n
-            {summary_parts}
-            {plan_now}
-            == 利用可能なツール ==\n
-            - metadata_retrieval_node: データベースのテーブル定義やカラムについて答える。\n
-            
-            == 専門家メンバーリスト ==\n
-            - sql_node: 依頼に従ってSQLを生成し、データを取得する\n
-            - processing_node: 依頼に従ってデータの加工やグラフ作成をする\n
-            - interpret_node: 依頼に従ってデータの解釈を行う\n
-            - planning_node: 複雑な分析に関して、分析プランを作成する
-            - ask_user_node: 不明確な分析依頼に対して、ユーザーに追加で質問をする
-
-            == 判断ルール ==\n
-            計画の次のステップを実行するために、まずツールで解決できるか検討し、できなければ専門家への割り振りを考えてください。\n
-            専門家へ割り振る際は、次に指名すべきメンバーと、そのメンバーへの具体的な指示内容を決定してください。\n
-            計画の最後のステップが完了したと判断した場合は、next_agentに 'FINISH' を指定してください。\n\n
-
-            == 指示 (task_description) の書き方 ==\n
-            専門家への指示内容は、単なる作業依頼ではなく、以下の情報を盛り込んだ「リッチなコンテキスト」として記述してください。これにより、専門家は前後の文脈を完全に理解して、より精度の高い作業を行うことができます。\n\n
-            1.  **最終目標の共有**: ユーザーが元々何を達成したいのか、計画がある場合には、全体計画のどの部分にいるのかを記述します。（例：「最終目標は『商品カテゴリ別の月次売上トレンドの可視化』です。」）\n
-            2.  **直前のステップの要約**: 直前のタスクの結果や、現在利用可能なデータについて具体的に記述します。（例：「直前のステップで、SQLを使い売上実績データを`df1`として取得済みです。`df1`には'売上日', 'カテゴリ', '金額'カラムが含まれています。」）\n
-            3.  **具体的な実行指示**: このステップで専門家に実行してほしいことを明確に指示します。（例：「この`df1`を利用して、カテゴリ別に月次の売上合計を算出し、その結果を`final_df`としてください。」）\n
-
-            == ユーザー指示の反映ルール ==
-            専門家への指示（task_description）を作成する際は、必ずユーザーからの追加指示（user_directives）がないか確認してください。
-            もし該当する専門家への指示が存在する場合、その内容を「ユーザーからの追加指示：」という接頭辞をつけて、あなたの指示の末尾に必ず含めてください。
-        """
+    # プロンプトを取得
+    prompt_template = PROMPTS.get("supervisor_node")
+    if not prompt_template:
+        raise ValueError("プロンプトがファイルから読み込めませんでした。")
+    
+    # 変数を当てはめて最終的なプロンプトを生成
+    prompt = prompt_template.format(
+        summary_parts=summary_parts,
+        plan_now=plan_now
+    )
  
     # 動的に生成したプロンプトでChainを組み立てます
     supervisor_prompt  = ChatPromptTemplate.from_messages([
@@ -885,7 +810,6 @@ def supervisor_node(state: AgentState):
         MessagesPlaceholder(variable_name="messages"),
     ])
     supervisor_chain_plan = supervisor_prompt | llm_with_supervisor_tools
-
 
     response = supervisor_chain_plan.invoke({"messages": state["messages"]})
     for msg in state["messages"]:
@@ -918,10 +842,24 @@ def supervisor_node(state: AgentState):
 
         if "next_agent" not in called_tool_arguments:
             # 'next_agent' が引数にない場合、スーパーバイザーが直接ツールを実行する(例: metadata_retrieval_node や planning_node)
-            logging.info(f"supervisor_node: 判断: ツール '{called_tool_name}' を直接実行します。")
-            # この場合、response (AIMessage) にはツール実行に必要な情報(tool_call)が含まれている
-            # ToolNode はこの response.tool_calls を見てツールを実行する
-            return {"messages": [response], "next": "tools", "retry_counts": counts}
+            # ただし: tool登録以外のnext_agent が来たら、ここで強制的にエージェント扱いにする
+            if called_tool_name not in ALLOWED_TOOL_NAMES:
+                dispatch_decision = DispatchDecision(**called_tool_arguments)
+                logging.info(f"supervisor_node: 判断: 専門家 '{called_tool_name}' にタスクを割り振ります。")
+                logging.info(f"supervisor_node: 判断理由: {dispatch_decision.rationale}")
+                logging.info(f"supervisor_node: 具体的な指示: {dispatch_decision.task_description}")
+                return {
+                    "messages": [response],
+                    "next": called_tool_name,
+                    "plan":plan,
+                    "plan_cursor":plan_cursor,
+                    "retry_counts": counts
+                }
+            else:
+                # この場合、response (AIMessage) にはツール実行に必要な情報(tool_call)が含まれている
+                # ToolNode はこの response.tool_calls を見てツールを実行する
+                logging.info(f"supervisor_node: 判断: ツール '{called_tool_name}' を直接実行します。")
+                return {"messages": [response], "next": "tools", "retry_counts": counts}
         else:
             # 'next_agent' が引数にある場合、専門家へのディスパッチ (DispatchDecision が呼ばれた)
             # called_tool_arguments は DispatchDecision の引数 (next_agent, task_description, rationale)
