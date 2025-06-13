@@ -217,7 +217,7 @@ def extract_alerts(chunk):
                     "summary": payload.get("summary", payload.get("error_message", "")),
                 })
     return alerts   # 0 件なら []
-def load_prompts(file_path="prompts.yaml"):
+def load_prompts(file_path):
     """YAMLファイルからプロンプトを読み込む"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
