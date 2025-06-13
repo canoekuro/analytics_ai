@@ -5,12 +5,10 @@ import uuid
 from backend_codes import build_workflow
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import logging
-import plotly.io as pio
-import plotly.graph_objects as go
 from functions import render_plan_sidebar, extract_alerts
-import streamlit.components.v1 as components
 import io
 import pprint
+import altair as alt 
 
 # --- ログをキャプチャするための準備 ---
 # Streamlitアプリ内でログを一時的に補足するための設定
@@ -66,15 +64,10 @@ for message in st.session_state.messages:
             if "result_df_json" in message["content"] and message["content"]["result_df_json"]:
                 df_data = json.loads(message["content"]["result_df_json"])
                 st.dataframe(pd.DataFrame(df_data))
-            if "fig_html_path" in message["content"] and message["content"]["fig_html_path"]:
-                html_path = message["content"]["fig_html_path"]
-                display_height = message["content"].get("display_height", 600)
-                try:
-                    with open(html_path, 'r', encoding='utf-8') as f:
-                        html_content = f.read()
-                    components.html(html_content, height=display_height, scrolling=True)
-                except FileNotFoundError:
-                    st.error(f"グラフファイルが見つかりません: {html_path}")
+            if "altair_chart_json" in message["content"] and message["content"]["altair_chart_json"]:
+                chart_spec = json.loads(message["content"]["altair_chart_json"])
+                chart  = alt.Chart.from_dict(chart_spec)
+                st.altair_chart(chart, use_container_width=True)
             if "interpretation_text" in message["content"] and message["content"]["interpretation_text"]:
                 st.markdown(message["content"]["interpretation_text"])
 
@@ -85,7 +78,6 @@ if st.session_state.awaiting_ai_question:
 else:
     prompt_label = "分析したいことを入力してください（例: カテゴリ別の売上を見せて）"
 user_input = st.chat_input(prompt_label)
-
 
 if user_input:
     # ユーザーの入力を履歴に追加して表示
@@ -98,21 +90,21 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # AIの応答を待つ間、スピナー（くるくる回るアイコン）を表示
     # アシスタントの応答スペースを確保
+    status_ph = st.empty()
+    log_expander = st.expander("分析実行詳細ログを見る", expanded=False)
+    with log_expander:
+        log_placeholder   = st.empty()
+        chunk_placeholder = st.empty()
+
     with st.chat_message("assistant"):
         
         # st.statusを使用して、実行状況を動的に更新
-        with st.status("AIがリクエストを分析中...", expanded=True) as status:
+        with status_ph.status("AIがリクエストを分析中...", expanded=True) as status:
             try:
                 # LangGraphバックエンドの呼び出し設定
                 config = {"configurable": {"thread_id": st.session_state.session_id}}
                 input_data = {"messages": [HumanMessage(content=user_input)]}
-                
-                # 思考プロセス表示用のExpanderをstatus内に用意
-                with st.expander("詳細ログを見る"):
-                    log_placeholder = st.empty()
-                    chunk_placeholder = st.empty()
 
                 # .stream()を使い、リアルタイムでチャンクを処理
                 for chunk in compiled_workflow.stream(input_data, config, stream_mode="updates"):
@@ -141,6 +133,8 @@ if user_input:
                     elif "interpret_node" in chunk:
                         status.update(label="結果を解釈し、説明を生成中...")
                     elif "metadata_retrieval_node" in chunk:
+                        status.update(label="テーブル情報を取得中...")
+                    elif "planning_node" in chunk:
                         status.update(label="テーブル情報を取得中...")
                     else:
                         status.update(label="少々お待ちください...")
