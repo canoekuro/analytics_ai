@@ -42,29 +42,15 @@ class PythonExecTool(BaseTool):
         exec(compile(code, "<llm_code>", "exec"), self._scope, self._scope)
 
         final_df = self._scope.get("final_df")
-        fig = self._scope.get("fig")
-        fig_html_path = None
-        display_height = 600
-        if fig is not None:
-            # 保存用ディレクトリを作成 (存在しない場合)
-            temp_dir = "figs"
-            os.makedirs(temp_dir, exist_ok=True)
-            # UUIDを使って一意なファイル名を生成
-            file_name = f"{uuid.uuid4()}.html"
-            fig_html_path = os.path.join(temp_dir, file_name)
-            # HTMLファイルとして書き出し
-            fig.write_html(fig_html_path)
-            if fig.layout and fig.layout.height:
-                display_height = fig.layout.height
+        chart = self._scope.get("chart")
+        altair_chart_json = chart.to_json() if chart is not None else None
 
         payload = {
-            # fig_json の代わりに fig_html_path を返す
-            "fig_html_path": fig_html_path,
+            "altair_chart_json": altair_chart_json,
             "final_df_json": (
                 final_df.to_json(orient="records", force_ascii=False)
                 if isinstance(final_df, pd.DataFrame) else None
-            ),
-            "display_height": display_height
+            )
         }
 
         return json.dumps(payload, ensure_ascii=False)
