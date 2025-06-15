@@ -228,3 +228,32 @@ def load_prompts(file_path):
     except Exception as e:
         logging.error(f"プロンプトファイルの読み込み中にエラーが発生しました: {e}")
         return {}
+    
+def extract_graph_payload(chunk):
+    """
+    LangGraphのストリームchunkから、グラフ描画用のペイロードを抽出する。
+    processing_nodeからの成功メッセージに含まれるペイロードを探す。
+    """
+    # chunkにprocessing_nodeの更新が含まれているかチェック
+    if "processing_node" not in chunk:
+        return None
+
+    node_val = chunk.get("processing_node", {})
+    # nodeの値が辞書形式で、messagesキーを持っているかチェック
+    if isinstance(node_val, dict):
+        msgs = node_val.get("messages", [])
+        for msg in msgs:
+            # ToolMessageのみを対象とする
+            if isinstance(msg, ToolMessage):
+                try:
+                    payload = json.loads(msg.content)
+                    # statusがsuccessの場合のみ処理
+                    if payload.get("status") == "success":
+                        result_payload = payload.get("result_payload")
+                        # result_payloadにaltairのグラフ仕様が含まれているかチェック
+                        if result_payload and result_payload.get("chart_json"):
+                            return result_payload # グラフ描画用ペイロードを返す
+                except (json.JSONDecodeError, AttributeError):
+                    # JSONのパース失敗などは無視して次のメッセージへ
+                    continue
+    return None

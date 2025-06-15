@@ -4,7 +4,6 @@ import os
 import pandas as pd
 import logging
 from typing import TypedDict, List, Optional, Dict, Any, Annotated, Union
-import altair as alt
 import json
 from langchain_community.vectorstores import FAISS
 from langchain_core.tools import tool
@@ -14,12 +13,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langgraph.prebuilt import ToolNode
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from files.functions import extract_sql, try_sql_execute, get_table_name_from_formatted_doc, fetch_tool_args, plan_list_conv, load_prompts
-from files.classes import PythonExecTool, DispatchDecision
+from functions import extract_sql, try_sql_execute, get_table_name_from_formatted_doc, fetch_tool_args, plan_list_conv, load_prompts
+from classes import PythonExecTool, DispatchDecision
 import re
 import ast
 from pathlib import Path
+import altair as alt
 
 
 # # 環境変数からLLMモデル名を取得します（デフォルト値あり）
@@ -647,18 +646,20 @@ def processing_node(state: AgentState):
     logging.info(f"processing_node: 生成されたコード:\n---\n{generated_code}\n---")
 
     # Python実行ツールの準備
-    locals_for_tool = {**df_locals, "alt": alt, "pd": pd}
+    locals_for_tool = {
+        **df_locals,
+        "pd": pd,
+        "alt": alt
+    }
     python_tool = PythonExecTool(locals=locals_for_tool)
 
     try:
         # ツールを直接実行
         tool_output_str = python_tool._run(code=generated_code)
         content_payload = json.loads(tool_output_str) # ツール出力はJSON文字列なのでパース
-        
+        chart_json = content_payload.get("chart_json")
         final_df_json = content_payload.get("final_df_json")
-        altair_chart_json = content_payload.get("altair_chart_json")
         logging.info(f"processing_node: コード実行成功。")
-
         # stateの更新
         updated_df_history = state.get("df_history", [])
         if final_df_json:
@@ -671,7 +672,7 @@ def processing_node(state: AgentState):
 
         # Supervisorに返すToolMessageのコンテンツを作成
         result_summary = []
-        if altair_chart_json:
+        if chart_json:
             result_summary.append("グラフを生成しました。")
         if final_df_json:
             result_summary.append("加工されたデータフレームを生成しました。")
@@ -682,7 +683,11 @@ def processing_node(state: AgentState):
             "status": "success",
             "node": "processing_node",
             "summary": result_summary,
-            "result_payload": {"altair_chart_json":altair_chart_json, "result_df_json":final_df_json}
+            "result_payload": {
+                "chart_json": chart_json,
+                "final_df_json": final_df_json,
+                "generated_code":generated_code
+                }
         })
         return {
             "messages": [ToolMessage(content=result, tool_call_id=tool_call_id)],

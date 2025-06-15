@@ -5,11 +5,10 @@ import uuid
 from backend_codes import build_workflow
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import logging
-from functions import render_plan_sidebar, extract_alerts
+from functions import render_plan_sidebar, extract_alerts, extract_graph_payload
 import io
 import pprint
-import altair as alt 
-
+import altair as alt
 # --- ログをキャプチャするための準備 ---
 # Streamlitアプリ内でログを一時的に補足するための設定
 log_stream = io.StringIO()
@@ -64,10 +63,9 @@ for message in st.session_state.messages:
             if "result_df_json" in message["content"] and message["content"]["result_df_json"]:
                 df_data = json.loads(message["content"]["result_df_json"])
                 st.dataframe(pd.DataFrame(df_data))
-            if "altair_chart_json" in message["content"] and message["content"]["altair_chart_json"]:
-                chart_spec = json.loads(message["content"]["altair_chart_json"])
-                chart  = alt.Chart.from_dict(chart_spec)
-                st.altair_chart(chart, use_container_width=True)
+            if "chart_json" in message["content"] and message["content"]["chart_json"]:
+                chart_json = message["content"]["chart_json"]
+                st.vega_lite_chart(json.loads(chart_json), use_container_width=True)
             if "interpretation_text" in message["content"] and message["content"]["interpretation_text"]:
                 st.markdown(message["content"]["interpretation_text"])
 
@@ -105,6 +103,7 @@ if user_input:
                 # LangGraphバックエンドの呼び出し設定
                 config = {"configurable": {"thread_id": st.session_state.session_id}}
                 input_data = {"messages": [HumanMessage(content=user_input)]}
+                graph_payload_to_display = None
 
                 # .stream()を使い、リアルタイムでチャンクを処理
                 for chunk in compiled_workflow.stream(input_data, config, stream_mode="updates"):
@@ -138,7 +137,7 @@ if user_input:
                         status.update(label="テーブル情報を取得中...")
                     else:
                         status.update(label="少々お待ちください...")
-
+                    
                     # --- 詳細ログの表示を更新 ---
                     # chunkの生データを整形して表示
                     chunk_placeholder.markdown("**Last Received Chunk:**")
@@ -148,6 +147,12 @@ if user_input:
                     log_placeholder.markdown("**Backend Logs:**")
                     log_stream.seek(0) # ストリームの読み取り位置を先頭に戻す
                     log_placeholder.text(log_stream.read())
+
+                    # ★ストリーム中にグラフのペイロードを捕捉する
+                    graph_payload = extract_graph_payload(chunk)
+                    if graph_payload:
+                        # まだ表示はせず、変数に保持しておく
+                        graph_payload_to_display = graph_payload
                     
                     #エラーがあった場合はsession_stateに追加
                     alerts = extract_alerts(chunk)
@@ -178,7 +183,12 @@ if user_input:
                         response_content = "AI応答の最終状態が取得できませんでした。"
 
                 # 解析したAIの応答を履歴に追加
-                st.session_state.messages.append({"role": "assistant", "content": response_content})             
+                st.session_state.messages.append({"role": "assistant", "content": response_content})      
+                if graph_payload_to_display:
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": graph_payload_to_display
+                    })       
 
                 # ToolMessageの場合、result_payload(figやdf,interpretなど)の内容を追加
                 if isinstance(ai_response, ToolMessage):

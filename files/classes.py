@@ -5,8 +5,6 @@ from enum import Enum
 from pydantic import BaseModel, Field
 import json
 import pandas as pd
-import os
-import uuid
 
 
 class DispatchDecision(BaseModel):
@@ -41,19 +39,25 @@ class PythonExecTool(BaseTool):
 
         exec(compile(code, "<llm_code>", "exec"), self._scope, self._scope)
 
-        final_df = self._scope.get("final_df")
         chart = self._scope.get("chart")
-        altair_chart_json = chart.to_json() if chart is not None else None
+        final_df = self._scope.get("final_df")
+        print("データ読込")
+        
+        if chart is not None:
+            # グラフの仕様を辞書として取得
+            chart_json = chart.to_json()
+        else:
+            chart_json = None
 
         payload = {
-            "altair_chart_json": altair_chart_json,
+            "chart_json": chart_json,
             "final_df_json": (
                 final_df.to_json(orient="records", force_ascii=False)
                 if isinstance(final_df, pd.DataFrame) else None
-            )
+            ),
         }
 
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload)
 
 class NodeStatus(str, Enum):
     success = "success"
